@@ -1,0 +1,17 @@
+# Arduino/esp32 build artifacts
+build/
+.classpath
+.pio/
+.vscode/
+*.o
+*.a
+*.so
+.DS_Store
+*.swp
+*~
+secrets.local.txt
+**/secrets.h
+
+# 대용량 STT 모델 (직접 다운로드)
+voice/models/
+*.bin
