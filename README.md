@@ -1,64 +1,91 @@
 # daijin
 
-> **외로운 개발자의 친구이자 비서.**
-> 내가 만들고, 내 시스템에 연결하고, *무엇이든* 시킬 수 있는 AI 음성 대화 IoT 디바이스.
+> **A lonely developer's friend and assistant.**
+> An AI voice-conversation IoT device I built myself, wired into my own systems, that I can tell to do *anything*.
 
-디바이스에 말을 걸면 → 클라우드를 거쳐 AI(**Claude**)가 생각하고 → 디바이스가 음성으로 답한다.
-단순히 대답만 하는 게 아니라, **내 집과 내 컴퓨터를 실제로 조종한다.**
+Talk to the device → it goes through the cloud → an AI (**Claude**) thinks → the device answers back in speech.
+It doesn't just reply — it **actually controls my home and my computer.**
 
-ESP32-S3(Freenove FNK0082) + 맥 두뇌 + 클라우드 MQTT로, 케이블 한 가닥부터 차근히 쌓아 만들었다.
+Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a Mac brain + cloud MQTT.
 
-## 아키텍처 (이동형 — 들고 나가도 동작)
+## Architecture (portable — works even when you take it outside)
+
+```mermaid
+flowchart LR
+    subgraph device["ESP32-S3 device (ears + mouth)"]
+        MIC[Mic]
+        SPK[Speaker]
+    end
+
+    BROKER{{"HiveMQ Cloud<br/>MQTT / TLS<br/>(both sides rendezvous outbound)"}}
+
+    subgraph brain["Mac brain (at home, outbound only)"]
+        STT["whisper.cpp<br/>(STT, Korean)"]
+        AGENT["Claude<br/>(claude -p)"]
+        TTS[TTS]
+        STT --> AGENT --> TTS
+    end
+
+    MIC -- "daijin/audio/in" --> BROKER
+    BROKER -- "daijin/audio/in" --> STT
+    TTS -- "daijin/audio/out" --> BROKER
+    BROKER -- "daijin/audio/out" --> SPK
+
+    AGENT -. "controls" .-> HOME["Home LEDs / devices"]
 ```
-[ESP32 디바이스: 마이크/스피커]  ──audio──►  HiveMQ 클라우드(MQTT/TLS)  ◄──audio──►  [맥 두뇌]
-       어느 WiFi에 있든                         (양쪽 outbound 랑데부)        whisper(STT) → Claude → TTS
+
+- **They meet at a cloud broker** → works even when the device is on an outside network. The Mac stays home and only goes outbound (no inbound exposure needed).
+- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice).
+
+## Extensibility — bolting on other agents (open by design)
+
+daijin **separates the "ears + mouth" (device) from the "brain" (agent) over MQTT topics**. So the brain is swappable, and daijin itself can be used as the *voice I/O device for any agent*.
+
+- **Swap the brain**: anything in place of `claude -p` — OpenAI, Gemini, a local LLM (EXAONE), the Claude Agent SDK, etc. STT/TTS and the device stay the same.
+- **Generic voice I/O**: subscribe/publish just the `daijin/text/in` (what I say) and `daijin/text/out` (the reply) topics, and any agent can use daijin as its ears and mouth (daijin handles audio, STT, TTS).
+- **Multi-agent routing**: dispatch by transcribed intent to a home-control agent / coding agent / chit-chat agent.
+- **MCP integration**: expose daijin's actions (speaking, device control) as MCP tools, or have the brain wire up multiple MCP servers to extend its abilities modularly.
+
+> The topic contract (`daijin/audio/*`, `daijin/text/*`) already acts as the interface, so swapping the brain or attaching an external agent is just *one adapter layer*. (Current brain = Claude; the extensions are roadmap.)
+
+## Current status
+
+- **Remote control**: evolved HTTP (LAN) → MQTT (LAN) → **HiveMQ Cloud (portable)**. Verified controlling home devices from a phone on LTE.
+- **daijin brain**: voice → STT → Claude → TTS → voice round-trip, verified end-to-end through the cloud (~7s latency).
+- **Next (Phase 2)**: mount an INMP441 mic on the ESP32 so the device listens and speaks directly. → [docs/chunking-protocol.md](docs/chunking-protocol.md)
+
+## Layout
+
 ```
-- **클라우드 브로커에서 만남** → 디바이스가 외부 망에 있어도 동작. 맥은 집에서 outbound만(외부 노출 불필요).
-- 두뇌 = `claude -p` (에이전트라 집의 LED·기기를 음성으로 제어).
-
-## 확장 — 다른 에이전트에 붙이기 (설계상 열려 있음)
-daijin은 **"귀·입(디바이스)"과 "두뇌(에이전트)"가 MQTT 토픽으로 분리**돼 있다. 그래서 두뇌를 갈아끼울 수 있고, daijin 자체를 *어떤 에이전트의 음성 입출력 장치*로도 쓸 수 있다.
-
-- **두뇌 교체**: `claude -p` 자리에 OpenAI·Gemini·로컬 LLM(EXAONE)·Claude Agent SDK 등 무엇이든. STT/TTS·디바이스는 그대로.
-- **범용 음성 I/O**: `daijin/text/in`(내 말)·`daijin/text/out`(답) 토픽만 구독/발행하면, 어떤 에이전트든 daijin을 귀와 입으로 사용. (오디오·STT·TTS는 daijin이 처리)
-- **멀티 에이전트 라우팅**: 전사된 의도에 따라 집-제어 에이전트 / 코딩 에이전트 / 잡담 에이전트로 분배.
-- **MCP 연동**: daijin의 행동(말하기·기기 제어)을 MCP 도구로 노출하거나, 두뇌가 여러 MCP 서버를 물려 능력을 모듈로 확장.
-
-> 토픽 계약(`daijin/audio/*`, `daijin/text/*`)이 이미 인터페이스 역할을 하므로, 두뇌를 바꾸거나 외부 에이전트를 붙이는 건 *어댑터 한 겹*이면 된다. (현재 두뇌=Claude, 확장은 로드맵.)
-
-## 현재 상태
-- **원격 제어**: HTTP(LAN) → MQTT(LAN) → **HiveMQ 클라우드(이동형)** 로 진화. 폰 LTE에서 집 기기 제어 검증 완료.
-- **daijin 두뇌**: 음성 → STT → Claude → TTS → 음성 왕복, 클라우드 경유 검증 완료(지연 ~7초).
-- **다음(Phase 2)**: ESP32에 INMP441 마이크 달아 디바이스가 직접 듣고/말하기. → [docs/chunking-protocol.md](docs/chunking-protocol.md)
-
-## 구조
-```
-sketches/   ESP32 펌웨어
-  01~06               학습용(LED/WiFi/서보/센서)
-  10-remote-led       HTTP 원격 LED (초기)
+sketches/   ESP32 firmware
+  01~06               learning sketches (LED/WiFi/servo/sensor)
+  10-remote-led       HTTP remote LED (early)
   11-mqtt-led         LAN MQTT
-  12*-funnel          Tailscale Funnel 시도(이동형엔 불안정 — 기록)
-  13-cloud-led        HiveMQ 클라우드 (이동형 ✅)
+  12*-funnel          Tailscale Funnel attempt (unstable for portable use — kept as a record)
+  13-cloud-led        HiveMQ Cloud (portable ✅)
 voice/      daijin
-  daijin_mqtt.py      두뇌: MQTT 클라이언트 (STT→Claude→TTS)
-  talk.sh             맥-only 음성 루프
-  led.sh              음성 에이전트용 기기 제어
-  test_device.py      가짜 디바이스 왕복 테스트
-docs/       로드맵·리서치·프로토콜
+  daijin_mqtt.py      brain: MQTT client (STT→Claude→TTS)
+  talk.sh             Mac-only voice loop
+  led.sh              device control for the voice agent
+  test_device.py      fake-device round-trip test
+docs/       roadmap·research·protocol
 ```
 
-## 스택
-ESP32-S3 · Arduino(arduino-cli) · MQTT(Mosquitto / HiveMQ Cloud) · TLS(Let's Encrypt) ·
-whisper.cpp(STT, 한국어) · Claude(두뇌) · TTS · WiFiManager
+## Stack
 
-## 셋업 메모
-- **자격증명은 코드에 없음.** `secrets.h`·`secrets.local.txt`·whisper 모델은 gitignore. 본인 값으로 직접 생성.
-- whisper 모델 `ggml-large-v3-turbo-q5_0.bin` 은 `voice/models/` 에 직접 다운로드.
+ESP32-S3 · Arduino (arduino-cli) · MQTT (Mosquitto / HiveMQ Cloud) · TLS (Let's Encrypt) ·
+whisper.cpp (STT, Korean) · Claude (brain) · TTS · WiFiManager
 
-## 핵심 교훈
-- ESP32는 **2.4GHz WiFi만**, USB는 **데이터 케이블** 필수.
-- ESP32-S3 TLS는 **NTP 시간동기화** 필요(타임아웃 걸 것).
-- 이동형 백엔드는 **집 맥+터널(불안정)** 보다 **클라우드 브로커**가 정답.
+## Setup notes
+
+- **No credentials in the code.** `secrets.h`, `secrets.local.txt`, and the whisper model are gitignored — create them with your own values.
+- Download the whisper model `ggml-large-v3-turbo-q5_0.bin` into `voice/models/` yourself.
+
+## Key lessons
+
+- ESP32 is **2.4GHz WiFi only**, and the USB connection must be a **data cable**.
+- ESP32-S3 TLS needs **NTP time sync** (set a timeout).
+- For a portable backend, a **cloud broker** beats a **home Mac + tunnel (unstable)**.
 
 ---
 *Built with [Claude Code](https://claude.com/claude-code).*
