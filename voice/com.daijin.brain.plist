@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daijin.brain</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/kangminsung/esp32-iot/voice/daijin_mqtt.py</string>
+    </array>
+
+    <!-- 부팅 시 자동 시작 + 죽으면 재시작 -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/kangminsung/esp32-iot/voice/daijin.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/kangminsung/esp32-iot/voice/daijin.log</string>
+
+    <!-- launchd 기본 PATH는 최소라서: claude(~/.local/bin), mosquitto_pub·whisper(/opt/homebrew/bin) 포함 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/kangminsung/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/kangminsung</string>
+    </dict>
+</dict>
+</plist>

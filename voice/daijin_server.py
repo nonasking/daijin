@@ -29,7 +29,7 @@ def stt(wav):
 
 def brain(text):
     global turn
-    cmd = ["claude", "-p", text, "--allowedTools", "Bash", "--append-system-prompt", SYS]
+    cmd = ["claude", "-p", text, "--allowedTools", "Bash(bash ~/esp32-iot/voice/led.sh *)", "--append-system-prompt", SYS]
     if turn > 0:
         cmd.insert(2, "--continue")
     turn += 1

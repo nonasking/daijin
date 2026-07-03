@@ -31,9 +31,9 @@ while true; do
 
   # 두뇌 (Claude). 2턴부터 --continue 로 대화 맥락 유지
   if [ "$turn" -eq 0 ]; then
-    RESP=$(claude -p "$TXT" --allowedTools "Bash" --append-system-prompt "$SYS" 2>/dev/null)
+    RESP=$(claude -p "$TXT" --allowedTools "Bash(bash ~/esp32-iot/voice/led.sh *)" --append-system-prompt "$SYS" 2>/dev/null)
   else
-    RESP=$(claude -p "$TXT" --continue --allowedTools "Bash" --append-system-prompt "$SYS" 2>/dev/null)
+    RESP=$(claude -p "$TXT" --continue --allowedTools "Bash(bash ~/esp32-iot/voice/led.sh *)" --append-system-prompt "$SYS" 2>/dev/null)
   fi
   turn=$((turn+1))
 

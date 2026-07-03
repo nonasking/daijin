@@ -15,3 +15,13 @@ secrets.local.txt
 # 대용량 STT 모델 (직접 다운로드)
 voice/models/
 *.bin
+
+# 개인 사진(임시)
+IMG_*.jpg
+IMG_*.jpeg
+IMG_*.png
+IMG_*.HEIC
+
+# daijin 런타임 파일
+voice/.daijin_session
+voice/daijin.log
