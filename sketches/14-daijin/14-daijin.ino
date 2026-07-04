@@ -29,6 +29,7 @@
 
 #define T_AUDIO_IN  "daijin/audio/in"
 #define T_AUDIO_OUT "daijin/audio/out"
+#define T_STATUS    "daijin/status"
 
 const int   SR        = 16000;
 const int   REC_SEC   = 4;
@@ -118,6 +119,7 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
   if (strcmp(topic, T_AUDIO_OUT) != 0 || len <= HDR) return;
   size_t n = len - HDR;
   if (payload[1] == 0 && payload[2] == 0) {     // seq 0 = 새 클립
+    WiFi.setSleep(false);                       // 재생 세션 → 풀속도
     rw = rr = 0; gotLast = false; playing = false;
     adPred = 0; adIdx = 0;                      // ADPCM 상태 리셋 (브레인 인코더와 동기)
     rxT0 = millis(); underruns = 0; inUnderrun = false; rxBytes = 0;
@@ -146,6 +148,7 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
 void recordAndPublish() {
   while (digitalRead(BTN) == LOW) delay(10);                   // 시작 탭에서 손 뗄 때까지
   delay(80);                                                   // 디바운스
+  WiFi.setSleep(false);                                        // 오디오 세션 시작 → 풀속도
   led(0,40,0);                                                 // 초록 = 녹음 중 (말하세요)
   logf("녹음+전송 시작 (clip %u, 탭-토글)\n", clipId);
   static int32_t raw[1024];
@@ -203,7 +206,8 @@ void setup() {
   wifiMulti.addAP(WIFI_SSID, WIFI_PASS);      // 집
   wifiMulti.addAP(WIFI_SSID2, WIFI_PASS2);    // 아이폰 핫스팟 (집 밖)
   while (wifiMulti.run() != WL_CONNECTED) { led(0,0,20); delay(150); led(0,0,0); delay(150); }
-  WiFi.setSleep(false);   // 모뎀 절전 OFF — 켜져 있으면 수신이 ~12KB/s로 붕괴(오디오 스트리밍 불가)
+  // 스마트 절전: 평소 ON(발열·배터리 절약), 녹음·재생 순간에만 OFF (절전시 수신 ~12KB/s로 제한됨)
+  WiFi.setSleep(true);
   logf("WiFi OK %s (%s)\n", WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
 
   // TLS: NTP 시각 동기(12초 제한) 성공 시 CA 검증, 실패 시 setInsecure 폴백 (13-cloud-led 패턴)
@@ -235,12 +239,26 @@ void setup() {
   logf("daijin v3(QoS0+계측) 준비 완료 — BOOT 누르고 말하세요\n");
 }
 
+// 60초마다 자기 상태(칩온도·WiFi·업타임) retained 발행 — 브레인이 status.sh로 읽음
+void publishStatus() {
+  static uint32_t last = 0;
+  if (millis() - last < 60000 && last != 0) return;
+  last = millis();
+  char js[160];
+  snprintf(js, sizeof(js),
+    "{\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u}",
+    temperatureRead(), WiFi.SSID().c_str(), WiFi.RSSI(),
+    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap());
+  mqtt.publish(T_STATUS, (const uint8_t*)js, strlen(js), true);   // retained
+}
+
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {        // 망 이동(집↔핫스팟) 시 재접속
-    led(0,0,20); wifiMulti.run(); WiFi.setSleep(false); LED_IDLE;
+    led(0,0,20); wifiMulti.run(); WiFi.setSleep(true); LED_IDLE;
   }
   if (!mqtt.connected()) mqttConnect();
   mqtt.loop();
+  publishStatus();
 
   // 재생 상태 머신: 프리버퍼 차거나 마지막 청크 오면 시작, 다 비우면 종료
   if (!playing && (ringAvail() >= PREBUF || (gotLast && ringAvail() > 0))) {
@@ -255,6 +273,7 @@ void loop() {
       static int16_t z[512] = {0};
       i2sSpk.write((uint8_t*)z, sizeof(z));     // 팝 방지 무음
       playing = false; gotLast = false; LED_IDLE;
+      WiFi.setSleep(true);                      // 오디오 세션 끝 → 절전 복귀
       logf("재생 완료 · 언더런 %u회\n", underruns);
     }
   }

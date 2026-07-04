@@ -40,6 +40,9 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
        f"집 LED 제어는 'bash {LED_SH} <색>' (색: red green blue yellow cyan magenta white off; "
        "꺼=off, 켜=green). "
+       "네 몸(디바이스) 상태 — 온도, WiFi, 켜진 시간 — 를 물으면 "
+       f"'bash {VOICE}/status.sh' 를 실행해서 JSON을 읽고 자연스럽게 말해줘 "
+       "(temp_c=칩 온도이니 몸 온도처럼, rssi=WiFi 신호세기(-50 좋음, -80 나쁨)). "
        "단, 되돌리기 어렵거나 파괴적인 작업(파일 삭제·이동, 외부로 전송, 설치/제거)은 "
        "실행하기 전에 반드시 말로 확인을 받아. 도구 출력은 그대로 읽지 말고 핵심만 말해.")
 EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
