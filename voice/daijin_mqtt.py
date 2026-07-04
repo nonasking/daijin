@@ -206,9 +206,11 @@ _STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,
 _IDX = [-1,-1,-1,-1,2,4,6,8]
 
 class AdpcmEnc:
-    """스트리밍 인코더 — 조각조각 넣어도 상태(pred/idx/니블·홀수바이트) 유지"""
-    def __init__(self):
+    """스트리밍 인코더 — 조각조각 넣어도 상태(pred/idx/니블·홀수바이트) 유지.
+    vol: 디지털 음량(0~1) — 작은 앰프/스피커의 풀스케일 왜곡(쇳소리) 방지"""
+    def __init__(self, vol=1.0):
         self.pred, self.idx, self.lo, self.rem = 0, 0, None, b""
+        self.vol = vol
 
     def encode(self, pcm):
         import array
@@ -217,6 +219,9 @@ class AdpcmEnc:
         if odd: data, self.rem = data[:-1], data[-1:]
         else:   self.rem = b""
         smp = array.array("h"); smp.frombytes(data)
+        if self.vol < 0.999:
+            for i in range(len(smp)):
+                smp[i] = int(smp[i] * self.vol)
         out = bytearray()
         for s in smp:
             diff = s - self.pred
@@ -255,7 +260,11 @@ def wav_to_pcm(path):
 def publish_pcm_stream(client, pcm_iter):
     """PCM 조각 이터레이터를 받는 즉시 ADPCM 청크로 발행 (TTS 생성과 전송을 겹침)"""
     clip = int(time.time()) & 0xFF
-    enc, buf, seq = AdpcmEnc(), b"", 0
+    try:
+        vol = float(sec("TTS_VOLUME") or "0.6")
+    except ValueError:
+        vol = 0.6
+    enc, buf, seq = AdpcmEnc(vol), b"", 0
     for pcm in pcm_iter:
         buf += enc.encode(pcm)
         while len(buf) >= CHUNK_OUT:
