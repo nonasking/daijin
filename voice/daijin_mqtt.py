@@ -30,15 +30,18 @@ T_AUDIO_OUT = "daijin/audio/out"
 T_TXT_IN    = "daijin/text/in"
 T_TXT_OUT   = "daijin/text/out"
 
-# 허용 도구 = led.sh 호출 형태만 (절대경로/~ 두 표기 모두 매칭)
-ALLOWED_TOOLS = f"Bash(bash {LED_SH} *),Bash(bash ~/esp32-iot/voice/led.sh *)"
+# 허용 도구 — 사용자 결정(2026-07-04)으로 전면 개방. 보안 노트: 브로커 자격증명이
+# 곧 이 맥의 명령 입력 통로가 되므로, HiveMQ 비밀번호 관리가 곧 보안 경계다.
+ALLOWED_TOOLS = "Bash,WebSearch,WebFetch,Read,Glob,Grep,Write,Edit"
 
 SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하고 친근하게 한국어로 "
        "2~3문장 이내로 짧게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽힘). "
-       f"집에 제어 가능한 LED가 있어 — 불을 켜/꺼/색 바꿔 달라고 하면 반드시 "
-       f"'bash {LED_SH} <색>' 을 실행해(색: red green blue yellow cyan magenta white off; "
-       "꺼=off, 켜=green). 실행 후 한국어로 짧게 확인해. LED 요청이 아니면 그냥 대화해. "
-       "LED 제어 외의 명령·파일 접근은 도구가 막혀 있으니 시도하지 말고 말로만 답해.")
+       "너는 이 맥에서 도구를 자유롭게 쓸 수 있어 — 웹 검색, 파일 읽고 쓰기, 셸 명령 실행. "
+       "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
+       f"집 LED 제어는 'bash {LED_SH} <색>' (색: red green blue yellow cyan magenta white off; "
+       "꺼=off, 켜=green). "
+       "단, 되돌리기 어렵거나 파괴적인 작업(파일 삭제·이동, 외부로 전송, 설치/제거)은 "
+       "실행하기 전에 반드시 말로 확인을 받아. 도구 출력은 그대로 읽지 말고 핵심만 말해.")
 EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
 
 def sec(key):
