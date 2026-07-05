@@ -21,8 +21,10 @@ MODEL   = f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
 CLAUDE  = f"{HOME}/.local/bin/claude"
 LED_SH  = f"{VOICE}/led.sh"
 SESSION_FILE = f"{VOICE}/.daijin_session"
-TTS_VOICE = "Yuna"                     # 폴백용 (ElevenLabs 실패 시)
-ELEVEN_VOICE = "TFUX5RKA9yUMr26dSJqF"  # daijin 보이스 (Voice Design으로 생성)
+TTS_VOICE = "Yuna"                     # 최종 폴백 (오프라인 보장)
+ELEVEN_VOICE = "TFUX5RKA9yUMr26dSJqF"  # daijin 보이스 (Voice Design으로 생성, 크레딧제)
+EDGE_VOICE = "de-DE-SeraphinaMultilingualNeural"  # 무료·무제한 기본 보이스 (사용자 선택 2026-07-05)
+EDGE_MP3 = "/tmp/daijin_edge.mp3"
 IN_WAV, OUT_WAV = "/tmp/daijin_in.wav", "/tmp/daijin_reply.wav"
 
 T_AUDIO_IN  = "daijin/audio/in"
@@ -153,14 +155,14 @@ def brain_stream(text):
     yield "미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"
 
 def tts_stream(text):
-    """PCM 16k 조각을 생성되는 즉시 yield.
-    1차: ElevenLabs flash_v2_5 스트리밍 (같은 보이스, 저지연·크레딧 절반)
-    2차 폴백: macOS Yuna (오프라인 보장)"""
+    """PCM 16k 조각을 yield. 엔진은 secrets.local.txt의 TTS_ENGINE으로 선택(브레인 재시작 필요):
+      edge   (기본) — MS 뉴럴 Seraphina, 무료·무제한
+      eleven        — ElevenLabs 커스텀 보이스, 크레딧제(월 1만 무료)
+      yuna          — macOS 내장, 오프라인 보장 (모든 엔진의 최종 폴백)"""
     if not text:
         text = "잘 못 들었어, 다시 말해줄래?"
-    # secrets.local.txt의 TTS_ENGINE=yuna|eleven 로 전환 (기본 eleven, 브레인 재시작 필요)
-    key = sec("ELEVEN_API_KEY")
-    if key and sec("TTS_ENGINE") != "yuna":
+    engine = sec("TTS_ENGINE") or "edge"
+    if engine == "eleven" and sec("ELEVEN_API_KEY"):
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -168,7 +170,8 @@ def tts_stream(text):
                 "?output_format=pcm_16000",
                 data=json.dumps({"text": text,
                                  "model_id": "eleven_flash_v2_5"}).encode(),
-                headers={"xi-api-key": key, "Content-Type": "application/json"})
+                headers={"xi-api-key": sec("ELEVEN_API_KEY"),
+                         "Content-Type": "application/json"})
             resp = urllib.request.urlopen(req, timeout=20)
             first = resp.read(8192)          # 실패면 여기서 예외 → 폴백
             yield first
@@ -178,7 +181,22 @@ def tts_stream(text):
                 yield d
             return
         except Exception as e:
-            print(f"  (ElevenLabs 실패: {e} → Yuna 폴백)")
+            print(f"  (ElevenLabs 실패: {e} → edge 폴백)")
+            engine = "edge"
+    if engine == "edge":
+        try:
+            subprocess.run(["/opt/homebrew/bin/python3", "-m", "edge_tts",
+                            "--voice", EDGE_VOICE, "--text", text,
+                            "--write-media", EDGE_MP3],
+                           check=True, capture_output=True, timeout=20)
+            # mp3(24k) → PCM 16k mono 변환
+            subprocess.run(["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@16000",
+                            "-c", "1", EDGE_MP3, OUT_WAV],
+                           check=True, capture_output=True, timeout=15)
+            yield wav_to_pcm(OUT_WAV)
+            return
+        except Exception as e:
+            print(f"  (edge-tts 실패: {e} → Yuna 폴백)")
     subprocess.run(["/usr/bin/say","-v",TTS_VOICE,"-o",OUT_WAV,
                     "--file-format=WAVE","--data-format=LEI16@16000",text])
     yield wav_to_pcm(OUT_WAV)
