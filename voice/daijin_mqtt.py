@@ -5,7 +5,8 @@
 # 실행:  python3 -u ~/esp32-iot/voice/daijin_mqtt.py   (상시 구동은 LaunchAgent com.daijin.brain)
 #
 # 설계 노트:
-# - 보안: Claude 도구는 led.sh 한 줄만 허용 (--allowedTools 패턴 제한). Bash 전체 개방 금지.
+# - 보안: 도구 전면 개방(사용자 결정 2026-07-04) — 브로커 자격증명이 곧 보안 경계.
+#   상세는 아래 ALLOWED_TOOLS 주석 참조.
 # - 대화 연속성: session_id를 파일(.daijin_session)에 영속 → 재시작해도 이어지고,
 #   같은 디렉토리의 다른 claude 세션과 절대 섞이지 않음 (--continue 사용 금지).
 # - launchd 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속.

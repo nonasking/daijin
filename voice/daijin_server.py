@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ⚠️ LEGACY — daijin_mqtt.py 로 대체됨. 기록용으로만 보존 (실행하지 말 것).
+#   HTTP 방식 구버전이며, `claude --continue` 를 사용함 — 같은 디렉토리의 다른
+#   claude 세션과 대화가 섞일 수 있는 안티패턴 (현행 daijin_mqtt.py 는
+#   세션 id 를 파일에 영속하고 --resume 으로 재개함).
 # daijin 브레인 서버 — ESP32가 녹음한 오디오를 받아 AI 음성 답을 돌려줌.
 #   POST /talk  (body = WAV 오디오) → whisper(STT) → Claude(두뇌) → say(TTS) → WAV 반환
 # 실행:  python3 ~/esp32-iot/voice/daijin_server.py   (포트 8848)

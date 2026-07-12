@@ -12,7 +12,7 @@ Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a Mac brain + 
 
 daijin is not "a better Siri." It's a **different kind of thing**.
 
-- **The brain is an agent that reasons and acts, not a command matcher.** Siri pattern-matches fixed commands. daijin's brain is Claude — it holds a real conversation and *acts* on my scripts, MQTT devices, and data through a (deliberately restricted) shell.
+- **The brain is an agent that reasons and acts, not a command matcher.** Siri pattern-matches fixed commands. daijin's brain is Claude — it holds a real conversation and *acts* on my scripts, MQTT devices, and data through shell access on my Mac.
 - **I own it and I can rewire it.** Personality, prompts, and the set of allowed actions are mine to define. Closed assistants (Siri, Alexa, even ChatGPT voice) can't give you an agent that *works inside your own infrastructure*.
 - **It's a separate being, not an app on my phone.** Something you place on a desk or carry around. A relationship, not a tool.
 
@@ -32,7 +32,7 @@ flowchart LR
     subgraph brain["Mac brain (at home, outbound only)"]
         STT["whisper.cpp<br/>(STT, Korean)"]
         AGENT["Claude<br/>(claude -p, streaming)"]
-        TTS["ElevenLabs / macOS TTS<br/>(sentence by sentence)"]
+        TTS["Edge TTS (default) / ElevenLabs / macOS<br/>(sentence by sentence)"]
         STT --> AGENT --> TTS
     end
 
@@ -45,9 +45,9 @@ flowchart LR
 ```
 
 - **They meet at a cloud broker** → works on any network: home WiFi or a phone hotspot on LTE. The Mac stays home and only goes outbound (no inbound exposure needed).
-- **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer.
+- **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers: a full round trip (record → STT → agent → TTS → playback) typically takes **6–22 s** depending on how much the agent thinks and does — streaming hides part of that, but this is a conversation, not real-time.
 - **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. Downstream audio is **IMA ADPCM-compressed 4:1** and played through a jitter ring buffer on the device.
-- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory and a **tool allowlist locked to one script** — a leaked broker credential cannot become a shell.
+- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker (certificate verification required), credentials kept only in a gitignored `secrets.local.txt`, the Mac makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one).
 
 ### Why ADPCM? (a physics lesson)
 
@@ -67,7 +67,7 @@ daijin **separates the "ears + mouth" (device) from the "brain" (agent) over MQT
 ## Current status
 
 - **Phase 2 shipped** — the device itself listens and speaks: tap BOOT to record, tap again to send; the reply streams back and plays with **zero underruns**, at home or on a phone hotspot outside.
-- **Voice**: a custom voice designed on ElevenLabs (streamed as PCM, flash model), with macOS TTS as an offline-safe fallback (`TTS_ENGINE=` switch).
+- **Voice**: free **Edge TTS** is the default engine (neural multilingual voice); a custom voice designed on ElevenLabs (streamed as PCM, flash model) is opt-in via `TTS_ENGINE=eleven`, with macOS TTS as the offline-safe final fallback.
 - **Device UX**: ready chirp through the speaker, dim-green idle LED, status colors for record/upload/play (LTE connects can take 30+ seconds — sound beats a blinking LED).
 - Earlier milestones: HTTP LAN control → MQTT LAN → HiveMQ Cloud portable control (verified from a phone on LTE) → cloud voice round-trip with a fake device.
 
@@ -93,7 +93,8 @@ sketches/   ESP32 firmware (arduino-cli)
   mic-diag            auto-sweeps every pin/slot combo to find I2S wiring empirically
 voice/      daijin
   daijin_mqtt.py      brain: MQTT client (STT → Claude → streaming TTS → ADPCM chunks)
-  talk.sh             Mac-only voice loop (Phase 0)
+  daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
+  talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
   led.sh              device control for the voice agent
   test_device.py      fake-device round-trip test
   mic_test_server.py  HTTP endpoint for mic verification
@@ -103,7 +104,7 @@ docs/       roadmap · research · audio protocol
 ## Stack
 
 ESP32-S3 · Arduino (arduino-cli) · MQTT (HiveMQ Cloud, TLS/Let's Encrypt) · whisper.cpp (STT, Korean) ·
-Claude CLI (agent brain, stream-json) · ElevenLabs / macOS TTS · IMA ADPCM · launchd
+Claude CLI (agent brain, stream-json) · Edge TTS (default) / ElevenLabs / macOS TTS · IMA ADPCM · launchd
 
 ## Setup notes
 
