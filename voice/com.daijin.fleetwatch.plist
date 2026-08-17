@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daijin.fleetwatch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/kangminsung/esp32-iot/voice/fleet_watch.py</string>
+    </array>
+
+    <!-- 부팅 시 자동 시작 + 죽으면 재시작.
+         설치(수동): cp 이 파일 ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.daijin.fleetwatch.plist
+         워처가 돌면 노드가 죽거나 살아날 때 다이진이 먼저 말한다 — 보드 작업 중엔 꺼두는 게 조용하다. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/kangminsung/esp32-iot/voice/fleetwatch.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/kangminsung/esp32-iot/voice/fleetwatch.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/kangminsung</string>
+    </dict>
+</dict>
+</plist>
