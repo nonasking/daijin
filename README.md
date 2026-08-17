@@ -46,7 +46,7 @@ flowchart LR
 
 - **They meet at a cloud broker** → works on any network: home WiFi or a phone hotspot on LTE. The Mac stays home and only goes outbound (no inbound exposure needed).
 - **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers: a full round trip (record → STT → agent → TTS → playback) typically takes **6–22 s** depending on how much the agent thinks and does — streaming hides part of that, but this is a conversation, not real-time.
-- **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. Downstream audio is **IMA ADPCM-compressed 4:1** and played through a jitter ring buffer on the device.
+- **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. **Both directions are IMA ADPCM-compressed 4:1** — the ~19KB/s bandwidth ceiling applies to the ESP32's send buffer too, so raw 32KB/s PCM can't keep up in either direction. Downstream plays through a jitter ring buffer; upstream is drained by a dedicated capture task so a blocking TLS publish never drops samples.
 - The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker (certificate verification required), credentials kept only in a gitignored `secrets.local.txt`, the Mac makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one).
 
 ### Why ADPCM? (a physics lesson)
@@ -88,6 +88,7 @@ sketches/   ESP32 firmware (arduino-cli)
   12*-funnel          Tailscale Funnel attempt (unstable for portable use — kept as a record)
   13-cloud-led        HiveMQ Cloud (portable ✅)
   14-daijin           the daijin device: mic → cloud → speaker ✅
+  15-home-node        home fleet node: one firmware per NODE_NAME — retained heartbeat, MQTT LWT, servo/relay/DHT/PIR switches
   test-mic            mic verification (record → HTTP → whisper)
   test-speaker        speaker verification (I2S tone melody)
   mic-diag            auto-sweeps every pin/slot combo to find I2S wiring empirically
@@ -96,8 +97,12 @@ voice/      daijin
   daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
   talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
   led.sh              device control for the voice agent
+  dev.sh              command a home node and verify its retained ack
+  fleet.sh            fleet status: ONLINE / STALE(heartbeat gap) / OFFLINE(broker LWT)
+  say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
   test_device.py      fake-device round-trip test
   mic_test_server.py  HTTP endpoint for mic verification
+  tests/              unit tests (ADPCM encoder ⇄ device decoder, sentence splitting) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
 docs/       roadmap · research · audio protocol
 ```
 

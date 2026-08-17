@@ -108,6 +108,30 @@ inline int16_t adpcmNibble(uint8_t c) {
   return (int16_t)adPred;
 }
 
+// ---------- IMA ADPCM 인코더 (16bit PCM → 4bit, 업스트림용) ----------
+// 업로드도 같은 물리 한계(TCP 송신버퍼 5.7KB × RTT 300ms ≈ 19KB/s)에 걸려
+// 원본 PCM(32KB/s)은 실시간 전송 불가 → 4:1 압축(8KB/s)으로 해결. 브레인 AdpcmEnc와 동일 알고리즘.
+static int32_t encPred = 0; static int encIdx = 0; static int encLo = -1;
+
+inline uint8_t adpcmEncode(int16_t s) {
+  int diff = s - encPred;
+  uint8_t code = 0;
+  if (diff < 0) { code = 8; diff = -diff; }
+  int step = ADPCM_STEP[encIdx];
+  if (diff >= step)      { code |= 4; diff -= step; }
+  if (diff >= step >> 1) { code |= 2; diff -= step >> 1; }
+  if (diff >= step >> 2) { code |= 1; }
+  int vp = step >> 3;
+  if (code & 4) vp += step;
+  if (code & 2) vp += step >> 1;
+  if (code & 1) vp += step >> 2;
+  encPred += (code & 8) ? -vp : vp;
+  if (encPred > 32767) encPred = 32767; else if (encPred < -32768) encPred = -32768;
+  encIdx += ADPCM_IDX[code & 7];
+  if (encIdx < 0) encIdx = 0; else if (encIdx > 88) encIdx = 88;
+  return code;
+}
+
 void ringPush16(int16_t s) {
   while (ringFree() < 2) ringPlayChunk();       // 가득 차면 재생으로 비움 (블로킹=실시간)
   size_t off = rw % RING_SZ;
@@ -145,37 +169,76 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
 
 // ---------- 녹음(탭-토글): BOOT 한 번 = 시작, 한 번 더 = 종료·전송 ----------
 // 고정 4초의 문제(말 시작 전 낭비·끝 잘림 → STT 오인식) 해결. 최소 1초, 최대 10초 자동컷.
+//
+// 캡처 태스크 분리 (2026-08-16): I2SClass의 DMA 버퍼는 6×240프레임 ≈ 90ms 고정이라,
+// 같은 루프에서 TLS 발행(수십~수백 ms 블로킹)을 하면 그동안의 샘플이 유실됐다
+// (증상: 음절 사이가 뚝뚝 잘림 → STT 오인식). 캡처는 전용 태스크가 쉬지 않고
+// DMA를 비워 1.5초 링에 쌓고, 메인은 링에서 꺼내 발행만 한다. 재생 지터 버퍼와 대칭.
+#define CAP_SZ 24576                                 // 캡처 링 0.75초분 — 48KB는 TLS 재핸드셰이크 힙(~45KB)을 고갈시켜 재접속 불능(rc=-2)
+static uint8_t capRing[CAP_SZ];
+static volatile size_t capW = 0, capR = 0;           // 누적 쓰기/읽기 (SPSC)
+static volatile bool capturing = false;
+static volatile uint32_t capDrops = 0;
+inline size_t capAvail() { return capW - capR; }
+
+void captureTask(void*) {
+  static int32_t raw[512];
+  while (capturing) {
+    size_t nb = i2sMic.readBytes((char*)raw, sizeof(raw));
+    for (size_t i = 0; i < nb/4; i++) {
+      int32_t v = raw[i] >> 15;                      // x2 게인 (클리핑 방지)
+      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+      int16_t s = (int16_t)v;
+      if (CAP_SZ - capAvail() >= 2) {
+        size_t off = capW % CAP_SZ;
+        capRing[off] = s & 0xFF; capRing[(off + 1) % CAP_SZ] = (s >> 8) & 0xFF;
+        capW += 2;
+      } else capDrops++;                             // 링 포화 (발행이 1.5초 이상 정체)
+    }
+  }
+  vTaskDelete(NULL);
+}
+
 void recordAndPublish() {
   while (digitalRead(BTN) == LOW) delay(10);                   // 시작 탭에서 손 뗄 때까지
   delay(80);                                                   // 디바운스
   WiFi.setSleep(false);                                        // 오디오 세션 시작 → 풀속도
   led(0,40,0);                                                 // 초록 = 녹음 중 (말하세요)
   logf("녹음+전송 시작 (clip %u, 탭-토글)\n", clipId);
-  static int32_t raw[1024];
+  const size_t CHUNK_UP = 2048;                                // ADPCM 청크 (=4096샘플=256ms)
   static uint8_t msg[HDR + CHUNK];
-  const size_t minS = SR * 1, maxS = SR * 10;
-  size_t sent = 0, fill = 0; uint16_t seq = 0;
-  bool done = false;
-  while (!done) {
-    size_t nb = i2sMic.readBytes((char*)raw, sizeof(raw));
-    for (size_t i = 0; i < nb/4; i++) {
-      int32_t v = raw[i] >> 15;                                // x2 게인 (클리핑 방지)
-      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-      int16_t s = (int16_t)v;
-      memcpy(msg + HDR + fill, &s, 2); fill += 2; sent++;
-      bool stopTap = (digitalRead(BTN) == LOW && sent >= minS);// 종료 탭
-      done = stopTap || sent >= maxS;
-      if (fill == CHUNK || done) {
-        msg[0] = clipId; msg[1] = seq >> 8; msg[2] = seq & 0xFF; msg[3] = done ? 1 : 0;
-        if (!mqtt.publish(T_AUDIO_IN, msg, HDR + fill)) logf("청크 %u 발행 실패\n", seq);
-        mqtt.loop();
-        seq++; fill = 0;
-        if (done) break;
-      }
+  const size_t minB = SR * 1 * 2, maxB = SR * 10 * 2;          // 최소/최대 (PCM 바이트)
+  capW = capR = 0; capDrops = 0; capturing = true;
+  encPred = 0; encIdx = 0; encLo = -1;                         // 인코더 리셋 (브레인 디코더와 동기)
+  xTaskCreatePinnedToCore(captureTask, "cap", 4096, NULL, 10, NULL, 0);
+  size_t fill = 0; uint16_t seq = 0;
+  bool lastSent = false;
+  while (!lastSent) {
+    if (capturing && ((digitalRead(BTN) == LOW && capW >= minB) || capW >= maxB))
+      capturing = false;                                       // 종료 탭/자동컷 → 캡처 중단
+    if (capAvail() < 2 && capturing) { delay(5); continue; }   // 캡처 대기
+    while (capAvail() >= 2 && fill < CHUNK_UP) {               // PCM 2바이트 → ADPCM 니블
+      size_t off = capR % CAP_SZ;
+      int16_t s = (int16_t)(capRing[off] | (capRing[(off + 1) % CAP_SZ] << 8));
+      capR += 2;
+      uint8_t code = adpcmEncode(s);
+      if (encLo < 0) encLo = code;
+      else { msg[HDR + fill++] = encLo | (code << 4); encLo = -1; }
+    }
+    bool last = (!capturing && capAvail() < 2);                // 링까지 다 비움 = 마지막
+    if (last && encLo >= 0) { msg[HDR + fill++] = (uint8_t)encLo; encLo = -1; }  // 홀수 니블
+    if (fill == CHUNK_UP || last) {
+      msg[0] = clipId; msg[1] = seq >> 8; msg[2] = seq & 0xFF;
+      msg[3] = (last ? 1 : 0) | 2;                             // bit1 = ADPCM
+      if (!mqtt.publish(T_AUDIO_IN, msg, HDR + fill)) logf("청크 %u 발행 실패\n", seq);
+      mqtt.loop();
+      seq++; fill = 0;
+      lastSent = last;
     }
   }
   led(40,40,0);                                                // 노랑 = 전송 마무리
-  logf("전송 완료: %u 청크 (%.1f초)\n", seq, sent / (float)SR);
+  if (capDrops) logf("경고: 캡처 링 포화로 %u 샘플 유실\n", (unsigned)capDrops);
+  logf("전송 완료: %u 청크 (%.1f초)\n", seq, (capW / 2) / (float)SR);
   clipId++;
   while (digitalRead(BTN) == LOW) delay(10);                   // 종료 탭 손 뗄 때까지
   delay(120);                                                  // 디바운스 (재시작 방지)

@@ -32,6 +32,9 @@ T_AUDIO_IN  = "daijin/audio/in"
 T_AUDIO_OUT = "daijin/audio/out"
 T_TXT_IN    = "daijin/text/in"
 T_TXT_OUT   = "daijin/text/out"
+# 능동 발화 — 다이진이 먼저 말하는 경로 (음성 입력 없이 텍스트로 발화 트리거)
+T_SAY       = "daijin/say"    # 페이로드 텍스트를 그대로 TTS → 스피커 (알림·차임용)
+T_ASK       = "daijin/ask"    # 페이로드를 에이전트에 전달 → 스스로 표현해 말함 (보고용)
 
 # 허용 도구 — 사용자 결정(2026-07-04)으로 전면 개방. 보안 노트: 브로커 자격증명이
 # 곧 이 맥의 명령 입력 통로가 되므로, HiveMQ 비밀번호 관리가 곧 보안 경계다.
@@ -43,6 +46,10 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
        f"집 LED 제어는 'bash {LED_SH} <색>' (색: red green blue yellow cyan magenta white off; "
        "꺼=off, 켜=green). "
+       f"집안 홈 노드(dev1, dev2 등) 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' "
+       "(명령: led:색, servo:0~180, relay:on/off, fan:on/off, ping — ack까지 확인해줘). "
+       f"홈 노드들의 상태·온라인 여부 조회는 'bash {VOICE}/fleet.sh' "
+       "(OFFLINE=전원/네트워크 끊김, STALE=하트비트 끊김 — 발견하면 원인 추측과 함께 알려줘). "
        "네 몸(디바이스) 상태 — 온도, WiFi, 켜진 시간 — 를 물으면 "
        f"'bash {VOICE}/status.sh' 를 실행해서 JSON을 읽고 자연스럽게 말해줘 "
        "(temp_c=칩 온도이니 몸 온도처럼, rssi=WiFi 신호세기(-50 좋음, -80 나쁨)). "
@@ -67,8 +74,16 @@ def save_session(sid):
     if sid:
         open(SESSION_FILE, "w").write(sid)
 
+# 어휘 바이어스 — 도메인 단어를 알려주면 오인식이 크게 줄어드는 것을 실측으로 확인
+# (2026-08-16: 같은 녹음에서 "빨갛을 켜줘" → "빨간 불 켜 줘"로 교정됨)
+# 주의: whisper는 프롬프트를 "직전 대화 전사"로 취급한다. 라벨식("장치 이름: ...")으로 쓰면
+# 그 라벨이 전사 앞에 새어 들어옴(실측 2026-08-17) → 자연스러운 문장 나열로 쓸 것.
+STT_PROMPT = ("다이진, dev1 파란불 켜 줘. dev2 빨간불 꺼 줘. "
+              "장치 상태 알려줘. 전부 꺼 줘. 응, 알았어.")
+
 def stt(wav):
-    r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np","-f",wav],
+    r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
+                        "--prompt",STT_PROMPT,"-f",wav],
                        capture_output=True, text=True)
     return r.stdout.strip()
 
@@ -267,6 +282,28 @@ class AdpcmEnc:
             return b
         return b""
 
+class AdpcmDec:
+    """업스트림(디바이스 녹음) 디코더 — 펌웨어 adpcmEncode의 거울.
+    업로드도 다운로드와 같은 대역 한계(~19KB/s)라 디바이스가 4:1 압축해 보낸다 (2026-08-17)."""
+    def __init__(self):
+        self.pred, self.idx = 0, 0
+
+    def decode(self, data):
+        import array
+        out = array.array("h")
+        for b in data:
+            for c in (b & 0x0F, b >> 4):
+                step = _STEP[self.idx]
+                vp = step >> 3
+                if c & 4: vp += step
+                if c & 2: vp += step >> 1
+                if c & 1: vp += step >> 2
+                self.pred += -vp if c & 8 else vp
+                self.pred = max(-32768, min(32767, self.pred))
+                self.idx = max(0, min(88, self.idx + _IDX[c & 7]))
+                out.append(self.pred)
+        return out.tobytes()
+
 def pcm_to_wav(pcm, path):
     with wave.open(path, "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
@@ -298,8 +335,10 @@ def publish_pcm_stream(client, pcm_iter):
     return seq + 1
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    print(f"✅ HiveMQ 연결 (rc={reason_code}) → 구독 {T_AUDIO_IN}")
+    print(f"✅ HiveMQ 연결 (rc={reason_code}) → 구독 {T_AUDIO_IN}, {T_SAY}, {T_ASK}")
     client.subscribe(T_AUDIO_IN, qos=1)
+    client.subscribe(T_SAY, qos=1)
+    client.subscribe(T_ASK, qos=1)
 
 def handle_clip(client, pcm_or_wav, is_wav):
     t0 = time.monotonic()
@@ -322,18 +361,36 @@ def handle_clip(client, pcm_or_wav, is_wav):
         client.publish(T_AUDIO_OUT, data)
         print(f"  📤 답 발행(통WAV) {len(data)} bytes · ⏱️ {time.monotonic()-t0:.1f}s")
     else:       # 신형(ESP32): 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
-        sentences = []
-        def gen():
-            src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
-            for s in src:
-                sentences.append(s)
-                print(f"  🤖 daijin: {s}  (+{time.monotonic()-t0:.1f}s)")
-                for pcm in tts_stream(s):
-                    yield pcm
-                yield b"\x00" * 3200          # 문장 사이 0.1초 숨고르기
-        n = publish_pcm_stream(client, gen())
-        client.publish(T_TXT_OUT, " ".join(sentences))
-        print(f"  📤 답 발행 {n} 청크 · ⏱️ {time.monotonic()-t0:.1f}s")
+        src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
+        speak_stream(client, src, t0)
+
+def speak_stream(client, sentence_iter, t0):
+    """문장 이터레이터를 스트리밍 TTS→ADPCM 발행. 음성 응답과 능동 발화의 공통 출구."""
+    sentences = []
+    def gen():
+        for s in sentence_iter:
+            sentences.append(s)
+            print(f"  🤖 daijin: {s}  (+{time.monotonic()-t0:.1f}s)")
+            for pcm in tts_stream(s):
+                yield pcm
+            yield b"\x00" * 3200              # 문장 사이 0.1초 숨고르기
+    n = publish_pcm_stream(client, gen())
+    client.publish(T_TXT_OUT, " ".join(sentences))
+    print(f"  📤 답 발행 {n} 청크 · ⏱️ {time.monotonic()-t0:.1f}s")
+
+def handle_say(client, text):
+    """daijin/say — 받은 텍스트를 그대로 말한다 (에이전트 미경유, 알림·차임용)"""
+    t0 = time.monotonic()
+    print(f"\n📢 say: {text}")
+    speak_stream(client, iter([text]), t0)
+
+def handle_ask(client, text):
+    """daijin/ask — 상황 텍스트를 에이전트에 넣고, 다이진이 스스로 표현해 말한다.
+    세션 고정을 그대로 타므로 대화 맥락·기억도 이어진다 (보고·능동 알림용)"""
+    t0 = time.monotonic()
+    print(f"\n📨 ask: {text}")
+    client.publish(T_TXT_IN, f"[ask] {text}")
+    speak_stream(client, brain_stream(text), t0)
 
 # 처리(whisper/Claude/TTS/발행)는 워커 스레드에서 — paho 네트워크 스레드(콜백)에서 하면
 # publish가 콜백 종료까지 실제 송신되지 않아 스트리밍이 무효화됨
@@ -341,31 +398,44 @@ _clipq = queue.Queue()
 
 def worker(client):
     while True:
-        pcm_or_wav, is_wav = _clipq.get()
+        kind, data = _clipq.get()
         try:
-            handle_clip(client, pcm_or_wav, is_wav)
+            if   kind == "wav": handle_clip(client, data, True)
+            elif kind == "pcm": handle_clip(client, data, False)
+            elif kind == "say": handle_say(client, data)
+            elif kind == "ask": handle_ask(client, data)
         except Exception as e:
             print(f"  ⚠️ 처리 오류: {e}")
 
 def on_message(client, userdata, msg):
+    if msg.topic == T_SAY:
+        _clipq.put(("say", msg.payload.decode("utf-8", "replace").strip()))
+        return
+    if msg.topic == T_ASK:
+        _clipq.put(("ask", msg.payload.decode("utf-8", "replace").strip()))
+        return
     if msg.topic != T_AUDIO_IN:
         return
     p = msg.payload
     if p[:4] == b"RIFF":                      # 구형: 통 WAV 한 방
         print(f"\n🎧 통WAV 수신 {len(p)} bytes")
-        _clipq.put((p, True))
+        _clipq.put(("wav", p))
         return
     if len(p) <= 4:
         return
     clip, seq, last = p[0], (p[1] << 8) | p[2], p[3] & 1
     if _rx["clip"] != clip:                   # 새 클립 시작
         _rx["clip"], _rx["parts"] = clip, {}
+        _rx["adpcm"] = bool(p[3] & 2)         # bit1 = ADPCM 압축 클립
     _rx["parts"][seq] = p[4:]
     if last:
-        pcm = b"".join(_rx["parts"][k] for k in sorted(_rx["parts"]))
-        print(f"\n🎧 클립 {clip} 수신: {len(_rx['parts'])} 청크, {len(pcm)} bytes")
+        data = b"".join(_rx["parts"][k] for k in sorted(_rx["parts"]))
+        if _rx.get("adpcm"):
+            data = AdpcmDec().decode(data)    # 4:1 해제 → 원본 PCM
+        print(f"\n🎧 클립 {clip} 수신: {len(_rx['parts'])} 청크, "
+              f"{len(data)} bytes{' (ADPCM)' if _rx.get('adpcm') else ''}")
         _rx["clip"], _rx["parts"] = None, {}
-        _clipq.put((pcm, False))
+        _clipq.put(("pcm", data))
 
 c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-brain")
 c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
