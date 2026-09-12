@@ -39,6 +39,19 @@ T_ASK       = "daijin/ask"    # 페이로드를 에이전트에 전달 → 스�
 # 허용 도구 — 사용자 결정(2026-07-04)으로 전면 개방. 보안 노트: 브로커 자격증명이
 # 곧 이 맥의 명령 입력 통로가 되므로, HiveMQ 비밀번호 관리가 곧 보안 경계다.
 ALLOWED_TOOLS = "Bash,WebSearch,WebFetch,Read,Glob,Grep,Write,Edit"
+# 속도: 모델은 secrets의 BRAIN_MODEL(기본 sonnet-5, 명령 판단엔 충분하고 첫 토큰이 빠름),
+# MCP(Gmail 등)는 매 턴 접속 비용만 들어서 끈다 (--strict-mcp-config + 빈 설정).
+def _speed_opts():
+    return ["--model", sec("BRAIN_MODEL") or "claude-sonnet-5",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
+def _props():
+    """voice/props.txt: 각 노드에 물려 있는 물리 소품 설명. 있으면 시스템 프롬프트에 붙인다."""
+    try:
+        t = open(f"{VOICE}/props.txt", encoding="utf-8").read().strip()
+        return (" 지금 홈 노드들에 붙어 있는 실제 소품과 할 수 있는 장난: " + t.replace("\n", " ") + " ") if t else ""
+    except FileNotFoundError:
+        return ""
 
 SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하고 친근하게 한국어로 "
        "2~3문장 이내로 짧게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽힘). "
@@ -46,15 +59,18 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
        f"집 LED 제어는 'bash {LED_SH} <색>' (색: red green blue yellow cyan magenta white off; "
        "꺼=off, 켜=green). "
-       f"집안 홈 노드(dev1, dev2 등) 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' "
-       "(명령: led:색, servo:0~180, relay:on/off, fan:on/off, ping — ack까지 확인해줘). "
+       f"집안 홈 노드 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' (노드는 1번=dev1, 2번=dev2. 사용자는 1번·2번이라 부르고 dev.sh도 1 또는 1번을 받아; 말할 때도 1번, 2번이라고 불러) "
+       "(명령: led:색 · servo:0~180 · poke:각도[:ms]=갔다가 원위치(스위치 누르기·풍선 터뜨리기) · "
+       "relay:on/off/pulse[:ms] · fan:on/off · step:±각도(스텝모터, 느림) · motor[:각도]=노드 종류 상관없이 모터 돌리기(서보면 갔다 옴, 스텝이면 회전; 모터 돌려달라면 이걸 써) · buzz:alarm/ok/fail/ms · ping · caps. "
+       "ack까지 확인하고, err:unknown이면 그 노드에 그 기능이 없는 거야). "
        f"홈 노드들의 상태·온라인 여부 조회는 'bash {VOICE}/fleet.sh' "
        "(OFFLINE=전원/네트워크 끊김, STALE=하트비트 끊김 — 발견하면 원인 추측과 함께 알려줘). "
        "네 몸(디바이스) 상태 — 온도, WiFi, 켜진 시간 — 를 물으면 "
        f"'bash {VOICE}/status.sh' 를 실행해서 JSON을 읽고 자연스럽게 말해줘 "
        "(temp_c=칩 온도이니 몸 온도처럼, rssi=WiFi 신호세기(-50 좋음, -80 나쁨)). "
        "단, 되돌리기 어렵거나 파괴적인 작업(파일 삭제·이동, 외부로 전송, 설치/제거)은 "
-       "실행하기 전에 반드시 말로 확인을 받아. 도구 출력은 그대로 읽지 말고 핵심만 말해.")
+       "실행하기 전에 반드시 말로 확인을 받아. 도구 출력은 그대로 읽지 말고 핵심만 말해."
+       + _props())
 EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
 
 def sec(key):
@@ -78,8 +94,13 @@ def save_session(sid):
 # (2026-08-16: 같은 녹음에서 "빨갛을 켜줘" → "빨간 불 켜 줘"로 교정됨)
 # 주의: whisper는 프롬프트를 "직전 대화 전사"로 취급한다. 라벨식("장치 이름: ...")으로 쓰면
 # 그 라벨이 전사 앞에 새어 들어옴(실측 2026-08-17) → 자연스러운 문장 나열로 쓸 것.
-STT_PROMPT = ("다이진, dev1 파란불 켜 줘. dev2 빨간불 꺼 줘. "
-              "장치 상태 알려줘. 전부 꺼 줘. 응, 알았어.")
+STT_PROMPT = ("다이진, 1번 모터 돌려 줘. 2번 부저 울려 줘. 1번이랑 2번 순서대로 돌려 줘. "
+              "장치 상태 알려줘. 전부 꺼 줘. 장난 좀 쳐 줘. 응, 알았어.")
+
+# STT가 노드 이름을 제각각 적는다("대부 1", "데브 1", "dev 1", "1번 장치") → 브레인에 넘기기 전에 "1번"으로 통일
+_NODE_ALIAS = re.compile(r"(?<![0-9])(?:(?:dev|데브|대브|대부|디브|devi)\s*([12])|([12])\s*번(?:\s*(?:장치|노드|기기))?)(?![0-9])", re.I)
+def normalize_nodes(t):
+    return _NODE_ALIAS.sub(lambda m: (m.group(1) or m.group(2)) + "번", t)
 
 def stt(wav):
     r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
@@ -89,7 +110,7 @@ def stt(wav):
 
 def _claude_once(text, resume_id):
     cmd = [CLAUDE, "-p", text, "--output-format", "json",
-           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS]
+           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
     if resume_id:
         cmd += ["--resume", resume_id]
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=VOICE, stdin=subprocess.DEVNULL)
@@ -125,7 +146,7 @@ def brain_stream(text):
     def run(resume_id):
         cmd = [CLAUDE, "-p", text, "--output-format", "stream-json",
                "--include-partial-messages", "--verbose",
-               "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS]
+               "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
         if resume_id:
             cmd += ["--resume", resume_id]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
@@ -347,7 +368,7 @@ def handle_clip(client, pcm_or_wav, is_wav):
             f.write(pcm_or_wav)
     else:
         pcm_to_wav(pcm_or_wav, IN_WAV)
-    user = stt(IN_WAV)
+    user = normalize_nodes(stt(IN_WAV))
     print(f"  🗣️  나: {user}")
     client.publish(T_TXT_IN, user)
     if is_wav:  # 구형(파이썬 가짜 디바이스): 통 WAV로 응답
