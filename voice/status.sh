@@ -3,11 +3,20 @@
 # 디바이스가 daijin/status 에 retained로 발행하는 JSON(온도·WiFi·업타임)을 읽어온다.
 # 사용법: bash status.sh
 SEC="$HOME/esp32-iot/secrets.local.txt"
-H=$(grep '^MQTT_CLOUD_HOST=' "$SEC" 2>/dev/null | cut -d= -f2-)
-PORT=$(grep '^MQTT_CLOUD_PORT=' "$SEC" 2>/dev/null | cut -d= -f2-)
-U=$(grep '^MQTT_CLOUD_USER=' "$SEC" 2>/dev/null | cut -d= -f2-)
-P=$(grep '^MQTT_CLOUD_PASS=' "$SEC" 2>/dev/null | cut -d= -f2-)
-OUT=$(mosquitto_sub -h "$H" -p "$PORT" --cafile /etc/ssl/cert.pem -u "$U" -P "$P" \
+# 로컬 mosquitto(1883, 평문)로 붙는다 — HiveMQ 브리지가 클라우드와 동기화 (mosquitto.conf 참고).
+# 클라우드 직결(TLS 왕복 1.3초)보다 명령당 3초 이상 빠르다. 로컬 브로커가 죽어 있으면 클라우드로 폴백.
+H=localhost; PORT=1883
+U=$(grep '^MQTT_USER=' "$SEC" 2>/dev/null | cut -d= -f2-)
+P=$(grep '^MQTT_PASS=' "$SEC" 2>/dev/null | cut -d= -f2-)
+CAFILE=()
+if ! nc -z localhost 1883 2>/dev/null; then
+  H=$(grep '^MQTT_CLOUD_HOST=' "$SEC" 2>/dev/null | cut -d= -f2-)
+  PORT=$(grep '^MQTT_CLOUD_PORT=' "$SEC" 2>/dev/null | cut -d= -f2-)
+  U=$(grep '^MQTT_CLOUD_USER=' "$SEC" 2>/dev/null | cut -d= -f2-)
+  P=$(grep '^MQTT_CLOUD_PASS=' "$SEC" 2>/dev/null | cut -d= -f2-)
+  CAFILE=(--cafile /etc/ssl/cert.pem)
+fi
+OUT=$(mosquitto_sub -h "$H" -p "$PORT" "${CAFILE[@]}" -u "$U" -P "$P" \
       -t daijin/status -C 1 -W 5 2>/dev/null)
 if [ -n "$OUT" ]; then
   echo "$OUT"

@@ -3,12 +3,26 @@
 import sys, json, time
 
 now = time.time()
+# 같은 노드의 메시지가 여러 개 오면(retained + 미러 사본) ts가 가장 큰 것 하나만 쓴다
+latest = {}
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
     topic, _, payload = line.partition(" ")
+    try:
+        ts = json.loads(payload).get("ts", 0)
+    except Exception:
+        ts = 0
+    if topic not in latest or ts >= latest[topic][0]:
+        latest[topic] = (ts, line)
+for _, line in sorted(latest.values(), key=lambda x: x[1]):
+    line = line.strip()
+    if not line:
+        continue
+    topic, _, payload = line.partition(" ")
     node = topic.split("/")[2] if topic.count("/") >= 2 else topic
+    node = {"dev1": "1번(dev1)", "dev2": "2번(dev2)"}.get(node, node)
     try:
         d = json.loads(payload)
     except Exception:
@@ -24,5 +38,7 @@ for line in sys.stdin:
     if "room_c" in d and d["room_c"] != -1:
         extra = f' 실내 {d["room_c"]}°C/{d.get("room_rh", "?")}%'
     tail = f" · 하트비트 {age}초 전" if age is not None else " · 시간 미동기"
+    if d.get("ssid"):
+        tail += f' · 망 {d["ssid"]}'
     print(f'{node}: {state} · 칩 {d.get("chip_c", "?")}°C · RSSI {d.get("rssi", "?")}'
           f' · 업타임 {d.get("up_s", "?")}초{tail}{extra}')

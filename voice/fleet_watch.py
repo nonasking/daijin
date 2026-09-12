@@ -13,6 +13,11 @@ import json, os, ssl, time
 HOME = os.path.expanduser("~")
 SEC  = f"{HOME}/esp32-iot/secrets.local.txt"
 T_STATUS = "daijin/dev/+/status"
+T_MAIN   = "daijin/status"      # 메인 디바이스 상태 (status.sh용)
+# 로컬 브로커 미러: 브리지는 라이브 메시지의 retain 플래그를 못 살려서(MQTT 규격) 로컬 retained가
+# 낡은 값으로 남는다. 그래서 클라우드에서 받은 상태를 로컬(1883)에 retained로 다시 써준다.
+# fleet.sh/status.sh/dev.sh가 로컬에서 즉시 최신 상태를 읽을 수 있는 근거.
+LOCAL_HOST, LOCAL_PORT = "localhost", 1883
 T_ASK    = "daijin/ask"
 STALE_S    = 90     # 하트비트(30초 주기)가 이 시간 이상 끊기면 STALE
 COOLDOWN_S = 60     # 노드별 최소 보고 간격
@@ -42,7 +47,19 @@ def report(client, node, text, kind):
     st[key] = time.time()
     ask(client, text)
 
+local = None   # 로컬 미러 클라이언트 (연결 실패 시 None → 미러 생략)
+
+def mirror(topic, payload):
+    if local is not None:
+        try:
+            local.publish(topic, payload, qos=0, retain=True)
+        except Exception as e:
+            print(f"(로컬 미러 실패: {e})")
+
 def on_message(client, userdata, msg):
+    mirror(msg.topic, msg.payload)
+    if not msg.topic.startswith("daijin/dev/"):
+        return
     node = msg.topic.split("/")[2]
     try:
         d = json.loads(msg.payload)
@@ -89,6 +106,7 @@ def stale_check(client):
 def on_connect(client, userdata, flags, rc, properties):
     print(f"✅ 브로커 연결 → 구독 {T_STATUS}")
     client.subscribe(T_STATUS, qos=1)
+    client.subscribe(T_MAIN, qos=0)
 
 c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-fleetwatch")
 c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
@@ -98,6 +116,13 @@ c.on_connect = on_connect
 c.on_message = on_message
 
 print("👁️ fleet_watch 시작")
+try:
+    _l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
+    _l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
+    _l.connect(LOCAL_HOST, LOCAL_PORT, 60); _l.loop_start(); local = _l
+    print("🪞 로컬 브로커 미러 ON (localhost:1883)")
+except Exception as e:
+    print(f"🪞 로컬 브로커 없음, 미러 생략 ({e})")
 while True:
     try:
         c.connect(sec("MQTT_CLOUD_HOST"), int(sec("MQTT_CLOUD_PORT")), 60)
