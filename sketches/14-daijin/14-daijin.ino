@@ -15,6 +15,7 @@
 #include <time.h>
 #include "secrets.h"     // WIFI_SSID/PASS, MQTT_HOST/PORT/USER/PASS
 #include "ca_cert.h"     // ISRG Root X1 (Let's Encrypt)
+#include "face_types.h"  // OLED 얼굴 상태 enum
 
 #define RGB_PIN 48
 #define BTN     0
@@ -46,6 +47,83 @@ bool playing = false;
 inline void led(uint8_t r,uint8_t g,uint8_t b){ neopixelWrite(RGB_PIN,r,g,b); }
 #define LED_IDLE led(0,5,0)                     // 은은한 초록 = 대기(살아있음)
 
+// ---------- 얼굴: SSD1306 128x64 I2C OLED (SDA=8, SCL=9, 주소 0x3C) ----------
+// 파이프라인 단계를 표정으로 보여준다. OLED가 안 꽂혀 있으면 자동으로 건너뛴다(hasFace=false).
+// 그리기는 상태 전환 때와 애니메이션 틱(150~400ms)에서만: I2C 1KB 전송 ≈ 25ms라 오디오에 영향 없음.
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#define OLED_SDA 8
+#define OLED_SCL 9
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+bool hasFace = false;
+Face faceState = F_IDLE;
+uint32_t faceSince = 0, faceTickAt = 0;
+bool faceFrame = false;
+
+void drawEye(int cx, int cy, int w, int h, int px, int py) {   // 눈(흰 타원) + 눈동자(검정)
+  oled.fillRoundRect(cx - w/2, cy - h/2, w, h, h/3, SSD1306_WHITE);
+  if (h > 6) oled.fillCircle(cx + px, cy + py, h/6 + 2, SSD1306_BLACK);
+}
+void drawFace() {
+  if (!hasFace) return;
+  oled.clearDisplay();
+  int lx = 38, rx = 90, ey = 26;
+  switch (faceState) {
+    case F_IDLE:                                              // 평소: 가끔 깜빡
+      if (faceFrame) { oled.fillRect(lx-14, ey-1, 28, 3, SSD1306_WHITE); oled.fillRect(rx-14, ey-1, 28, 3, SSD1306_WHITE); }
+      else { drawEye(lx, ey, 28, 22, 0, 0); drawEye(rx, ey, 28, 22, 0, 0); }
+      oled.fillRoundRect(54, 48, 20, 4, 2, SSD1306_WHITE);   // 다문 입
+      break;
+    case F_LISTEN:                                            // 듣는 중: 눈 크게, 입 살짝 벌림
+      drawEye(lx, ey, 34, 30, 0, 0); drawEye(rx, ey, 34, 30, 0, 0);
+      oled.drawRoundRect(52, 46, 24, 10, 4, SSD1306_WHITE);
+      break;
+    case F_UPLOAD:                                            // 보내는 중: 위를 봄
+      drawEye(lx, ey, 28, 22, 0, -4); drawEye(rx, ey, 28, 22, 0, -4);
+      oled.fillRoundRect(54, 48, 20, 4, 2, SSD1306_WHITE);
+      break;
+    case F_THINK: {                                           // 생각 중: 눈동자 좌우로
+      int px = faceFrame ? 6 : -6;
+      drawEye(lx, ey, 28, 22, px, -2); drawEye(rx, ey, 28, 22, px, -2);
+      oled.fillRoundRect(50, 48, 28, 3, 1, SSD1306_WHITE);
+      for (int i = 0; i < 3; i++) oled.fillCircle(104 + i*7, 58, 2, (i == ((millis()/300)%3)) ? SSD1306_WHITE : SSD1306_BLACK);
+      break; }
+    case F_SPEAK:                                             // 말하는 중: 입이 열렸다 닫혔다
+      drawEye(lx, ey, 28, 22, 0, 0); drawEye(rx, ey, 28, 22, 0, 0);
+      if (faceFrame) oled.fillRoundRect(50, 44, 28, 14, 6, SSD1306_WHITE);
+      else           oled.fillRoundRect(52, 48, 24, 5, 2, SSD1306_WHITE);
+      break;
+    case F_ERROR:                                             // 오류: X 눈
+      for (int x : {lx, rx}) { oled.drawLine(x-10, ey-10, x+10, ey+10, SSD1306_WHITE); oled.drawLine(x-10, ey+10, x+10, ey-10, SSD1306_WHITE); }
+      oled.drawRoundRect(52, 48, 24, 8, 3, SSD1306_WHITE);
+      break;
+  }
+  oled.display();
+}
+void face(Face f) { if (faceState != f) { faceState = f; faceSince = millis(); faceFrame = false; faceTickAt = 0; drawFace(); } }
+void faceTick() {                                             // loop()에서 호출: 상태별 애니메이션
+  if (!hasFace) return;
+  uint32_t now = millis(), period;
+  switch (faceState) {
+    case F_IDLE:  period = faceFrame ? 120 : 2600 + (now % 1500); break;   // 깜빡: 짧게 감고 오래 뜸
+    case F_THINK: period = 400; break;
+    case F_SPEAK: period = 160; break;
+    default:      period = 1000; break;
+  }
+  if (now - faceTickAt < period) return;
+  faceTickAt = now; faceFrame = !faceFrame;
+  if (faceState == F_IDLE || faceState == F_THINK || faceState == F_SPEAK) drawFace();
+  if (faceState == F_THINK && now - faceSince > 90000) face(F_IDLE);      // 답이 영영 안 오면 원래 얼굴로
+}
+void faceInit() {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.beginTransmission(0x3C);
+  if (Wire.endTransmission() != 0) { logf("OLED 없음 (얼굴 생략)\n"); return; }
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { logf("OLED 초기화 실패\n"); return; }
+  hasFace = true; oled.setRotation(0); face(F_IDLE); logf("OLED 얼굴 OK\n");
+}
+
 void chirp() {                                  // "띠링" = 준비 완료 (LTE에선 연결에 30초+ 걸려 소리로 알림)
   static int16_t b[800];
   const float fr[2] = {660.f, 990.f};
@@ -64,7 +142,7 @@ void logf(const char* fmt, ...) {
 // ---------- 재생: 링버퍼(지터 버퍼) — 0.75초 쌓이면 재생 시작 ----------
 // 네트워크 도착 간격이 출렁여도 버퍼가 흡수해 끊김 없는 재생
 #define RING_SZ  65536                          // 2초분
-#define PREBUF   24576                          // 0.75초 차면 재생 시작
+#define PREBUF   12800                          // 0.4초 차면 재생 시작 (ADPCM 8KB/s vs 회선 ~19KB/s라 여유; 0.75→0.4로 체감 지연 단축)
 static uint8_t ring[RING_SZ];
 static volatile size_t rw = 0, rr = 0;          // 누적 write/read 바이트
 static volatile bool gotLast = false;
@@ -204,6 +282,7 @@ void recordAndPublish() {
   delay(80);                                                   // 디바운스
   WiFi.setSleep(false);                                        // 오디오 세션 시작 → 풀속도
   led(0,40,0);                                                 // 초록 = 녹음 중 (말하세요)
+  face(F_LISTEN);
   logf("녹음+전송 시작 (clip %u, 탭-토글)\n", clipId);
   const size_t CHUNK_UP = 2048;                                // ADPCM 청크 (=4096샘플=256ms)
   static uint8_t msg[HDR + CHUNK];
@@ -237,12 +316,14 @@ void recordAndPublish() {
     }
   }
   led(40,40,0);                                                // 노랑 = 전송 마무리
+  face(F_UPLOAD);
   if (capDrops) logf("경고: 캡처 링 포화로 %u 샘플 유실\n", (unsigned)capDrops);
   logf("전송 완료: %u 청크 (%.1f초)\n", seq, (capW / 2) / (float)SR);
   clipId++;
   while (digitalRead(BTN) == LOW) delay(10);                   // 종료 탭 손 뗄 때까지
   delay(120);                                                  // 디바운스 (재시작 방지)
   LED_IDLE;
+  face(F_THINK);                                               // 답이 올 때까지 생각하는 얼굴
 }
 
 // ---------- 연결 ----------
@@ -265,6 +346,7 @@ void setup() {
   Serial.begin(115200); Serial0.begin(115200);
   pinMode(BTN, INPUT_PULLUP);
   led(20,20,20);
+  faceInit();                                    // OLED 있으면 얼굴, 없으면 조용히 생략
 
   wifiMulti.addAP(WIFI_SSID, WIFI_PASS);      // 집
   wifiMulti.addAP(WIFI_SSID2, WIFI_PASS2);    // 아이폰 핫스팟 (집 밖)
@@ -288,12 +370,12 @@ void setup() {
   // 마이크: 32비트 프레임 필수 (INMP441)
   i2sMic.setPins(MIC_SCK, MIC_WS, -1, MIC_SD, -1);
   if (!i2sMic.begin(I2S_MODE_STD, SR, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
-    logf("마이크 I2S 실패\n"); led(40,0,0); while(1) delay(1000);
+    logf("마이크 I2S 실패\n"); led(40,0,0); face(F_ERROR); while(1) delay(1000);
   }
   // 스피커: 16비트 TX
   i2sSpk.setPins(SPK_BCK, SPK_LRC, SPK_DIN, -1, -1);
   if (!i2sSpk.begin(I2S_MODE_STD, SR, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
-    logf("스피커 I2S 실패\n"); led(40,0,0); while(1) delay(1000);
+    logf("스피커 I2S 실패\n"); led(40,0,0); face(F_ERROR); while(1) delay(1000);
   }
 
   mqttConnect();
@@ -322,10 +404,12 @@ void loop() {
   if (!mqtt.connected()) mqttConnect();
   mqtt.loop();
   publishStatus();
+  faceTick();
 
   // 재생 상태 머신: 프리버퍼 차거나 마지막 청크 오면 시작, 다 비우면 종료
   if (!playing && (ringAvail() >= PREBUF || (gotLast && ringAvail() > 0))) {
     playing = true; led(0,30,30);               // 청록 = 재생
+    face(F_SPEAK);
   }
   if (playing) {
     if (ringAvail() == 0 && !gotLast) {         // 버퍼 고갈 = 언더런 (끊김 지점)
@@ -335,7 +419,7 @@ void loop() {
     if (gotLast && ringAvail() == 0) {
       static int16_t z[512] = {0};
       i2sSpk.write((uint8_t*)z, sizeof(z));     // 팝 방지 무음
-      playing = false; gotLast = false; LED_IDLE;
+      playing = false; gotLast = false; LED_IDLE; face(F_IDLE);
       WiFi.setSleep(true);                      // 오디오 세션 끝 → 절전 복귀
       logf("재생 완료 · 언더런 %u회\n", underruns);
     }
