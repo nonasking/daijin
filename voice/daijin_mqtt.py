@@ -102,6 +102,15 @@ _NODE_ALIAS = re.compile(r"(?<![0-9])(?:(?:dev|데브|대브|대부|디브|devi)
 def normalize_nodes(t):
     return _NODE_ALIAS.sub(lambda m: (m.group(1) or m.group(2)) + "번", t)
 
+_PROMPT_SENTS = [x.strip() for x in re.split(r"[.!?]", "다이진, 1번 모터 돌려 줘. 2번 부저 울려 줘. 1번이랑 2번 순서대로 돌려 줘. 장치 상태 알려줘. 전부 꺼 줘. 장난 좀 쳐 줘. 응, 알았어.") if x.strip()]
+def _looks_hallucinated(t):
+    """whisper는 무음·잡음에서 프롬프트 예문을 그대로 뱉는다. 같은 문장이 2회 이상 반복되거나
+    전사가 프롬프트 예문 하나로만 이뤄져 있으면 환청으로 본다."""
+    sents = [x.strip() for x in re.split(r"[.!?]", t) if x.strip()]
+    if len(sents) >= 2 and len(set(sents)) == 1:
+        return True
+    return len(sents) == 1 and sents[0] in _PROMPT_SENTS
+
 def stt(wav):
     r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
                         "--prompt",STT_PROMPT,"-f",wav],
@@ -361,14 +370,37 @@ def on_connect(client, userdata, flags, reason_code, properties):
     client.subscribe(T_SAY, qos=1)
     client.subscribe(T_ASK, qos=1)
 
+import array, math
+SPEECH_RMS = 260   # 16bit PCM 상위창 RMS. 실측(2026-09-15): 스피커 누설 헛클립 180, 합성 잡음 91. 말소리는 수천대
+
+def speech_rms(pcm):
+    a = array.array("h"); a.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if not a: return 0.0
+    # 20ms 창별 RMS의 상위 10% 평균 → 짧게라도 말한 구간이 있으면 잡힌다
+    win = 320; vals = []
+    for i in range(0, len(a) - win, win):
+        seg = a[i:i+win]; vals.append(math.sqrt(sum(x*x for x in seg) / win))
+    vals.sort(); top = vals[-max(1, len(vals)//10):]
+    return sum(top) / len(top)
+
+_last_reply_end = 0.0   # 마지막 답 발행이 끝난 시각 — 그 직후 도착한 클립은 스피커 누설일 가능성이 큼
+
 def handle_clip(client, pcm_or_wav, is_wav):
     t0 = time.monotonic()
+    if not is_wav:
+        rms = speech_rms(pcm_or_wav)
+        if rms < SPEECH_RMS:
+            print(f"  🔇 말소리 없음(RMS {rms:.0f} < {SPEECH_RMS}) → 클립 무시")
+            return
     if is_wav:
         with open(IN_WAV, "wb") as f:
             f.write(pcm_or_wav)
     else:
         pcm_to_wav(pcm_or_wav, IN_WAV)
     user = normalize_nodes(stt(IN_WAV))
+    if user and _looks_hallucinated(user):
+        print(f"  🔇 환청 의심(프롬프트 예문 반복): {user!r} → 클립 무시")
+        return
     print(f"  🗣️  나: {user}")
     client.publish(T_TXT_IN, user)
     if is_wav:  # 구형(파이썬 가짜 디바이스): 통 WAV로 응답
@@ -396,6 +428,7 @@ def speak_stream(client, sentence_iter, t0):
                 yield pcm
             yield b"\x00" * 3200              # 문장 사이 0.1초 숨고르기
     n = publish_pcm_stream(client, gen())
+    global _last_reply_end; _last_reply_end = time.monotonic()
     client.publish(T_TXT_OUT, " ".join(sentences))
     print(f"  📤 답 발행 {n} 청크 · ⏱️ {time.monotonic()-t0:.1f}s")
 

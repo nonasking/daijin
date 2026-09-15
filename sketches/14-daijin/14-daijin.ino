@@ -133,6 +133,14 @@ void chirp() {                                  // "띠링" = 준비 완료 (LTE
   }
   static int16_t z[256] = {0}; i2sSpk.write((uint8_t*)z, sizeof(z));
 }
+void cutChirp() {                               // "뚜-뚜" 낮게 두 번 = 10초 자동컷. 이 소리 들리면 이미 전송됐으니 버튼 누르지 말 것
+  static int16_t b[800];
+  for (int r = 0; r < 2; r++) {
+    for (int i = 0; i < 800; i++) b[i] = (int16_t)(5000 * sinf(2 * PI * 440.f * i / 16000.f));
+    for (int k = 0; k < 2; k++) i2sSpk.write((uint8_t*)b, sizeof(b));
+    static int16_t z[1600] = {0}; i2sSpk.write((uint8_t*)z, sizeof(z));
+  }
+}
 void logf(const char* fmt, ...) {
   char b[160]; va_list a; va_start(a, fmt);
   vsnprintf(b, sizeof(b), fmt, a); va_end(a);
@@ -246,7 +254,7 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
 }
 
 // ---------- 녹음(탭-토글): BOOT 한 번 = 시작, 한 번 더 = 종료·전송 ----------
-// 고정 4초의 문제(말 시작 전 낭비·끝 잘림 → STT 오인식) 해결. 최소 1초, 최대 10초 자동컷.
+// 고정 4초의 문제(말 시작 전 낭비·끝 잘림 → STT 오인식) 해결. 최소 1초, 최대 12초 자동컷.
 //
 // 캡처 태스크 분리 (2026-08-16): I2SClass의 DMA 버퍼는 6×240프레임 ≈ 90ms 고정이라,
 // 같은 루프에서 TLS 발행(수십~수백 ms 블로킹)을 하면 그동안의 샘플이 유실됐다
@@ -286,15 +294,17 @@ void recordAndPublish() {
   logf("녹음+전송 시작 (clip %u, 탭-토글)\n", clipId);
   const size_t CHUNK_UP = 2048;                                // ADPCM 청크 (=4096샘플=256ms)
   static uint8_t msg[HDR + CHUNK];
-  const size_t minB = SR * 1 * 2, maxB = SR * 10 * 2;          // 최소/최대 (PCM 바이트)
+  const size_t minB = SR * 1 * 2, maxB = SR * 12 * 2;          // 최소 1초 / 최대 12초 자동컷 (PCM 바이트)
   capW = capR = 0; capDrops = 0; capturing = true;
   encPred = 0; encIdx = 0; encLo = -1;                         // 인코더 리셋 (브레인 디코더와 동기)
   xTaskCreatePinnedToCore(captureTask, "cap", 4096, NULL, 10, NULL, 0);
   size_t fill = 0; uint16_t seq = 0;
-  bool lastSent = false;
+  bool lastSent = false, autoCut = false;
   while (!lastSent) {
-    if (capturing && ((digitalRead(BTN) == LOW && capW >= minB) || capW >= maxB))
+    if (capturing && ((digitalRead(BTN) == LOW && capW >= minB) || capW >= maxB)) {
+      autoCut = (capW >= maxB) && (digitalRead(BTN) != LOW);   // 버튼 없이 상한 도달 = 자동컷
       capturing = false;                                       // 종료 탭/자동컷 → 캡처 중단
+    }
     if (capAvail() < 2 && capturing) { delay(5); continue; }   // 캡처 대기
     while (capAvail() >= 2 && fill < CHUNK_UP) {               // PCM 2바이트 → ADPCM 니블
       size_t off = capR % CAP_SZ;
@@ -320,8 +330,18 @@ void recordAndPublish() {
   if (capDrops) logf("경고: 캡처 링 포화로 %u 샘플 유실\n", (unsigned)capDrops);
   logf("전송 완료: %u 청크 (%.1f초)\n", seq, (capW / 2) / (float)SR);
   clipId++;
-  while (digitalRead(BTN) == LOW) delay(10);                   // 종료 탭 손 뗄 때까지
-  delay(120);                                                  // 디바운스 (재시작 방지)
+  if (autoCut) {
+    // 자동컷: 사용자는 아직 말하는 중이라 곧 "종료" 탭을 누른다. 그 탭이 새 녹음 시작으로 읽히면
+    // 스피커 소리까지 10초 더 녹음돼 헛명령이 된다(2026-09-15 실측: 클립 3·4, 5·6, 8·9 쌍).
+    // → 알림음 내고, 버튼이 1.5초 동안 계속 떼어져 있을 때까지 새 녹음을 받지 않는다.
+    cutChirp();
+    uint32_t quiet = millis();
+    while (millis() - quiet < 1500) { if (digitalRead(BTN) == LOW) quiet = millis(); delay(10); }
+    logf("자동컷 → 1.5초 쿨다운 통과\n");
+  } else {
+    while (digitalRead(BTN) == LOW) delay(10);                 // 종료 탭 손 뗄 때까지
+    delay(120);                                                // 디바운스 (재시작 방지)
+  }
   LED_IDLE;
   face(F_THINK);                                               // 답이 올 때까지 생각하는 얼굴
 }
@@ -348,8 +368,14 @@ void setup() {
   led(20,20,20);
   faceInit();                                    // OLED 있으면 얼굴, 없으면 조용히 생략
 
+  // WIFI_ONLY=1(집)|2(핫스팟) 빌드 플래그로 한 망만 등록 가능. 촬영 때 메인은 집 와이파이에 고정해야
+  // 노드들과 다른 망이 된다 (2026-09-15 실측: 플래그 없이는 신호 센 핫스팟에 붙어 dev1과 같은 망이 됨).
+#if !defined(WIFI_ONLY) || WIFI_ONLY == 1
   wifiMulti.addAP(WIFI_SSID, WIFI_PASS);      // 집
+#endif
+#if !defined(WIFI_ONLY) || WIFI_ONLY == 2
   wifiMulti.addAP(WIFI_SSID2, WIFI_PASS2);    // 아이폰 핫스팟 (집 밖)
+#endif
   while (wifiMulti.run() != WL_CONNECTED) { led(0,0,20); delay(150); led(0,0,0); delay(150); }
   // 스마트 절전: 평소 ON(발열·배터리 절약), 녹음·재생 순간에만 OFF (절전시 수신 ~12KB/s로 제한됨)
   WiFi.setSleep(true);
