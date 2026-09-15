@@ -26,3 +26,9 @@ IMG_*.HEIC
 voice/.daijin_session
 voice/daijin.log
 voice/__pycache__/
+
+# 파이썬 캐시 (전역)
+**/__pycache__/
+*.pyc
+voice/fleetwatch.log
+voice/archive/

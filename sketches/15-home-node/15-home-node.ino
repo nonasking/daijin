@@ -299,13 +299,15 @@ void setup() {
   pinMode(PIR_PIN, INPUT);
 #endif
 
-#ifdef WIFI_SSID
+  // WIFI_ONLY=1|2|3 빌드 플래그가 있으면 그 망만 등록 (촬영·테스트용: 집 와이파이가 더 세도 핫스팟에 붙게).
+  // 없으면 아는 망 전부 등록하고 WiFiMulti가 신호 센 곳을 고른다.
+#if defined(WIFI_SSID) && (!defined(WIFI_ONLY) || WIFI_ONLY == 1)
   multi.addAP(WIFI_SSID, WIFI_PASS);               // 집
 #endif
-#ifdef WIFI_SSID2
+#if defined(WIFI_SSID2) && (!defined(WIFI_ONLY) || WIFI_ONLY == 2)
   multi.addAP(WIFI_SSID2, WIFI_PASS2);             // 아이폰 핫스팟 1
 #endif
-#ifdef WIFI_SSID3
+#if defined(WIFI_SSID3) && (!defined(WIFI_ONLY) || WIFI_ONLY == 3)
   multi.addAP(WIFI_SSID3, WIFI_PASS3);             // 아이폰 핫스팟 2
 #endif
 
