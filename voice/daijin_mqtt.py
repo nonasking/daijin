@@ -62,7 +62,7 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        f"집안 홈 노드 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' (노드는 1번=dev1, 2번=dev2. 사용자는 1번·2번이라 부르고 dev.sh도 1 또는 1번을 받아; 말할 때도 1번, 2번이라고 불러) "
        "(명령: led:색 · servo:0~180 · poke:각도[:ms]=갔다가 원위치(스위치 누르기·풍선 터뜨리기) · "
        "relay:on/off/pulse[:ms] · fan:on/off · step:±각도(스텝모터, 느림) · motor[:각도]=노드 종류 상관없이 모터 돌리기(서보면 갔다 옴, 스텝이면 회전; 모터 돌려달라면 이걸 써) · buzz:alarm/ok/fail/ms · ping · caps. "
-       "ack까지 확인하고, err:unknown이면 그 노드에 그 기능이 없는 거야). "
+       "ack까지 확인하되 말할 때는 ack라는 단어를 쓰지 말고 보냈어/갔어라고만 해. err:unknown이면 그 노드에 그 기능이 없는 거야). "
        f"홈 노드들의 상태·온라인 여부 조회는 'bash {VOICE}/fleet.sh' "
        "(OFFLINE=전원/네트워크 끊김, STALE=하트비트 끊김 — 발견하면 원인 추측과 함께 알려줘). "
        "네 몸(디바이스) 상태 — 온도, WiFi, 켜진 시간 — 를 물으면 "
@@ -94,13 +94,23 @@ def save_session(sid):
 # (2026-08-16: 같은 녹음에서 "빨갛을 켜줘" → "빨간 불 켜 줘"로 교정됨)
 # 주의: whisper는 프롬프트를 "직전 대화 전사"로 취급한다. 라벨식("장치 이름: ...")으로 쓰면
 # 그 라벨이 전사 앞에 새어 들어옴(실측 2026-08-17) → 자연스러운 문장 나열로 쓸 것.
-STT_PROMPT = ("다이진, 1번 모터 돌려 줘. 2번 부저 울려 줘. 1번이랑 2번 순서대로 돌려 줘. "
+STT_PROMPT = ("다이진, 일 번 모터 돌려 줘. 이 번 간식 줘. 일 번이랑 이 번 순서대로 돌려 줘. "
               "장치 상태 알려줘. 전부 꺼 줘. 장난 좀 쳐 줘. 응, 알았어.")
 
 # STT가 노드 이름을 제각각 적는다("대부 1", "데브 1", "dev 1", "1번 장치") → 브레인에 넘기기 전에 "1번"으로 통일
-_NODE_ALIAS = re.compile(r"(?<![0-9])(?:(?:dev|데브|대브|대부|디브|devi)\s*([12])|([12])\s*번(?:\s*(?:장치|노드|기기))?)(?![0-9])", re.I)
+# 사용자는 "일 번", "이 번"이라고 부른다. STT는 이걸 "한 번", "두 번", "일번", "1 번", "dev1" 등으로 적는다.
+# 전부 "1번"/"2번"으로 통일. "한 번 더" 같은 횟수 표현과 겹치는 게 위험이라, 뒤에 "더/만/씩/에"가 오거나
+# "번 더/번 돌"처럼 횟수로 읽히는 꼴은 손대지 않는다.
+_NODE_ALIAS = re.compile(
+    r"(?<![0-9])(?:"
+    r"(?:dev|데브|대브|대부|디브|devi)\s*([12])"                       # dev1, 대부 2
+    r"|(?:([12])|(일|한)|(이|두))\s*번(?:\s*(?:장치|노드|기기))?"      # 1번, 일 번, 한 번, 이 번, 두 번
+    r")(?![0-9])(?!\s*(?:더|만|씩|에|엔|째|은|는|처럼|만큼))", re.I)
+def _alias_sub(m):
+    n = m.group(1) or m.group(2) or ("1" if m.group(3) else "2")
+    return n + "번"
 def normalize_nodes(t):
-    return _NODE_ALIAS.sub(lambda m: (m.group(1) or m.group(2)) + "번", t)
+    return _NODE_ALIAS.sub(_alias_sub, t)
 
 _PROMPT_SENTS = [x.strip() for x in re.split(r"[.!?]", "다이진, 1번 모터 돌려 줘. 2번 부저 울려 줘. 1번이랑 2번 순서대로 돌려 줘. 장치 상태 알려줘. 전부 꺼 줘. 장난 좀 쳐 줘. 응, 알았어.") if x.strip()]
 def _looks_hallucinated(t):
@@ -417,11 +427,32 @@ def handle_clip(client, pcm_or_wav, is_wav):
         src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
         speak_stream(client, src, t0)
 
+# 말하기 직전 치환 — 프롬프트로 안 고쳐지는 습관어. TTS가 "ack"를 "액"으로 읽어 "액바닷서"가 됨(2026-09-16).
+_SPEAK_FIX = [
+    (re.compile(r"(명령(?:을|은)?\s*)?보냈고\s*(?:둘|전부|모두|다)?\s*(?:ack|에크|애크|확인\s*응답)\s*(?:을|도)?\s*받았어"), "보냈어"),
+    (re.compile(r"(?:ack|에크|애크)\s*(?:을|도|은|는|가)?\s*(?:받았어|왔어|받음|확인했어)"), "전달됐어"),
+    (re.compile(r"(?:ack|에크|애크)\s*(?:를|을|도|은|는|가|이)?\s*(?:안\s*줘|없어|안\s*와|못\s*받았어)"), "응답이 없어"),
+    (re.compile(r"\back\b", re.I), "응답"),
+    # 노드 호칭: dev1/dev2, 1번(dev1) 같은 표기가 새어 나오면 전부 "1번"/"2번"으로 (TTS가 "대부 2"로 읽음)
+    (re.compile(r"([12])번\s*\(\s*dev\s*[12]\s*\)"), r"\1번"),
+    (re.compile(r"(?<![A-Za-z0-9])dev\s*([12])(?![0-9])", re.I), r"\1번"),
+    # "번" 뒤 조사 정리: 받침 있는 "번" 뒤엔 이/은/을/이랑
+    (re.compile(r"번가(?=\s|$)"), "번이"), (re.compile(r"번는(?=\s|$)"), "번은"), (re.compile(r"번를(?=\s|$)"), "번을"), (re.compile(r"번랑(?=\s|$)"), "번이랑"),
+]
+def speak_fix(t):
+    for pat, rep in _SPEAK_FIX:
+        if "\\1" in rep:                                  # 역참조가 있는 치환은 그대로
+            t = pat.sub(rep, t)
+        else:
+            t = pat.sub(lambda m: (m.group(1) or "") + rep if m.re.groups else rep, t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
 def speak_stream(client, sentence_iter, t0):
     """문장 이터레이터를 스트리밍 TTS→ADPCM 발행. 음성 응답과 능동 발화의 공통 출구."""
     sentences = []
     def gen():
         for s in sentence_iter:
+            s = speak_fix(s)
             sentences.append(s)
             print(f"  🤖 daijin: {s}  (+{time.monotonic()-t0:.1f}s)")
             for pcm in tts_stream(s):
