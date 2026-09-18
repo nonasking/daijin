@@ -159,7 +159,9 @@ def brain(text):
 
 # ---------- 문장 스트리밍: Claude 답을 문장 단위로 실시간 yield ----------
 # 전체 답변 완성을 기다리지 않고 첫 문장부터 TTS·재생 → 체감 지연 대폭 감소
-_SENT_END = re.compile(r"[.!?…]+[\"')\]]*\s*")
+# 마침표는 뒤에 공백이 와야 문장 끝. "36.1도"처럼 숫자 사이 마침표에서 끊겨 "36." "1도야"로 말하던 버그(2026-09-17).
+# 스트림 끝의 마지막 문장은 공백이 없어도 rest 플러시로 나간다.
+_SENT_END = re.compile(r"[!?…]+[\"')\]]*\s*|\.+[\"')\]]*\s+")
 
 def brain_stream(text):
     def run(resume_id):
@@ -195,6 +197,13 @@ def brain_stream(text):
                         if sent:
                             yielded = True
                             yield sent
+                elif ev.get("type") == "content_block_stop":
+                    # 텍스트 블록이 끝나면(다음은 도구 호출) 마침표 뒤 공백이 없어도 바로 내보낸다.
+                    # 안 그러면 "응, 알았어."가 도구 실행이 끝난 뒤 다음 문장과 붙어서 나온다(실측).
+                    sent = EMOJI.sub("", buf).strip(); buf = ""
+                    if sent:
+                        yielded = True
+                        yield sent
             elif t == "result":
                 ok = not obj.get("is_error")
                 if ok:
@@ -381,7 +390,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
     client.subscribe(T_ASK, qos=1)
 
 import array, math
-SPEECH_RMS = 260   # 16bit PCM 상위창 RMS. 실측(2026-09-15): 스피커 누설 헛클립 180, 합성 잡음 91. 말소리는 수천대
+SPEECH_RMS = 40    # 16bit PCM 상위창 RMS. 2026-09-18 실측: 실제 발화가 212밖에 안 나와 260은 너무 높았음. 진짜 무음(0~20)만 거른다
 
 def speech_rms(pcm):
     a = array.array("h"); a.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])

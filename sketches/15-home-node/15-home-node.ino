@@ -69,7 +69,10 @@
 
 #if FEAT_SERVO
 #include <ESP32Servo.h>
-Servo servo; const int SERVO_PIN = 4; int servoPos = 0;
+#ifndef SERVO_REST
+#define SERVO_REST 0              // 부팅 시 서보 대기 각도 = poke의 시작점. 노드별 빌드 플래그로 지정
+#endif
+Servo servo; const int SERVO_PIN = 4; int servoPos = SERVO_REST;
 #endif
 #if FEAT_RELAY
 const int RELAY_PIN = 5;
@@ -80,6 +83,9 @@ const int BUZZER_PIN = 8;
 #endif
 #if FEAT_STEPPER
 #include <Stepper.h>
+#ifndef MOTOR_STEP_DEG
+#define MOTOR_STEP_DEG 180        // motor 명령 기본 회전각. 노드별 빌드 플래그로 지정
+#endif
 const int STEPS_PER_REV = 2048;                   // 28BYJ-48 풀스텝(기어비 포함)
 Stepper stepper(STEPS_PER_REV, 9, 11, 10, 12);   // Stepper 라이브러리 순서: IN1, IN3, IN2, IN4
 #endif
@@ -182,7 +188,7 @@ void runCmd(const String& cmd) {
     servo.write(a); holdMs(600); servo.write(servoPos); holdMs(300);
     ack("motor:servo-poke:" + String(a));
 #elif FEAT_STEPPER
-    int d = arg.toInt() != 0 ? constrain(arg.toInt(), -1080, 1080) : 180; // 0이나 빈 값은 기본 180
+    int d = arg.toInt() != 0 ? constrain(arg.toInt(), -1080, 1080) : MOTOR_STEP_DEG; // 0이나 빈 값은 기본값
     stepDegrees(d);
     ack("motor:step:" + String(d));
 #else

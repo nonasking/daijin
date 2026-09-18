@@ -412,13 +412,16 @@ class SentenceSplitTest(unittest.TestCase):
         self.assertEqual(split_stream([]), [])
         self.assertEqual(split_stream(["", "  "]), [])
 
-    def test_decimal_point_splits_a_sentence_known_limitation(self):
-        # Documented, deliberate: the regex is punctuation-only, so "3.14" becomes two
-        # fragments. Harmless for TTS (it is spoken as a pause) and the system prompt
-        # asks for plain conversational Korean. Pinned so the behaviour is a choice,
-        # not a surprise.
-        self.assertEqual(split_stream(["원주율은 3.14 정도야."]),
-                         ["원주율은 3.", "14 정도야."])
+    def test_decimal_point_does_not_split_a_sentence(self):
+        # Fixed 2026-09-17: a period only ends a sentence when whitespace follows it.
+        # "36.1도야" used to be spoken as "36." then "1도야".
+        self.assertEqual(split_stream(["원주율은 3.14 정도야."]), ["원주율은 3.14 정도야."])
+        self.assertEqual(split_stream(["몸 온도는 36.1도야. 쾌적해."]), ["몸 온도는 36.1도야.", "쾌적해."])
+        for size in (1, 2, 5):
+            deltas = ["칩 온도 45.3도, 실내 24.0도야. 괜찮아."[k:k + size]
+                      for k in range(0, len("칩 온도 45.3도, 실내 24.0도야. 괜찮아."), size)]
+            with self.subTest(delta=size):
+                self.assertEqual(split_stream(deltas), ["칩 온도 45.3도, 실내 24.0도야.", "괜찮아."])
 
 
 if __name__ == "__main__":

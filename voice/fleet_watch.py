@@ -50,7 +50,7 @@ def report(client, node, text, kind):
 local = None   # 로컬 미러 클라이언트 (연결 실패 시 None → 미러 생략)
 
 def mirror(topic, payload):
-    if local is not None:
+    if local is not None and local.is_connected():
         try:
             local.publish(topic, payload, qos=0, retain=True)
         except Exception as e:
@@ -116,13 +116,14 @@ c.on_connect = on_connect
 c.on_message = on_message
 
 print("👁️ fleet_watch 시작")
-try:
-    _l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
-    _l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
-    _l.connect(LOCAL_HOST, LOCAL_PORT, 60); _l.loop_start(); local = _l
-    print("🪞 로컬 브로커 미러 ON (localhost:1883)")
-except Exception as e:
-    print(f"🪞 로컬 브로커 없음, 미러 생략 ({e})")
+# 로컬 미러 — 부팅 직후엔 mosquitto보다 먼저 뜰 수 있어서(2026-09-17 실측: Connection refused 후 미러 영구 생략)
+# connect_async + loop_start로 붙을 때까지 paho가 알아서 재시도한다. 끊겨도 자동 재접속.
+_l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
+_l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
+_l.reconnect_delay_set(min_delay=1, max_delay=30)
+_l.on_connect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 미러 ON (localhost:1883, rc={rc})")
+_l.on_disconnect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 끊김(rc={rc}) → 재시도")
+_l.connect_async(LOCAL_HOST, LOCAL_PORT, 60); _l.loop_start(); local = _l
 while True:
     try:
         c.connect(sec("MQTT_CLOUD_HOST"), int(sec("MQTT_CLOUD_PORT")), 60)

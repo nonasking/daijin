@@ -7,8 +7,8 @@
 NODE="${1:?노드 이름 (dev1|dev2)}"; PORT="${2:?포트 (/dev/cu.usb...)}"; NET="${3:-}"
 case "$NET" in home) NETF="-DWIFI_ONLY=1";; hot1) NETF="-DWIFI_ONLY=2";; hot2) NETF="-DWIFI_ONLY=3";; "") NETF="";; *) echo "망은 home|hot1|hot2"; exit 1;; esac
 case "$NODE" in
-  dev1) FLAGS="-DFEAT_SERVO=1 -DFEAT_BUZZER=1 -DFEAT_RELAY=1 -DFEAT_STEPPER=0" ;;   # 서보 + 부저 + 릴레이
-  dev2) FLAGS="-DFEAT_SERVO=0 -DFEAT_BUZZER=1 -DFEAT_RELAY=0 -DFEAT_STEPPER=1" ;;   # 스텝모터 + 부저
+  dev1) FLAGS="-DFEAT_SERVO=1 -DFEAT_BUZZER=1 -DFEAT_RELAY=1 -DFEAT_STEPPER=0 -DSERVO_REST=180" ;;   # 서보(대기 180도) + 부저 + 릴레이
+  dev2) FLAGS="-DFEAT_SERVO=0 -DFEAT_BUZZER=1 -DFEAT_RELAY=0 -DFEAT_STEPPER=1 -DMOTOR_STEP_DEG=360" ;;   # 스텝모터(motor=한 바퀴) + 부저
   *)    FLAGS="" ;;                                                                 # 그 외: 펌웨어 기본값(전부 켬)
 esac
 cd "$(dirname "$0")" || exit 1
