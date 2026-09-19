@@ -8,6 +8,12 @@ It doesn't just reply — it **actually controls my home and my computer.**
 
 Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a Mac brain + cloud MQTT.
 
+## Demo
+
+[![daijin demo video](docs/media/demo-poster.jpg)](https://github.com/nonasking/daijin/releases/download/demo-v1/daijin_demo_v3.mp4)
+
+One minute, one take on the voice side: I talk to the device at home, the Claude brain on my Mac decides, and two home nodes on their own networks act — a cat-treat dispenser in the next room and a water balloon rigged in a park. [Watch the video](https://github.com/nonasking/daijin/releases/download/demo-v1/daijin_demo_v3.mp4) (1080p, 1 min).
+
 ## How is this different from Siri?
 
 daijin is not "a better Siri." It's a **different kind of thing**.
