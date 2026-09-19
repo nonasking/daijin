@@ -12,7 +12,7 @@ Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a Mac brain + 
 
 https://github.com/user-attachments/assets/48c4693b-7dae-40b5-aa2d-9cc7cdb3fe40
 
-One take on the voice side: I talk to the device at home, the Claude brain on my Mac decides, and two home nodes on their own networks act — a cat-treat dispenser in the next room and a water balloon rigged in a park.
+One take on the voice side: I talk to daijin at home, the Claude brain on my Mac decides, and two nodes on their own networks act — a cat-treat dispenser in the next room and a device waiting in a park.
 
 ## How is this different from Siri?
 
