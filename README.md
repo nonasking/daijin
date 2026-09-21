@@ -117,11 +117,52 @@ docs/       roadmap · research · audio protocol
 ESP32-S3 · Arduino (arduino-cli) · MQTT (HiveMQ Cloud, TLS/Let's Encrypt) · whisper.cpp (STT, Korean) ·
 Claude CLI (agent brain, stream-json) · Edge TTS (default) / ElevenLabs / macOS TTS · IMA ADPCM · launchd
 
-## Setup notes
+## Run it yourself
 
-- **No credentials in the code.** `secrets.h`, `secrets.local.txt`, and the whisper model are gitignored — create them with your own values.
-- Download the whisper model `ggml-large-v3-turbo-q5_0.bin` into `voice/models/` yourself.
-- The brain runs as LaunchAgent `com.daijin.brain` (plist copy in `voice/`).
+Everything here runs on a Mac (the brain) plus one or more ESP32-S3 boards. Clone anywhere; paths are derived from the repo location.
+
+**Mac prerequisites**
+
+- [Claude Code](https://claude.com/claude-code) CLI, logged in (`claude` on PATH or in `~/.local/bin`)
+- `brew install whisper-cpp mosquitto arduino-cli` — whisper for STT, mosquitto for the `mosquitto_pub`/`mosquitto_sub` helpers, arduino-cli for flashing
+- `pip3 install paho-mqtt edge-tts`
+- whisper model: download `ggml-large-v3-turbo-q5_0.bin` into `voice/models/`
+- A cloud MQTT broker with TLS. The free HiveMQ Cloud tier is what this repo was built against.
+
+**Secrets (gitignored)**
+
+```
+cp secrets.local.example secrets.local.txt          # broker, TTS engine, model
+cp sketches/secrets.h.example sketches/14-daijin/secrets.h
+cp sketches/secrets.h.example sketches/15-home-node/secrets.h
+```
+Fill in the broker credentials and your WiFi networks. `ca_cert.h` (Let's Encrypt root) is committed; nothing else needs a certificate.
+
+**Firmware**
+
+```
+arduino-cli lib install "PubSubClient" "WiFiManager" "ESP32Servo" "Adafruit SSD1306" "Stepper" "DHT sensor library"
+cd sketches
+arduino-cli compile --fqbn esp32:esp32:esp32s3 --board-options CDCOnBoot=cdc 14-daijin && \
+arduino-cli upload  --fqbn esp32:esp32:esp32s3 --board-options CDCOnBoot=cdc -p /dev/cu.usbmodemXXXX 14-daijin
+bash flash-node.sh dev1 /dev/cu.usbserial-XXXX   # home node: servo + buzzer + relay
+bash flash-node.sh dev2 /dev/cu.usbserial-XXXX   # home node: stepper + buzzer
+```
+Wiring for the device (mic, amp, OLED) is in [Hardware](#hardware); node pins are at the top of `15-home-node.ino`.
+
+**Brain**
+
+```
+python3 -u voice/daijin_mqtt.py        # foreground, logs to stdout
+bash voice/install-agents.sh           # or: register brain + fleet watcher as LaunchAgents (auto-start, auto-restart)
+```
+Then tap BOOT on the device and talk. `bash voice/console.sh` shows every transcript, reply, and node command live; `bash voice/fleet.sh` lists node status; `bash voice/dev.sh 1번 motor` drives a node by hand.
+
+**Optional: local broker bridge.** Running mosquitto on the Mac and bridging it to the cloud broker cuts each node command from ~3 s to well under a second. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
+
+## License
+
+Apache 2.0. See `LICENSE` and `NOTICE`.
 
 ## Key lessons
 
