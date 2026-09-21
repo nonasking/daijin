@@ -1,14 +1,14 @@
 #!/bin/bash
 # 맥-only 한국어 음성 비서 루프 (0단계, 보드 없이)
 # 흐름: 마이크 녹음 → whisper(한국어 STT) → claude(두뇌) → say(한국어 TTS)
-# 사용법:  bash ~/esp32-iot/voice/talk.sh    (종료: Ctrl+C)
+# 사용법:  bash voice/talk.sh    (종료: Ctrl+C)
 
-DIR="$HOME/esp32-iot/voice"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL="$DIR/models/ggml-large-v3-turbo-q5_0.bin"
 WHISPER="/opt/homebrew/bin/whisper-cli"
 WAV="/tmp/voice_in.wav"
 VOICE="Yuna"
-SYS="너는 음성으로 대화하는 친근한 비서야. 한국어로, 2~3문장 이내로 짧고 자연스럽게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽히니까). 집에 제어 가능한 LED가 있어 — 사용자가 불을 켜/꺼/색을 바꿔 달라고 하면 반드시 셸 명령 'bash ~/esp32-iot/voice/led.sh <색>' 을 실행해(색: red green blue yellow cyan magenta white off; '꺼줘'는 off, '켜줘'는 green). 실행 결과를 보고 한국어로 짧게 확인해. LED 요청이 아니면 그냥 대화해."
+SYS="너는 음성으로 대화하는 친근한 비서야. 한국어로, 2~3문장 이내로 짧고 자연스럽게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽히니까). 집에 제어 가능한 LED가 있어 — 사용자가 불을 켜/꺼/색을 바꿔 달라고 하면 반드시 셸 명령 'bash $DIR/led.sh <색>' 을 실행해(색: red green blue yellow cyan magenta white off; '꺼줘'는 off, '켜줘'는 green). 실행 결과를 보고 한국어로 짧게 확인해. LED 요청이 아니면 그냥 대화해."
 
 cd "$DIR" || exit 1
 echo "🎙️  한국어 음성 비서 시작 (종료: Ctrl+C)"
@@ -31,9 +31,9 @@ while true; do
 
   # 두뇌 (Claude). 2턴부터 --continue 로 대화 맥락 유지
   if [ "$turn" -eq 0 ]; then
-    RESP=$(claude -p "$TXT" --allowedTools "Bash(bash ~/esp32-iot/voice/led.sh *)" --append-system-prompt "$SYS" 2>/dev/null)
+    RESP=$(claude -p "$TXT" --allowedTools "Bash(bash $DIR/led.sh *)" --append-system-prompt "$SYS" 2>/dev/null)
   else
-    RESP=$(claude -p "$TXT" --continue --allowedTools "Bash(bash ~/esp32-iot/voice/led.sh *)" --append-system-prompt "$SYS" 2>/dev/null)
+    RESP=$(claude -p "$TXT" --continue --allowedTools "Bash(bash $DIR/led.sh *)" --append-system-prompt "$SYS" 2>/dev/null)
   fi
   turn=$((turn+1))
 

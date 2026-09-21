@@ -2,7 +2,7 @@
 # 관제 화면 — 촬영·디버깅용 라이브 토픽 모니터.
 # 오디오 청크(바이너리 홍수)는 제외하고, 사람이 읽을 이벤트만 시간과 함께 흘려준다.
 # 사용법: bash console.sh   (Ctrl-C로 종료)
-SEC="$HOME/esp32-iot/secrets.local.txt"
+SEC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secrets.local.txt"   # 저장소 루트의 secrets (클론 위치 무관)
 H=$(grep '^MQTT_CLOUD_HOST=' "$SEC" | cut -d= -f2-)
 PORT=$(grep '^MQTT_CLOUD_PORT=' "$SEC" | cut -d= -f2-)
 U=$(grep '^MQTT_CLOUD_USER=' "$SEC" | cut -d= -f2-)

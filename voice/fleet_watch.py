@@ -10,8 +10,8 @@
 import paho.mqtt.client as mqtt
 import json, os, ssl, time
 
-HOME = os.path.expanduser("~")
-SEC  = f"{HOME}/esp32-iot/secrets.local.txt"
+VOICE = os.path.dirname(os.path.abspath(__file__))
+SEC   = os.path.join(os.path.dirname(VOICE), "secrets.local.txt")
 T_STATUS = "daijin/dev/+/status"
 T_MAIN   = "daijin/status"      # 메인 디바이스 상태 (status.sh용)
 # 로컬 브로커 미러: 브리지는 라이브 메시지의 retain 플래그를 못 살려서(MQTT 규격) 로컬 retained가

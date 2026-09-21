@@ -2,7 +2,7 @@
 # daijin 브레인 (MQTT 클라이언트) — 맥이 HiveMQ에 outbound 접속해 오디오 토픽으로 대화.
 #   구독 daijin/audio/in  (디바이스가 녹음한 WAV) → whisper(STT) → Claude → Yuna(TTS)
 #   발행 daijin/audio/out (답 WAV)  + daijin/text/in, daijin/text/out (디버그)
-# 실행:  python3 -u ~/esp32-iot/voice/daijin_mqtt.py   (상시 구동은 LaunchAgent com.daijin.brain)
+# 실행:  python3 -u voice/daijin_mqtt.py   (상시 구동은 LaunchAgent com.daijin.brain — voice/install-agents.sh)
 #
 # 설계 노트:
 # - 보안: 도구 전면 개방(사용자 결정 2026-07-04) — 브로커 자격증명이 곧 보안 경계.
@@ -15,11 +15,13 @@ import paho.mqtt.client as mqtt
 import subprocess, re, os, ssl, time, json, wave, io, threading, queue
 
 HOME    = os.path.expanduser("~")
-VOICE   = f"{HOME}/esp32-iot/voice"
-SEC     = f"{HOME}/esp32-iot/secrets.local.txt"
-WHISPER = "/opt/homebrew/bin/whisper-cli"
+# 경로는 이 파일의 위치에서 유도한다. 저장소를 어디에 클론해도 된다.
+VOICE   = os.path.dirname(os.path.abspath(__file__))
+REPO    = os.path.dirname(VOICE)
+SEC     = f"{REPO}/secrets.local.txt"
+WHISPER = os.environ.get("WHISPER_CLI") or ("/opt/homebrew/bin/whisper-cli" if os.path.exists("/opt/homebrew/bin/whisper-cli") else "whisper-cli")
 MODEL   = f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
-CLAUDE  = f"{HOME}/.local/bin/claude"
+CLAUDE  = f"{HOME}/.local/bin/claude" if os.path.exists(f"{HOME}/.local/bin/claude") else "claude"
 LED_SH  = f"{VOICE}/led.sh"
 SESSION_FILE = f"{VOICE}/.daijin_session"
 TTS_VOICE = "Yuna"                     # 최종 폴백 (오프라인 보장)

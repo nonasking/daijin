@@ -6,8 +6,7 @@
 import paho.mqtt.client as mqtt
 import sys, os, ssl, subprocess, time
 
-HOME = os.path.expanduser("~")
-SEC  = f"{HOME}/esp32-iot/secrets.local.txt"
+SEC  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets.local.txt")
 def sec(k):
     for l in open(SEC):
         if l.startswith(k+"="): return l.split("=",1)[1].strip()

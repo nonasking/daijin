@@ -17,7 +17,7 @@
 NODE="${1:?노드 이름 필요 (1, 1번, dev1, 2, 2번, dev2, all)}"
 case "$NODE" in 1|1번|one) NODE=dev1;; 2|2번|two) NODE=dev2;; esac   # 사용자는 1번·2번이라 부른다
 CMD="${2:?명령 필요 (예: led:red, poke:120, relay:on)}"
-SEC="$HOME/esp32-iot/secrets.local.txt"
+SEC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secrets.local.txt"   # 저장소 루트의 secrets (클론 위치 무관)
 # 로컬 mosquitto(1883, 평문)로 붙는다 — HiveMQ 브리지가 클라우드와 동기화 (mosquitto.conf 참고).
 # 클라우드 직결(TLS 왕복 1.3초)보다 명령당 3초 이상 빠르다. 로컬 브로커가 죽어 있으면 클라우드로 폴백.
 H=localhost; PORT=1883

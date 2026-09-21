@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # mic_test_server — ESP32가 POST한 녹음 WAV를 저장하고 whisper로 받아쓰기 출력.
-# 실행:  python3 -u ~/esp32-iot/voice/mic_test_server.py   (포트 8849)
+# 실행:  python3 -u voice/mic_test_server.py   (포트 8849)
 import http.server, subprocess, os
 HOME=os.path.expanduser("~")
 WHISPER="/opt/homebrew/bin/whisper-cli"
-MODEL=f"{HOME}/esp32-iot/voice/models/ggml-large-v3-turbo-q5_0.bin"
+MODEL=f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
 WAV="/tmp/mic_test.wav"
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
