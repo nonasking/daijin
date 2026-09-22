@@ -22,7 +22,6 @@ SEC     = f"{REPO}/secrets.local.txt"
 WHISPER = os.environ.get("WHISPER_CLI") or ("/opt/homebrew/bin/whisper-cli" if os.path.exists("/opt/homebrew/bin/whisper-cli") else "whisper-cli")
 MODEL   = f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
 CLAUDE  = f"{HOME}/.local/bin/claude" if os.path.exists(f"{HOME}/.local/bin/claude") else "claude"
-LED_SH  = f"{VOICE}/led.sh"
 SESSION_FILE = f"{VOICE}/.daijin_session"
 TTS_VOICE = "Yuna"                     # 최종 폴백 (오프라인 보장)
 ELEVEN_VOICE = "TFUX5RKA9yUMr26dSJqF"  # daijin 보이스 (Voice Design으로 생성, 크레딧제)
@@ -59,7 +58,7 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        "2~3문장 이내로 짧게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽힘). "
        "너는 이 맥에서 도구를 자유롭게 쓸 수 있어 — 웹 검색, 파일 읽고 쓰기, 셸 명령 실행. "
        "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
-       f"집 LED 제어는 'bash {LED_SH} <색>' (색: red green blue yellow cyan magenta white off; "
+       f"집 LED(각 노드의 온보드 RGB)는 'bash {VOICE}/dev.sh all led:<색>' (색: red green blue yellow cyan magenta white off; "
        "꺼=off, 켜=green). "
        f"집안 홈 노드 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' (노드는 1번=dev1, 2번=dev2. 사용자는 1번·2번이라 부르고 dev.sh도 1 또는 1번을 받아; 말할 때도 1번, 2번이라고 불러) "
        "(명령: led:색 · servo:0~180 · poke:각도[:ms]=갔다가 원위치(스위치 누르기·풍선 터뜨리기) · "

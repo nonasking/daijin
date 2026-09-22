@@ -102,7 +102,6 @@ voice/      daijin
   daijin_mqtt.py      brain: MQTT client (STT → Claude → streaming TTS → ADPCM chunks)
   daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
   talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
-  led.sh              device control for the voice agent
   dev.sh              command a home node and verify its retained ack
   fleet.sh            fleet status: ONLINE / STALE(heartbeat gap) / OFFLINE(broker LWT)
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)

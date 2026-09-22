@@ -1,5 +1,7 @@
 #!/bin/bash
 # LED 제어 헬퍼 — Claude(음성비서)가 호출. 색을 HiveMQ 클라우드로 publish → 보드 LED 변경.
+# [legacy] home/led/set 토픽은 11~13번 학습 스케치만 듣는다. 14-daijin/15-home-node에는 효과 없음.
+# 현행 LED 제어: bash dev.sh all led:<색>  (또는 dev.sh 1번 led:red)
 # 사용법: bash led.sh <색>   (red green blue yellow cyan magenta white off)
 COLOR="${1:-off}"
 SEC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secrets.local.txt"   # 저장소 루트의 secrets (클론 위치 무관)
