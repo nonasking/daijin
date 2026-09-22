@@ -69,6 +69,9 @@
 
 #if FEAT_SERVO
 #include <ESP32Servo.h>
+#ifndef NODE_COLOR
+#define NODE_COLOR "green"        // 온라인 대기 색 = 노드 이름 색 (레드 노드=red, 블루 노드=blue). flash-node.sh 플래그
+#endif
 #ifndef SERVO_REST
 #define SERVO_REST 0              // 부팅 시 서보 대기 각도 = poke의 시작점. 노드별 빌드 플래그로 지정
 #endif
@@ -341,7 +344,7 @@ void loop() {
     if (!connectKnownWiFi(20000)) ESP.restart();
   }
   if (!mqtt.connected()) {
-    neopixelWrite(RGB_PIN, 40, 0, 0);              // 빨강 = 브로커 연결 시도
+    neopixelWrite(RGB_PIN, 40, 40, 0);             // 노랑 = 브로커 연결 시도 (빨강은 레드 노드 이름 색이라 피함)
     Serial.print("MQTT 연결...");
     // LWT: 연결이 끊기면 브로커가 status에 offline을 retained로 남긴다
     String will = String("{\"online\":false,\"node\":\"" NODE_NAME "\"}");
@@ -350,7 +353,7 @@ void loop() {
       Serial.println(" OK");
       mqtt.subscribe(T_CMD);
       mqtt.subscribe(T_ALL);
-      neopixelWrite(RGB_PIN, 0, 40, 0);            // 초록 = 온라인
+      setColor(NODE_COLOR);                        // 온라인 = 노드 이름 색
       lastBeat = 0; heartbeat();                   // 접속 즉시 online 하트비트
 #if FEAT_BUZZER
       buzzPreset("ok");                            // 촬영 시 "붙었다" 신호
