@@ -29,7 +29,7 @@
         <key>PATH</key>
         <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>/Users/kangminsung</string>
+        <string>__HOME__</string>
     </dict>
 </dict>
 </plist>

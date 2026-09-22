@@ -9,7 +9,7 @@ DEST="$HOME/Library/LaunchAgents"; mkdir -p "$DEST"
 for name in com.daijin.brain com.daijin.fleetwatch; do
   launchctl bootout "gui/$(id -u)/$name" 2>/dev/null || true
   if [ "$1" = "remove" ]; then rm -f "$DEST/$name.plist"; echo "해제: $name"; continue; fi
-  sed "s#__REPO__#$REPO#g; s#__HOME__#$HOME#g" "$VOICE/$name.plist" > "$DEST/$name.plist"
+  sed "s|__REPO__|$REPO|g; s|__HOME__|$HOME|g" "$VOICE/$name.plist" > "$DEST/$name.plist"
   launchctl bootstrap "gui/$(id -u)" "$DEST/$name.plist"
   echo "등록: $name → $DEST/$name.plist"
 done
