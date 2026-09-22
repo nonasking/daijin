@@ -11,8 +11,9 @@
 import http.server, subprocess, re, os, time, sys
 
 HOME    = os.path.expanduser("~")
+HERE    = os.path.dirname(os.path.abspath(__file__))
 WHISPER = "/opt/homebrew/bin/whisper-cli"
-MODEL   = f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
+MODEL   = f"{HERE}/models/ggml-large-v3-turbo-q5_0.bin"
 VOICE   = "Yuna"
 PORT    = 8848
 IN_WAV  = "/tmp/daijin_in.wav"

@@ -3,6 +3,7 @@
 # 실행:  python3 -u voice/mic_test_server.py   (포트 8849)
 import http.server, subprocess, os
 HOME=os.path.expanduser("~")
+VOICE=os.path.dirname(os.path.abspath(__file__))
 WHISPER="/opt/homebrew/bin/whisper-cli"
 MODEL=f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
 WAV="/tmp/mic_test.wav"
