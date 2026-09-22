@@ -22,7 +22,7 @@ for _, line in sorted(latest.values(), key=lambda x: x[1]):
         continue
     topic, _, payload = line.partition(" ")
     node = topic.split("/")[2] if topic.count("/") >= 2 else topic
-    node = {"dev1": "1번", "dev2": "2번"}.get(node, node)
+    node = {"dev1": "레드", "dev2": "블루"}.get(node, node)
     try:
         d = json.loads(payload)
     except Exception:

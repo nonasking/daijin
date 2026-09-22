@@ -155,7 +155,7 @@ Wiring for the device (mic, amp, OLED) is in [Hardware](#hardware); node pins ar
 python3 -u voice/daijin_mqtt.py        # foreground, logs to stdout
 bash voice/install-agents.sh           # or: register brain + fleet watcher as LaunchAgents (auto-start, auto-restart)
 ```
-Then tap BOOT on the device and talk. `bash voice/console.sh` shows every transcript, reply, and node command live; `bash voice/fleet.sh` lists node status; `bash voice/dev.sh 1번 motor` drives a node by hand.
+Then tap BOOT on the device and talk. `bash voice/console.sh` shows every transcript, reply, and node command live; `bash voice/fleet.sh` lists node status; `bash voice/dev.sh red motor` drives a node by hand (nodes are called red and blue; they light up in their colour).
 
 **Optional: local broker bridge.** Running mosquitto on the Mac and bridging it to the cloud broker cuts each node command from ~3 s to well under a second. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
 
@@ -174,6 +174,7 @@ Apache 2.0. See `LICENSE` and `NOTICE`.
 - `WiFi.setSleep(false)` — or the ESP32's receive throughput silently collapses to ~12 KB/s.
 - Bandwidth-delay product is real: far broker × tiny TCP window = a hard throughput ceiling. Compress, or move the broker closer.
 - For latency, **stream sentences, not essays**: the user hears the first sentence while the rest is still being thought.
+- **Name nodes by sound, not by number.** Measured with whisper large-v3-turbo on the same 144 synthetic utterances (pink noise at ∞/20/10/5 dB): IMA ADPCM 4:1 costs about 1 CER point over raw PCM, mostly smeared consonants; with a vocabulary prompt about half that. The node names mattered more than the codec: 일 번 / 이 번 ("one"/"two") differ by one final consonant and were confused 4/16 times even from raw PCM, while red / blue were 0/16. Nodes are now called by colour and light up in it.
 - ESP32-S3 TLS needs **NTP time sync** (set a timeout — LTE carriers often block NTP; fall back gracefully).
 - For a portable backend, a **cloud broker** beats a **home Mac + tunnel (unstable)**.
 

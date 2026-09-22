@@ -15,7 +15,7 @@
 # ACK 방식: state 토픽은 retained라 그냥 읽으면 "직전" 명령의 ACK가 먼저 튀어나온다(pong 오답의 원인).
 # 그래서 구독을 먼저 열고(-R: retained 무시) 그 다음 publish → 이번 명령의 ACK만 잡는다.
 NODE="${1:?노드 이름 필요 (1, 1번, dev1, 2, 2번, dev2, all)}"
-case "$NODE" in 1|1번|one) NODE=dev1;; 2|2번|two) NODE=dev2;; esac   # 사용자는 1번·2번이라 부른다
+case "$NODE" in 1|1번|red|레드) NODE=dev1;; 2|2번|blue|블루) NODE=dev2;; esac   # 음성 호칭은 레드·블루, 내부 ID는 1번·2번
 CMD="${2:?명령 필요 (예: led:red, poke:120, relay:on)}"
 SEC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secrets.local.txt"   # 저장소 루트의 secrets (클론 위치 무관)
 # 로컬 mosquitto(1883, 평문)로 붙는다 — HiveMQ 브리지가 클라우드와 동기화 (mosquitto.conf 참고).

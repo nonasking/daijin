@@ -426,3 +426,47 @@ class SentenceSplitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Node names: spoken 레드/블루 (red/blue) ↔ internal 1번/2번
+# ---------------------------------------------------------------------------
+
+class NodeNameTest(unittest.TestCase):
+
+    def test_spoken_names_normalize_to_internal_ids(self):
+        cases = {
+            "레드 돌리고 블루 돌려 줘": "1번 돌리고 2번 돌려 줘",
+            "Red 모터 돌려": "1번 모터 돌려",
+            "blue 간식 줘": "2번 간식 줘",
+            "블루 먼저, 그 다음에 레드": "2번 먼저, 그 다음에 1번",
+            "일 번이랑 이 번": "1번이랑 2번",       # older spoken form still accepted
+            "dev1이랑 두 번": "1번이랑 2번",
+        }
+        for src, want in cases.items():
+            with self.subTest(src=src):
+                self.assertEqual(dm.normalize_nodes(src), want)
+
+    def test_korean_color_words_are_led_commands_not_node_names(self):
+        self.assertEqual(dm.normalize_nodes("빨간 불 켜 줘"), "빨간 불 켜 줘")
+        self.assertEqual(dm.normalize_nodes("파랑으로 바꿔"), "파랑으로 바꿔")
+        self.assertEqual(dm.normalize_nodes("한 번 더"), "한 번 더")
+        self.assertEqual(dm.normalize_nodes("12번 버스"), "12번 버스")
+
+    def test_speech_uses_color_names_with_correct_particles(self):
+        cases = {
+            "1번이랑 2번 둘 다 온라인이야.": "레드랑 블루 둘 다 온라인이야.",
+            "1번은 온라인, 2번을 돌릴게.": "레드는 온라인, 블루를 돌릴게.",
+            "dev2가 응답이 없어.": "블루가 응답이 없어.",
+            "2번(dev2)이 돌아왔어.": "블루가 돌아왔어.",
+            "10번 반복했어.": "10번 반복했어.",          # other numbers untouched
+            "1번 모터 명령 보냈고 ack 받았어.": "레드 모터 명령 보냈어.",
+        }
+        for src, want in cases.items():
+            with self.subTest(src=src):
+                self.assertEqual(dm.speak_fix(src), want)
+
+    def test_hallucination_list_follows_the_stt_prompt(self):
+        # _PROMPT_SENTS must be derived from STT_PROMPT (it used to drift).
+        for sent in dm._PROMPT_SENTS:
+            self.assertIn(sent, dm.normalize_nodes(dm.STT_PROMPT))
