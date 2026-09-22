@@ -49,12 +49,23 @@ def report(client, node, text, kind):
 
 local = None   # 로컬 미러 클라이언트 (연결 실패 시 None → 미러 생략)
 
+_last_payload = {}   # topic -> 마지막 상태. 로컬 브로커가 늦게 붙거나 재시작해도 다시 써주기 위해 보관
+
 def mirror(topic, payload):
+    _last_payload[topic] = payload
     if local is not None and local.is_connected():
         try:
             local.publish(topic, payload, qos=0, retain=True)
         except Exception as e:
             print(f"(로컬 미러 실패: {e})")
+
+def _replay_mirror(c, *a):
+    # 로컬 브로커 (재)접속 시: 그 사이 놓친 상태를 retained로 다시 쓴다.
+    # 2026-09-22 실측: 맥 재부팅 직후 클라우드 베이스라인이 로컬 접속보다 먼저 와서 미러가 비어 있었음.
+    print(f"🪞 로컬 브로커 미러 ON (localhost:1883) → 상태 {len(_last_payload)}건 재전송")
+    for t, pl in list(_last_payload.items()):
+        try: c.publish(t, pl, qos=0, retain=True)
+        except Exception as e: print(f"(재전송 실패 {t}: {e})")
 
 def on_message(client, userdata, msg):
     mirror(msg.topic, msg.payload)
@@ -121,7 +132,7 @@ print("👁️ fleet_watch 시작")
 _l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
 _l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
 _l.reconnect_delay_set(min_delay=1, max_delay=30)
-_l.on_connect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 미러 ON (localhost:1883, rc={rc})")
+_l.on_connect = _replay_mirror
 _l.on_disconnect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 끊김(rc={rc}) → 재시도")
 _l.connect_async(LOCAL_HOST, LOCAL_PORT, 60); _l.loop_start(); local = _l
 while True:
