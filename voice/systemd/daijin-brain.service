@@ -1,0 +1,22 @@
+# daijin 브레인 — systemd 사용자 서비스 (리눅스). voice/install-services.sh 가 __REPO__/__HOME__/__PYTHON__ 을 채워 설치한다.
+# 맥의 com.daijin.brain.plist 에 해당. 부팅 시 자동 시작, 죽으면 5초 뒤 재시작.
+[Unit]
+Description=daijin brain (MQTT voice agent: STT -> Claude -> TTS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=__REPO__/voice
+ExecStart=__PYTHON__ -u __REPO__/voice/daijin_mqtt.py
+Restart=always
+RestartSec=5
+# 사용자 서비스의 PATH 는 최소라서: claude(~/.local/bin), mosquitto_pub·ffmpeg(/usr/bin) 포함
+Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=__HOME__
+Environment=PYTHONUNBUFFERED=1
+# 로그는 맥과 같은 자리(voice/daijin.log). journalctl --user -u daijin-brain 으로도 상태 확인 가능
+StandardOutput=append:__REPO__/voice/daijin.log
+StandardError=append:__REPO__/voice/daijin.log
+
+[Install]
+WantedBy=default.target

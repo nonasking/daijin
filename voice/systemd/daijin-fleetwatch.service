@@ -1,0 +1,19 @@
+# fleet_watch — 홈 노드 장애 워처, systemd 사용자 서비스 (리눅스). 맥의 com.daijin.fleetwatch.plist 에 해당.
+[Unit]
+Description=daijin fleet watcher (node OFFLINE/ONLINE/STALE -> daijin/ask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=__REPO__/voice
+ExecStart=__PYTHON__ -u __REPO__/voice/fleet_watch.py
+Restart=always
+RestartSec=5
+Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=__HOME__
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:__REPO__/voice/fleetwatch.log
+StandardError=append:__REPO__/voice/fleetwatch.log
+
+[Install]
+WantedBy=default.target

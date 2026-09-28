@@ -2,13 +2,9 @@
 # 관제 화면 — 촬영·디버깅용 라이브 토픽 모니터.
 # 오디오 청크(바이너리 홍수)는 제외하고, 사람이 읽을 이벤트만 시간과 함께 흘려준다.
 # 사용법: bash console.sh   (Ctrl-C로 종료)
-SEC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secrets.local.txt"   # 저장소 루트의 secrets (클론 위치 무관)
-H=$(grep '^MQTT_CLOUD_HOST=' "$SEC" | cut -d= -f2-)
-PORT=$(grep '^MQTT_CLOUD_PORT=' "$SEC" | cut -d= -f2-)
-U=$(grep '^MQTT_CLOUD_USER=' "$SEC" | cut -d= -f2-)
-P=$(grep '^MQTT_CLOUD_PASS=' "$SEC" | cut -d= -f2-)
+source "$(dirname "${BASH_SOURCE[0]}")/broker.sh"   # CLOUD_AUTH — 관제는 항상 클라우드 원본을 본다
 echo "═══ daijin 관제 화면 ═══ (오디오 스트림 제외 전 토픽)"
-mosquitto_sub -h "$H" -p "$PORT" --cafile /etc/ssl/cert.pem -u "$U" -P "$P" -v \
+mosquitto_sub "${CLOUD_AUTH[@]}" -v \
   -t 'daijin/text/#' -t 'daijin/say' -t 'daijin/ask' -t 'daijin/status' \
   -t 'daijin/dev/+/cmd' -t 'daijin/dev/+/state' -t 'daijin/dev/+/status' -t 'daijin/dev/+/event' \
 | while IFS= read -r line; do

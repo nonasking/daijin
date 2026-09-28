@@ -470,3 +470,47 @@ class NodeNameTest(unittest.TestCase):
         # _PROMPT_SENTS must be derived from STT_PROMPT (it used to drift).
         for sent in dm._PROMPT_SENTS:
             self.assertIn(sent, dm.normalize_nodes(dm.STT_PROMPT))
+
+
+class TestPortableBackends(unittest.TestCase):
+    """Linux-portability seams: STT engine selection and the stdlib multipart body sent to Groq.
+    sec() is swapped for a dict so no secrets file is read."""
+
+    def _with_secrets(self, d):
+        orig = dm.sec
+        dm.sec = lambda k: d.get(k, "")
+        self.addCleanup(setattr, dm, "sec", orig)
+
+    def test_stt_engine_defaults_to_groq_only_when_a_key_exists(self):
+        self._with_secrets({})
+        self.assertEqual(dm._stt_engine(), "whisper")
+        self._with_secrets({"GROQ_API_KEY": "gsk_x"})
+        self.assertEqual(dm._stt_engine(), "groq")
+        self._with_secrets({"GROQ_API_KEY": "gsk_x", "STT_ENGINE": "whisper"})   # explicit wins
+        self.assertEqual(dm._stt_engine(), "whisper")
+
+    def test_multipart_body_is_parseable_and_carries_the_vocabulary_prompt(self):
+        import email.parser, email.policy
+        body, ctype = dm._multipart({"model": "whisper-large-v3-turbo", "prompt": "레드, 블루"},
+                                    "clip.wav", b"RIFF\x00\x01\xff")
+        self.assertTrue(ctype.startswith("multipart/form-data; boundary="))
+        msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(
+            f"Content-Type: {ctype}\r\n\r\n".encode() + body)
+        parts = {p.get_param("name", header="content-disposition"): p for p in msg.iter_parts()}
+        self.assertEqual(set(parts), {"model", "prompt", "file"})
+        # form fields carry no charset header (HTTP multipart convention: raw UTF-8), so read the bytes
+        self.assertEqual(parts["prompt"].get_payload(decode=True).decode("utf-8"), "레드, 블루")
+        self.assertEqual(parts["file"].get_filename(), "clip.wav")
+        self.assertEqual(parts["file"].get_content_type(), "audio/wav")
+        self.assertEqual(parts["file"].get_payload(decode=True), b"RIFF\x00\x01\xff")
+
+    def test_claude_env_injects_token_from_secrets_without_overriding_the_shell(self):
+        self._with_secrets({"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secretsfile"})
+        prev = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        self.addCleanup(lambda: os.environ.update({"CLAUDE_CODE_OAUTH_TOKEN": prev}) if prev else None)
+        self.assertEqual(dm._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-secretsfile")
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "from-shell"
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_OAUTH_TOKEN", None)
+        self.assertEqual(dm._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "from-shell")
+        self._with_secrets({})
+        self.assertEqual(dm._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "from-shell")

@@ -6,7 +6,7 @@
 Tap a button, talk to the device → audio travels through the cloud → an AI agent (**Claude**) thinks → the device answers back in speech, in a voice I designed.
 It doesn't just reply — it **actually controls my home and my computer.**
 
-Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a Mac brain + cloud MQTT.
+Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a brain (a Mac at home, or any small Linux box/VPS) + cloud MQTT.
 
 ## Demo
 
@@ -35,8 +35,8 @@ flowchart LR
 
     BROKER{{"HiveMQ Cloud<br/>MQTT / TLS<br/>(both sides rendezvous outbound)"}}
 
-    subgraph brain["Mac brain (at home, outbound only)"]
-        STT["whisper.cpp<br/>(STT, Korean)"]
+    subgraph brain["Brain: Mac or Linux server (outbound only)"]
+        STT["Groq Whisper API / whisper.cpp<br/>(STT, Korean)"]
         AGENT["Claude<br/>(claude -p, streaming)"]
         TTS["Edge TTS (default) / ElevenLabs / macOS<br/>(sentence by sentence)"]
         STT --> AGENT --> TTS
@@ -50,7 +50,7 @@ flowchart LR
     AGENT -. "controls" .-> HOME["Home LEDs / devices"]
 ```
 
-- **They meet at a cloud broker** → works on any network: home WiFi or a phone hotspot on LTE. The Mac stays home and only goes outbound (no inbound exposure needed).
+- **They meet at a cloud broker** → works on any network: home WiFi or a phone hotspot on LTE. The brain only goes outbound (no inbound exposure needed), so it can be a Mac at home **or a headless Linux server** — the device does not care which. See [Run the brain on a Linux server](#run-the-brain-on-a-linux-server-no-mac-needed).
 - **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers: a full round trip (record → STT → agent → TTS → playback) typically takes **6–22 s** depending on how much the agent thinks and does — streaming hides part of that, but this is a conversation, not real-time.
 - **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. **Both directions are IMA ADPCM-compressed 4:1** — the ~19KB/s bandwidth ceiling applies to the ESP32's send buffer too, so raw 32KB/s PCM can't keep up in either direction. Downstream plays through a jitter ring buffer; upstream is drained by a dedicated capture task so a blocking TLS publish never drops samples.
 - The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker (certificate verification required), credentials kept only in a gitignored `secrets.local.txt`, the Mac makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one).
@@ -99,12 +99,15 @@ sketches/   ESP32 firmware (arduino-cli)
   test-speaker        speaker verification (I2S tone melody)
   mic-diag            auto-sweeps every pin/slot combo to find I2S wiring empirically
 voice/      daijin
-  daijin_mqtt.py      brain: MQTT client (STT → Claude → streaming TTS → ADPCM chunks)
+  daijin_mqtt.py      brain: MQTT client (STT → Claude → streaming TTS → ADPCM chunks) — runs on macOS or Linux
+  broker.sh           shared by the helpers: picks the local bridge or the cloud broker, finds the CA bundle (Mac/Linux)
   daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
   talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
   dev.sh              command a home node and verify its retained ack
   fleet.sh            fleet status: ONLINE / STALE(heartbeat gap) / OFFLINE(broker LWT)
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
+  install-agents.sh   macOS: register brain + fleet watcher as LaunchAgents
+  install-services.sh Linux: register them as systemd user services (systemd/*.service)
   test_device.py      fake-device round-trip test
   mic_test_server.py  HTTP endpoint for mic verification
   tests/              unit tests (ADPCM encoder ⇄ device decoder, sentence splitting) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
@@ -113,12 +116,12 @@ docs/       roadmap · research · audio protocol
 
 ## Stack
 
-ESP32-S3 · Arduino (arduino-cli) · MQTT (HiveMQ Cloud, TLS/Let's Encrypt) · whisper.cpp (STT, Korean) ·
-Claude CLI (agent brain, stream-json) · Edge TTS (default) / ElevenLabs / macOS TTS · IMA ADPCM · launchd
+ESP32-S3 · Arduino (arduino-cli) · MQTT (HiveMQ Cloud, TLS/Let's Encrypt) · Groq Whisper API or whisper.cpp (STT, Korean) ·
+Claude CLI (agent brain, stream-json) · Edge TTS (default) / ElevenLabs / macOS TTS · IMA ADPCM · launchd / systemd
 
 ## Run it yourself
 
-Everything here runs on a Mac (the brain) plus one or more ESP32-S3 boards. Clone anywhere; paths are derived from the repo location.
+Everything here runs on a brain machine (a Mac, or a Linux server — see the next section) plus one or more ESP32-S3 boards. Clone anywhere; paths are derived from the repo location.
 
 **Mac prerequisites**
 
@@ -157,7 +160,38 @@ bash voice/install-agents.sh           # or: register brain + fleet watcher as L
 ```
 Then tap BOOT on the device and talk. `bash voice/console.sh` shows every transcript, reply, and node command live; `bash voice/fleet.sh` lists node status; `bash voice/dev.sh red motor` drives a node by hand (nodes are called red and blue; they light up in their colour).
 
-**Optional: local broker bridge.** Running mosquitto on the Mac and bridging it to the cloud broker cuts each node command from ~3 s to well under a second. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
+**Optional: local broker bridge.** Running mosquitto on the brain machine and bridging it to the cloud broker cuts each node command from ~3 s to well under a second. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
+
+### Run the brain on a Linux server (no Mac needed)
+
+The brain is the only piece that ran on the Mac, and nothing in it needs macOS. Put it on an always-on Linux box — a €5 VPS, a Raspberry Pi, an old laptop — and the Mac can sleep or leave the house. What changes:
+
+| On the Mac | On Linux |
+|---|---|
+| whisper.cpp on the GPU (~2 s per clip) | **Groq Whisper API** (`STT_ENGINE=groq`): the same `whisper-large-v3-turbo` model, same vocabulary prompt, free tier covers home use. Local whisper.cpp still works as the fallback if you download the model, but on a 2-vCPU VPS it takes tens of seconds per clip. |
+| `claude` logged in via browser | `claude setup-token` on your Mac → paste into `CLAUDE_CODE_OAUTH_TOKEN` in `secrets.local.txt` (1-year subscription token; Pro/Max). |
+| `afconvert`, `say` | `ffmpeg`. No offline TTS fallback on Linux; Edge TTS is the default anyway. |
+| LaunchAgent | systemd user service (`install-services.sh`) |
+| The agent's shell is your Mac | The agent's shell is the server. Home nodes are still driven over MQTT, so `dev.sh`/`fleet.sh` work unchanged; anything that needed *the Mac itself* (its files, its apps) does not. |
+
+Conversation memory (the pinned Claude session) lives on the machine that runs the brain, so a new machine starts with a blank memory.
+
+```bash
+# Debian/Ubuntu
+sudo apt install ffmpeg mosquitto-clients python3-pip git
+pip3 install paho-mqtt edge-tts          # or: pip3 install --break-system-packages …, or use a venv
+curl -fsSL https://claude.ai/install.sh | bash      # Claude Code CLI → ~/.local/bin/claude
+
+git clone https://github.com/nonasking/daijin.git && cd daijin
+cp secrets.local.example secrets.local.txt     # broker creds + GROQ_API_KEY + CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token` on the Mac)
+python3 -u voice/daijin_mqtt.py                # foreground first: tap BOOT, talk, watch the log
+bash voice/install-services.sh                 # then register as systemd user services (auto-start, auto-restart, survives logout via linger)
+journalctl --user -u daijin-brain -f           # or tail voice/daijin.log
+```
+
+Run only one brain at a time against a broker: two subscribers on `daijin/audio/in` would both answer. Stop the Mac's LaunchAgent (`bash voice/install-agents.sh remove`) once the server is up.
+
+A server in the EU sits next to the HiveMQ broker, so node command acks drop from ~3 s to well under a second even without the local bridge. Moving later to a home server is the same install; the local mosquitto bridge simply becomes available again.
 
 ## License
 

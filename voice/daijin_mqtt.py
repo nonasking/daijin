@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-# daijin 브레인 (MQTT 클라이언트) — 맥이 HiveMQ에 outbound 접속해 오디오 토픽으로 대화.
-#   구독 daijin/audio/in  (디바이스가 녹음한 WAV) → whisper(STT) → Claude → Yuna(TTS)
+# daijin 브레인 (MQTT 클라이언트) — 브레인 머신(맥 또는 리눅스 서버)이 HiveMQ에 outbound 접속해 오디오 토픽으로 대화.
+#   구독 daijin/audio/in  (디바이스가 녹음한 WAV) → STT(Groq Whisper API 또는 로컬 whisper.cpp) → Claude → TTS
 #   발행 daijin/audio/out (답 WAV)  + daijin/text/in, daijin/text/out (디버그)
-# 실행:  python3 -u voice/daijin_mqtt.py   (상시 구동은 LaunchAgent com.daijin.brain — voice/install-agents.sh)
+# 실행:  python3 -u voice/daijin_mqtt.py
+#   상시 구동: 맥은 LaunchAgent com.daijin.brain (voice/install-agents.sh), 리눅스는 systemd 사용자 서비스 (voice/install-services.sh)
+# 이식성: 실행 파일은 PATH에서 찾고 macOS 전용 도구(afconvert, say)는 맥에서만 쓴다. 리눅스 의존은 ffmpeg 하나.
 #
 # 설계 노트:
 # - 보안: 도구 전면 개방(사용자 결정 2026-07-04) — 브로커 자격증명이 곧 보안 경계.
@@ -12,16 +14,26 @@
 # - launchd 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속.
 
 import paho.mqtt.client as mqtt
-import subprocess, re, os, ssl, time, json, wave, io, threading, queue
+import subprocess, re, os, sys, ssl, time, json, wave, io, threading, queue, shutil, uuid
+import urllib.request
 
 HOME    = os.path.expanduser("~")
 # 경로는 이 파일의 위치에서 유도한다. 저장소를 어디에 클론해도 된다.
 VOICE   = os.path.dirname(os.path.abspath(__file__))
 REPO    = os.path.dirname(VOICE)
 SEC     = f"{REPO}/secrets.local.txt"
-WHISPER = os.environ.get("WHISPER_CLI") or ("/opt/homebrew/bin/whisper-cli" if os.path.exists("/opt/homebrew/bin/whisper-cli") else "whisper-cli")
+IS_MAC  = sys.platform == "darwin"
+def _which(name, *candidates):
+    """실행 파일 찾기: 알려진 절대 경로 후보 → PATH → 이름 그대로(없으면 실행 시점에 실패로 드러남)."""
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return shutil.which(name) or name
+WHISPER = os.environ.get("WHISPER_CLI") or _which("whisper-cli", "/opt/homebrew/bin/whisper-cli")
 MODEL   = f"{VOICE}/models/ggml-large-v3-turbo-q5_0.bin"
-CLAUDE  = f"{HOME}/.local/bin/claude" if os.path.exists(f"{HOME}/.local/bin/claude") else "claude"
+CLAUDE  = _which("claude", f"{HOME}/.local/bin/claude")
+FFMPEG  = _which("ffmpeg", "/opt/homebrew/bin/ffmpeg")
+AFCONVERT = "/usr/bin/afconvert"       # macOS 내장 — ffmpeg가 없을 때만
 SESSION_FILE = f"{VOICE}/.daijin_session"
 TTS_VOICE = "Yuna"                     # 최종 폴백 (오프라인 보장)
 ELEVEN_VOICE = "TFUX5RKA9yUMr26dSJqF"  # daijin 보이스 (Voice Design으로 생성, 크레딧제)
@@ -56,7 +68,7 @@ def _props():
 
 SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하고 친근하게 한국어로 "
        "2~3문장 이내로 짧게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽힘). "
-       "너는 이 맥에서 도구를 자유롭게 쓸 수 있어 — 웹 검색, 파일 읽고 쓰기, 셸 명령 실행. "
+       "너는 이 컴퓨터(네 브레인이 돌아가는 서버)에서 도구를 자유롭게 쓸 수 있어 — 웹 검색, 파일 읽고 쓰기, 셸 명령 실행. "
        "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
        f"집 LED(각 노드의 온보드 RGB)는 'bash {VOICE}/dev.sh all led:<색>' (색: red green blue yellow cyan magenta white off; "
        "꺼=off, 켜=green). "
@@ -131,18 +143,72 @@ def _looks_hallucinated(t):
         return True
     return len(sents) == 1 and sents[0] in _PROMPT_SENTS
 
-def stt(wav):
+# ---------- STT 백엔드 ----------
+# secrets의 STT_ENGINE: groq = Groq Whisper API (지금 로컬로 쓰는 것과 같은 large-v3-turbo, 무료 티어면 충분)
+#                        whisper = 로컬 whisper.cpp (맥 GPU에선 빠르지만 2vCPU VPS에선 클립당 수십 초)
+# 비우면 GROQ_API_KEY가 있을 때 groq, 없으면 whisper. groq가 실패하면 로컬 모델이 있을 때 폴백.
+GROQ_URL   = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODEL = "whisper-large-v3-turbo"
+
+def _stt_engine():
+    return sec("STT_ENGINE") or ("groq" if sec("GROQ_API_KEY") else "whisper")
+
+def _multipart(fields, filename, filedata, content_type="audio/wav"):
+    """multipart/form-data 본문 조립 (stdlib만으로 — requests 의존 없이). (body, Content-Type) 반환."""
+    boundary = "----daijin" + uuid.uuid4().hex
+    body = bytearray()
+    for k, v in fields.items():
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").encode("utf-8")
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+             f"Content-Type: {content_type}\r\n\r\n").encode("utf-8") + filedata + b"\r\n"
+    body += f"--{boundary}--\r\n".encode("utf-8")
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+def stt_groq(wav):
+    # OpenAI 호환 엔드포인트. prompt는 로컬 whisper와 같은 어휘 바이어스 문장(레드/블루 오인식 교정).
+    body, ctype = _multipart({"model": GROQ_MODEL, "language": "ko", "prompt": STT_PROMPT,
+                              "response_format": "json"},
+                             "clip.wav", open(wav, "rb").read())
+    req = urllib.request.Request(GROQ_URL, data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {sec('GROQ_API_KEY')}",
+                                          "Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return (json.loads(resp.read()).get("text") or "").strip()
+
+def stt_whisper(wav):
     r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
                         "--prompt",STT_PROMPT,"-f",wav],
                        capture_output=True, text=True)
     return r.stdout.strip()
+
+def stt(wav):
+    engine = _stt_engine()
+    if engine == "groq":
+        try:
+            return stt_groq(wav)
+        except Exception as e:
+            print(f"  (Groq STT 실패: {e} → 로컬 whisper 폴백)")
+    if not os.path.exists(MODEL):
+        print(f"  ⚠️ STT 불가: 로컬 모델 없음({MODEL}) — secrets에 GROQ_API_KEY를 넣거나 모델을 내려받아야 해")
+        return ""
+    return stt_whisper(wav)
+
+def _claude_env():
+    """헤드리스 서버용 인증: secrets의 CLAUDE_CODE_OAUTH_TOKEN(`claude setup-token`으로 발급, 구독 1년 토큰)을
+    claude 자식 프로세스 환경에 넣는다. 이미 로그인된 맥처럼 비워 두면 평소 인증 그대로."""
+    env = os.environ.copy()
+    tok = sec("CLAUDE_CODE_OAUTH_TOKEN")
+    if tok and not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    return env
 
 def _claude_once(text, resume_id):
     cmd = [CLAUDE, "-p", text, "--output-format", "json",
            "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
     if resume_id:
         cmd += ["--resume", resume_id]
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=VOICE, stdin=subprocess.DEVNULL)
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=VOICE, stdin=subprocess.DEVNULL,
+                       env=_claude_env())
     try:
         data = json.loads(r.stdout)
     except (json.JSONDecodeError, ValueError):
@@ -181,7 +247,7 @@ def brain_stream(text):
         if resume_id:
             cmd += ["--resume", resume_id]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, text=True, cwd=VOICE)
+                                stderr=subprocess.DEVNULL, text=True, cwd=VOICE, env=_claude_env())
     sid = load_session()
     attempts = [sid, None] if sid else [None]
     for attempt in attempts:
@@ -229,11 +295,23 @@ def brain_stream(text):
             print("  (세션 재개 실패 → 새 세션으로)")
     yield "미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"
 
+def mp3_to_wav16k(src, dst):
+    """mp3(24k) → PCM 16k mono WAV. ffmpeg가 있으면 그걸(맥·리눅스 공통), 없으면 macOS 내장 afconvert."""
+    if shutil.which(FFMPEG):
+        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", src,
+                        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", dst],
+                       check=True, capture_output=True, timeout=15)
+    elif IS_MAC and os.path.exists(AFCONVERT):
+        subprocess.run([AFCONVERT, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", src, dst],
+                       check=True, capture_output=True, timeout=15)
+    else:
+        raise RuntimeError("ffmpeg 없음 (리눅스: apt install ffmpeg)")
+
 def tts_stream(text):
     """PCM 16k 조각을 yield. 엔진은 secrets.local.txt의 TTS_ENGINE으로 선택(브레인 재시작 필요):
-      edge   (기본) — MS 뉴럴 Seraphina, 무료·무제한
+      edge   (기본) — MS 뉴럴 Seraphina, 무료·무제한 (맥·리눅스 공통)
       eleven        — ElevenLabs 커스텀 보이스, 크레딧제(월 1만 무료)
-      yuna          — macOS 내장, 오프라인 보장 (모든 엔진의 최종 폴백)"""
+      yuna          — macOS 내장, 오프라인 보장 (맥에서만 최종 폴백; 리눅스엔 해당 없음)"""
     if not text:
         text = "잘 못 들었어, 다시 말해줄래?"
     engine = sec("TTS_ENGINE") or "edge"
@@ -260,18 +338,18 @@ def tts_stream(text):
             engine = "edge"
     if engine == "edge":
         try:
-            subprocess.run(["/opt/homebrew/bin/python3", "-m", "edge_tts",
+            # 브레인을 띄운 파이썬(sys.executable)에 edge-tts가 설치돼 있어야 한다 (pip install edge-tts)
+            subprocess.run([sys.executable, "-m", "edge_tts",
                             "--voice", EDGE_VOICE, "--text", text,
                             "--write-media", EDGE_MP3],
                            check=True, capture_output=True, timeout=20)
-            # mp3(24k) → PCM 16k mono 변환
-            subprocess.run(["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@16000",
-                            "-c", "1", EDGE_MP3, OUT_WAV],
-                           check=True, capture_output=True, timeout=15)
+            mp3_to_wav16k(EDGE_MP3, OUT_WAV)
             yield wav_to_pcm(OUT_WAV)
             return
         except Exception as e:
-            print(f"  (edge-tts 실패: {e} → Yuna 폴백)")
+            print(f"  (edge-tts 실패: {e} → {'Yuna 폴백' if IS_MAC else '이 문장은 건너뜀'})")
+    if not IS_MAC:
+        return                                  # 리눅스엔 오프라인 폴백 음성이 없다 — 조용히 넘어간다
     subprocess.run(["/usr/bin/say","-v",TTS_VOICE,"-o",OUT_WAV,
                     "--file-format=WAVE","--data-format=LEI16@16000",text])
     yield wav_to_pcm(OUT_WAV)
