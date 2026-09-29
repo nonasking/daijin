@@ -514,3 +514,40 @@ class TestPortableBackends(unittest.TestCase):
         self.assertEqual(dm._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "from-shell")
         self._with_secrets({})
         self.assertEqual(dm._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "from-shell")
+
+
+class TestLocalHooks(unittest.TestCase):
+    """The optional voice/local_hooks.py extension point. The file itself is not part of the repo,
+    so the tests plug in a stand-in module."""
+
+    def _with_hooks(self, hooks):
+        orig = dm.HOOKS
+        dm.HOOKS = hooks
+        self.addCleanup(setattr, dm, "HOOKS", orig)
+
+    def test_without_hooks_everything_goes_to_the_agent(self):
+        self._with_hooks(None)
+        self.assertFalse(dm.intercepted(None, "안녕", "voice", 0.0))
+
+    def test_intercept_can_answer_by_itself_through_ctx_say(self):
+        spoken = []
+        orig = dm.speak_stream
+        dm.speak_stream = lambda client, it, t0: spoken.extend(it)
+        self.addCleanup(setattr, dm, "speak_stream", orig)
+
+        def intercept(text, kind, ctx):
+            if kind == "voice" and "불 꺼" in text:
+                ctx.say("껐어.")
+                return True
+            return False
+        self._with_hooks(types.SimpleNamespace(intercept=intercept))
+        self.assertTrue(dm.intercepted(None, "거실 불 꺼 줘", "voice", 0.0))
+        self.assertEqual(spoken, ["껐어."])
+        self.assertFalse(dm.intercepted(None, "오늘 날씨 어때", "voice", 0.0))
+        self.assertFalse(dm.intercepted(None, "거실 불 꺼 줘", "ask", 0.0))
+
+    def test_a_crashing_hook_falls_through_to_the_agent(self):
+        def intercept(text, kind, ctx):
+            raise RuntimeError("boom")
+        self._with_hooks(types.SimpleNamespace(intercept=intercept))
+        self.assertFalse(dm.intercepted(None, "안녕", "voice", 0.0))

@@ -36,9 +36,36 @@ def ask(client, text):
     client.publish(T_ASK, text)
     print(f"[{time.strftime('%H:%M:%S')}] ask → {text}")
 
+def _load_hooks():
+    """voice/local_hooks.py (선택, 저장소 밖 개인 파일). mute_reports() 가 True 를 돌려주면 능동 보고를 쉰다."""
+    path = os.path.join(VOICE, "local_hooks.py")
+    if not os.path.exists(path):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("daijin_local_hooks", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        print(f"(local_hooks.py 로드 실패, 없는 셈 치고 계속: {e})")
+        return None
+HOOKS = _load_hooks()
+
+def muted():
+    fn = getattr(HOOKS, "mute_reports", None)
+    try:
+        return bool(fn()) if fn else False
+    except Exception as e:
+        print(f"(local_hooks.mute_reports 오류: {e})")
+        return False
+
 def report(client, node, text, kind):
     """kind별 쿨다운 — 오프라인 직후의 복귀 보고가 잘리지 않도록 종류를 분리.
     플래핑(널뛰기) 노드도 종류당 분당 1회로 제한된다."""
+    if muted():
+        print(f"[{time.strftime('%H:%M:%S')}] (보고 쉼, local_hooks) {text[:40]}")
+        return
     st = nodes[node]
     key = f"alerted_{kind}"
     if time.time() - st.get(key, 0) < COOLDOWN_S:

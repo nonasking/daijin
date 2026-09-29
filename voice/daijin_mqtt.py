@@ -14,7 +14,7 @@
 # - launchd 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속.
 
 import paho.mqtt.client as mqtt
-import subprocess, re, os, sys, ssl, time, json, wave, io, threading, queue, shutil, uuid
+import subprocess, re, os, sys, ssl, time, json, wave, io, threading, queue, shutil, uuid, types
 import urllib.request
 
 HOME    = os.path.expanduser("~")
@@ -59,12 +59,15 @@ def _speed_opts():
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
 def _props():
-    """voice/props.txt: 각 노드에 물려 있는 물리 소품 설명. 있으면 시스템 프롬프트에 붙인다."""
-    try:
-        t = open(f"{VOICE}/props.txt", encoding="utf-8").read().strip()
+    """각 노드에 물려 있는 물리 소품 설명. 있으면 시스템 프롬프트에 붙인다.
+    voice/props.local.txt(저장소에 넣지 않는 이 설치본의 것)가 있으면 그것을, 없으면 voice/props.txt(예시)를 읽는다."""
+    for name in ("props.local.txt", "props.txt"):
+        try:
+            t = open(f"{VOICE}/{name}", encoding="utf-8").read().strip()
+        except FileNotFoundError:
+            continue
         return (" 지금 홈 노드들에 붙어 있는 실제 소품과 할 수 있는 장난: " + t.replace("\n", " ") + " ") if t else ""
-    except FileNotFoundError:
-        return ""
+    return ""
 
 SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하고 친근하게 한국어로 "
        "2~3문장 이내로 짧게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽힘). "
@@ -103,11 +106,47 @@ def save_session(sid):
     if sid:
         open(SESSION_FILE, "w").write(sid)
 
+# ---------- 로컬 확장 (선택) ----------
+# voice/local_hooks.py 가 있으면 불러온다. 저장소에 넣지 않는 개인 파일로(.gitignore), 이 설치본만의 동작을 얹는 자리다.
+# 없으면 아무 일도 없다. 정의할 수 있는 것 (전부 선택):
+#   STT_PROMPT_EXTRA = "..."             STT 어휘 프롬프트 앞에 붙일 문장 (자주 쓰는 말, 고유명사)
+#   intercept(text, kind, ctx) -> bool    True 를 돌려주면 에이전트를 거치지 않고 거기서 처리 끝 (단축 응답, 빠른 명령).
+#                                         kind: "voice"(말로 들어온 것) | "ask"(daijin/ask 로 들어온 것)
+#                                         ctx.say(문장) 으로 말한다. ctx.voice_dir, ctx.t0, ctx.sec(키) 도 쓸 수 있다.
+#   mute_reports() -> bool                True 면 fleet_watch 가 능동 보고를 쉰다 (fleet_watch.py 가 읽는다)
+def _load_hooks():
+    path = f"{VOICE}/local_hooks.py"
+    if not os.path.exists(path):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("daijin_local_hooks", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        print("🔌 로컬 확장 로드: local_hooks.py")
+        return mod
+    except Exception as e:
+        print(f"  ⚠️ local_hooks.py 로드 실패 (없는 셈 치고 계속): {e}")
+        return None
+HOOKS = _load_hooks()
+
+def intercepted(client, text, kind, t0):
+    fn = getattr(HOOKS, "intercept", None)
+    if fn is None:
+        return False
+    ctx = types.SimpleNamespace(say=lambda line: speak_stream(client, iter([line]), t0),
+                                sec=sec, voice_dir=VOICE, t0=t0)
+    try:
+        return bool(fn(text, kind, ctx))
+    except Exception as e:
+        print(f"  ⚠️ local_hooks.intercept 오류 (에이전트로 넘김): {e}")
+        return False
+
 # 어휘 바이어스 — 도메인 단어를 알려주면 오인식이 크게 줄어드는 것을 실측으로 확인
 # (2026-08-16: 같은 녹음에서 "빨갛을 켜줘" → "빨간 불 켜 줘"로 교정됨)
 # 주의: whisper는 프롬프트를 "직전 대화 전사"로 취급한다. 라벨식("장치 이름: ...")으로 쓰면
 # 그 라벨이 전사 앞에 새어 들어옴(실측 2026-08-17) → 자연스러운 문장 나열로 쓸 것.
-STT_PROMPT = (""
+STT_PROMPT = (getattr(HOOKS, "STT_PROMPT_EXTRA", "") +
               "다이진, 레드 모터 돌려 줘. 블루 간식 줘. 레드랑 블루 순서대로 돌려 줘. "
               "레드는 서보, 블루는 스텝모터. 블루 먼저, 그 다음에 레드. 십 초 뒤에 돌려 줘. "
               "장치 상태 알려줘. 전부 꺼 줘. 응, 알았어.")
@@ -522,6 +561,8 @@ def handle_clip(client, pcm_or_wav, is_wav):
         client.publish(T_AUDIO_OUT, data)
         print(f"  📤 답 발행(통WAV) {len(data)} bytes · ⏱️ {time.monotonic()-t0:.1f}s")
     else:       # 신형(ESP32): 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
+        if user and intercepted(client, user, "voice", t0):
+            return
         src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
         speak_stream(client, src, t0)
 
@@ -577,6 +618,8 @@ def handle_ask(client, text):
     t0 = time.monotonic()
     print(f"\n📨 ask: {text}")
     client.publish(T_TXT_IN, f"[ask] {text}")
+    if intercepted(client, text, "ask", t0):
+        return
     speak_stream(client, brain_stream(text), t0)
 
 # 처리(whisper/Claude/TTS/발행)는 워커 스레드에서 — paho 네트워크 스레드(콜백)에서 하면

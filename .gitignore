@@ -12,6 +12,10 @@ build/
 secrets.local.txt
 **/secrets.h
 
+# 이 설치본만의 것 (개인 소품 설명, 로컬 확장). 예시는 props.txt, 인터페이스는 daijin_mqtt.py 주석 참고
+*.local.txt
+voice/local_hooks.py
+
 # 대용량 STT 모델 (직접 다운로드)
 voice/models/
 *.bin
