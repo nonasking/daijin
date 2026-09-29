@@ -170,8 +170,9 @@ def stt_groq(wav):
                               "response_format": "json"},
                              "clip.wav", open(wav, "rb").read())
     req = urllib.request.Request(GROQ_URL, data=body, method="POST",
+                                 # User-Agent 필수: Groq 앞단 Cloudflare가 urllib 기본값(Python-urllib)을 403(1010)으로 막는다
                                  headers={"Authorization": f"Bearer {sec('GROQ_API_KEY')}",
-                                          "Content-Type": ctype})
+                                          "Content-Type": ctype, "User-Agent": "daijin-brain/1.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         return (json.loads(resp.read()).get("text") or "").strip()
 
