@@ -24,6 +24,8 @@
 //   "daijin-<node>"로 폴백. 브로커는 클라우드(아웃바운드 TLS만)라 어느 망이든 같은 플릿에 붙는다.
 //   ※ ESP32는 2.4GHz 전용: 아이폰 핫스팟은 "호환성 최대화"를 켜야 보인다.
 //
+// 명령은 수신 콜백에서 큐에 넣고 loop() 에서 온 순서대로 실행한다 (동작 중에 온 명령이 겹쳐 실행되지 않게).
+//
 // 장애 감지 설계: keepalive 15s + LWT(retained {"online":false}) → 전원이 뽑히면
 // 브로커가 ~30초 내에 offline을 retained로 남긴다. 브레인은 fleet.sh로 조회.
 //
@@ -41,6 +43,13 @@
 #include <PubSubClient.h>
 #include "secrets.h"              // MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS (+ WIFI_SSID*)
 #include "ca_cert.h"              // ISRG_ROOT_X1
+#include "tls_time.h"             // 시계 맞추기: NTP, 막히면 HTTP Date (인증서 검증을 끄지 않기 위해)
+
+// 시각을 끝내 못 맞췄을 때 인증서 검증 없이라도 붙을지. 0(기본) = 붙지 않고 재부팅해서 다시 시도한다.
+// 1 로 빌드하면 예전처럼 검증 없이 붙는다: 같은 망의 누구든 브로커 행세로 MQTT 비밀번호를 가로챌 수 있으니 급할 때만.
+#ifndef ALLOW_INSECURE_TLS
+#define ALLOW_INSECURE_TLS 0
+#endif
 
 // ---------- 보드별 설정 (플래시 전 여기만 바꾼다) ----------
 #ifndef NODE_NAME
@@ -234,17 +243,26 @@ void runCmd(const String& cmd) {
   else                      { ack("err:unknown:" + cmd); }
 }
 
+// 명령 큐: 수신 콜백은 넣기만 하고, 실행은 loop() 가 한다.
+// 예전엔 콜백 안에서 바로 실행했는데, 동작 중에 keepalive 를 위해 mqtt.loop() 를 다시 부르기 때문에
+// 그 사이 도착한 명령이 콜백 안의 콜백으로 겹쳐 실행됐다 (모터가 도는 중에 다른 모터 명령이 끼어듦).
+// 이제 동작 중에 온 명령은 줄을 서고, 줄이 꽉 차면 err:busy 로 알린다.
+const int QLEN = 4;
+String cmdQ[QLEN]; int qHead = 0, qCount = 0;
+
 void onMessage(char* t, byte* p, unsigned int n) {
-  String m; for (unsigned int i = 0; i < n; i++) m += (char)p[i];
+  String m; m.reserve(n); for (unsigned int i = 0; i < n; i++) m += (char)p[i];
   Serial.printf("[MQTT] %s <- %s\n", t, m.c_str());
-  runCmd(m);
+  if (qCount == QLEN) { ack("err:busy:" + m); return; }
+  cmdQ[(qHead + qCount++) % QLEN] = m;
 }
 
-bool syncTime(uint32_t timeoutMs) {   // TLS 인증서 검증 + 하트비트 타임스탬프용
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  uint32_t start = millis(); time_t now = time(nullptr);
-  while (now < 1700000000 && millis() - start < timeoutMs) { delay(200); now = time(nullptr); }
-  return now >= 1700000000;
+void runQueued() {                    // loop() 에서 호출: 줄 선 명령을 하나씩, 온 순서대로
+  while (qCount > 0) {
+    String m = cmdQ[qHead]; cmdQ[qHead] = "";
+    qHead = (qHead + 1) % QLEN; qCount--;
+    runCmd(m);
+  }
 }
 
 // 30초 하트비트: retained라 브레인이 언제든 마지막 상태를 읽는다.
@@ -329,8 +347,17 @@ void setup() {
   WiFi.setSleep(false);                            // 핫스팟에서 응답 지연·끊김 방지
   Serial.printf("WiFi OK: %s (%s)\n", WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
 
-  if (syncTime(12000)) { net.setCACert(ISRG_ROOT_X1); Serial.println("time OK → CA 검증"); }
-  else { net.setInsecure(); Serial.println("NTP 실패 → setInsecure(암호화만)"); }
+  // 시계가 맞아야 인증서를 검증할 수 있다 (하트비트 타임스탬프도 이 시계). NTP → HTTP Date 순 (tls_time.h).
+  if (syncClock()) { net.setCACert(ISRG_ROOT_X1); Serial.printf("time OK (%s) → CA 검증\n", clockSource); }
+  else {
+#if ALLOW_INSECURE_TLS
+    net.setInsecure(); Serial.println("시각 동기 실패 → setInsecure (ALLOW_INSECURE_TLS=1)");
+#else
+    Serial.println("시각 동기 실패 → 검증을 끄지 않고 10초 뒤 재부팅해서 다시 시도");
+    for (int i = 0; i < 10; i++) { neopixelWrite(RGB_PIN, 40, 0, 40); delay(300); neopixelWrite(RGB_PIN, 0, 0, 0); delay(700); }
+    ESP.restart();
+#endif
+  }
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMessage);
@@ -364,6 +391,7 @@ void loop() {
     }
   }
   mqtt.loop();
+  runQueued();
   heartbeat();
 
 #if FEAT_PIR
