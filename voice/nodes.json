@@ -1,0 +1,16 @@
+{
+  "dev1": {
+    "n": 1,
+    "name": "레드",
+    "aliases": ["red"],
+    "color": "red",
+    "flash": "-DFEAT_SERVO=1 -DFEAT_BUZZER=1 -DFEAT_RELAY=1 -DFEAT_STEPPER=0 -DSERVO_REST=180"
+  },
+  "dev2": {
+    "n": 2,
+    "name": "블루",
+    "aliases": ["blue"],
+    "color": "blue",
+    "flash": "-DFEAT_SERVO=0 -DFEAT_BUZZER=1 -DFEAT_RELAY=0 -DFEAT_STEPPER=1 -DMOTOR_STEP_DEG=360"
+  }
+}

@@ -12,8 +12,7 @@ RestartSec=5
 Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=__HOME__
 Environment=PYTHONUNBUFFERED=1
-StandardOutput=append:__REPO__/voice/fleetwatch.log
-StandardError=append:__REPO__/voice/fleetwatch.log
+# 로그는 journald 로 간다 (용량 관리·순환을 journald 가 한다): journalctl --user -u daijin-fleetwatch -f
 
 [Install]
 WantedBy=default.target

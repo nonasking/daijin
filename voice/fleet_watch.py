@@ -7,11 +7,9 @@
 # 노드별 쿨다운 60초 — 전원 갈아끼우는 작업 중 스팸 방지.
 # 실행: python3 -u fleet_watch.py  (상시 구동은 LaunchAgent com.daijin.fleetwatch)
 
-import paho.mqtt.client as mqtt
-import json, os, ssl, time
+import json, time
+from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
 
-VOICE = os.path.dirname(os.path.abspath(__file__))
-SEC   = os.path.join(os.path.dirname(VOICE), "secrets.local.txt")
 T_STATUS = "daijin/dev/+/status"
 T_MAIN   = "daijin/status"      # 메인 디바이스 상태 (status.sh용)
 # 로컬 브로커 미러: 브리지는 라이브 메시지의 retain 플래그를 못 살려서(MQTT 규격) 로컬 retained가
@@ -23,12 +21,6 @@ STALE_S    = 90     # 하트비트(30초 주기)가 이 시간 이상 끊기면 
 COOLDOWN_S = 60     # 노드별 최소 보고 간격
 BASELINE_S = 3      # 시작 후 이 시간 동안의 retained는 베이스라인 (무보고)
 
-def sec(key):
-    for line in open(SEC):
-        if line.startswith(key + "="):
-            return line.split("=", 1)[1].strip()
-    return ""
-
 started = time.time()
 nodes = {}   # name -> {"online": bool, "ts": float(수신시각), "beat": int(하트비트 ts), "alerted_at": float, "stale_alerted": bool}
 
@@ -36,21 +28,7 @@ def ask(client, text):
     client.publish(T_ASK, text)
     print(f"[{time.strftime('%H:%M:%S')}] ask → {text}")
 
-def _load_hooks():
-    """voice/local_hooks.py (선택, 저장소 밖 개인 파일). mute_reports() 가 True 를 돌려주면 능동 보고를 쉰다."""
-    path = os.path.join(VOICE, "local_hooks.py")
-    if not os.path.exists(path):
-        return None
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("daijin_local_hooks", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    except Exception as e:
-        print(f"(local_hooks.py 로드 실패, 없는 셈 치고 계속: {e})")
-        return None
-HOOKS = _load_hooks()
+HOOKS = load_hooks()      # voice/local_hooks.py (선택). mute_reports() 가 True 를 돌려주면 능동 보고를 쉰다
 
 def muted():
     fn = getattr(HOOKS, "mute_reports", None)
@@ -146,33 +124,37 @@ def on_connect(client, userdata, flags, rc, properties):
     client.subscribe(T_STATUS, qos=1)
     client.subscribe(T_MAIN, qos=0)
 
-c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-fleetwatch")
-c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
-c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-c.reconnect_delay_set(min_delay=1, max_delay=60)
-c.on_connect = on_connect
-c.on_message = on_message
+def start_local_mirror():
+    """로컬 미러 클라이언트. 부팅 직후엔 mosquitto 보다 먼저 뜰 수 있어서(2026-09-17 실측: Connection refused 후 미러 영구 생략)
+    connect_async + loop_start 로 붙을 때까지 paho 가 알아서 재시도한다. 끊겨도 자동 재접속.
+    로컬 브로커가 아예 없는 머신(클라우드 서버)에서는 조용히 재시도만 하고 아무 일도 없다."""
+    global local
+    import paho.mqtt.client as mqtt
+    l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
+    l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
+    l.reconnect_delay_set(min_delay=1, max_delay=30)
+    l.on_connect = _replay_mirror
+    l.on_disconnect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 끊김(rc={rc}) → 재시도")
+    l.connect_async(LOCAL_HOST, LOCAL_PORT, 60)
+    l.loop_start()
+    local = l
 
-print("👁️ fleet_watch 시작")
-# 로컬 미러 — 부팅 직후엔 mosquitto보다 먼저 뜰 수 있어서(2026-09-17 실측: Connection refused 후 미러 영구 생략)
-# connect_async + loop_start로 붙을 때까지 paho가 알아서 재시도한다. 끊겨도 자동 재접속.
-_l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
-_l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
-_l.reconnect_delay_set(min_delay=1, max_delay=30)
-_l.on_connect = _replay_mirror
-_l.on_disconnect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 끊김(rc={rc}) → 재시도")
-_l.connect_async(LOCAL_HOST, LOCAL_PORT, 60); _l.loop_start(); local = _l
-while True:
+def main():
+    global started
+    started = time.time()
+    c = cloud_client("daijin-fleetwatch")
+    c.on_connect = on_connect
+    c.on_message = on_message
+    print("👁️ fleet_watch 시작")
+    start_local_mirror()
+    connect_with_retry(c)
+    c.loop_start()
     try:
-        c.connect(sec("MQTT_CLOUD_HOST"), int(sec("MQTT_CLOUD_PORT")), 60)
-        break
-    except Exception as e:
-        print(f"초기 연결 실패({e}) — 10초 후 재시도")
-        time.sleep(10)
-c.loop_start()
-try:
-    while True:
-        time.sleep(15)
-        stale_check(c)
-except KeyboardInterrupt:
-    pass
+        while True:
+            time.sleep(15)
+            stale_check(c)
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()

@@ -22,3 +22,4 @@ systemctl --user enable --now daijin-brain daijin-fleetwatch
 # linger: 로그인 세션이 없어도(SSH 끊김, 재부팅 후) 사용자 서비스가 계속 돈다. 배포판에 따라 sudo 가 필요할 수 있다.
 loginctl enable-linger "$USER" 2>/dev/null || echo "참고: 'sudo loginctl enable-linger $USER' 를 한 번 실행해야 로그아웃 후에도 서비스가 유지된다"
 systemctl --user --no-pager status daijin-brain daijin-fleetwatch | grep -E "●|Active:"
+echo "로그: journalctl --user -u daijin-brain -f   (플릿 워처는 -u daijin-fleetwatch)"

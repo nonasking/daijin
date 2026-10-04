@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # daijin 브레인 (MQTT 클라이언트) — 브레인 머신(맥 또는 리눅스 서버)이 HiveMQ에 outbound 접속해 오디오 토픽으로 대화.
-#   구독 daijin/audio/in  (디바이스가 녹음한 WAV) → STT(Groq Whisper API 또는 로컬 whisper.cpp) → Claude → TTS
-#   발행 daijin/audio/out (답 WAV)  + daijin/text/in, daijin/text/out (디버그)
+#   구독 daijin/audio/in  (디바이스가 녹음한 ADPCM 청크) → STT(Groq Whisper API 또는 로컬 whisper.cpp) → Claude → TTS
+#   발행 daijin/audio/out (답 ADPCM 청크, 문장 단위 스트리밍)  + daijin/text/in, daijin/text/out (디버그)
+#   프로토콜: docs/chunking-protocol.md. 디바이스 없이 왕복 시험: voice/test_device.py
 # 실행:  python3 -u voice/daijin_mqtt.py
 #   상시 구동: 맥은 LaunchAgent com.daijin.brain (voice/install-agents.sh), 리눅스는 systemd 사용자 서비스 (voice/install-services.sh)
 # 이식성: 실행 파일은 PATH에서 찾고 macOS 전용 도구(afconvert, say)는 맥에서만 쓴다. 리눅스 의존은 ffmpeg 하나.
@@ -11,17 +12,22 @@
 #   상세는 아래 ALLOWED_TOOLS 주석 참조.
 # - 대화 연속성: session_id를 파일(.daijin_session)에 영속 → 재시작해도 이어지고,
 #   같은 디렉토리의 다른 claude 세션과 절대 섞이지 않음 (--continue 사용 금지).
-# - launchd 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속.
+# - 서비스 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속 (daijin_common).
 
-import paho.mqtt.client as mqtt
-import subprocess, re, os, sys, ssl, time, json, wave, io, threading, queue, shutil, uuid, types
+import subprocess, re, os, sys, time, json, wave, threading, queue, shutil, uuid, types
+import array, asyncio, math, tempfile
 import urllib.request
+try:
+    import edge_tts                    # pip install edge-tts. 없으면 edge 엔진만 못 쓰고 다음 엔진으로 넘어간다
+except ImportError:
+    edge_tts = None
+from daijin_common import VOICE, REPO, sec, load_hooks, cloud_client, connect_with_retry
+from nodes import NODES
 
 HOME    = os.path.expanduser("~")
-# 경로는 이 파일의 위치에서 유도한다. 저장소를 어디에 클론해도 된다.
-VOICE   = os.path.dirname(os.path.abspath(__file__))
-REPO    = os.path.dirname(VOICE)
-SEC     = f"{REPO}/secrets.local.txt"
+# 헬퍼 스크립트(dev.sh 등)가 쓸 파이썬 = 브레인을 띄운 이 파이썬 (paho 가 깔려 있는 것). 에이전트의 셸과 local_hooks 가 물려받는다.
+os.environ.setdefault("DAIJIN_PYTHON", sys.executable)
+# 경로(VOICE, REPO)는 daijin_common 이 이 저장소의 위치에서 유도한다. 저장소를 어디에 클론해도 된다.
 IS_MAC  = sys.platform == "darwin"
 def _which(name, *candidates):
     """실행 파일 찾기: 알려진 절대 경로 후보 → PATH → 이름 그대로(없으면 실행 시점에 실패로 드러남)."""
@@ -38,8 +44,6 @@ SESSION_FILE = f"{VOICE}/.daijin_session"
 TTS_VOICE = "Yuna"                     # 최종 폴백 (오프라인 보장)
 ELEVEN_VOICE = "TFUX5RKA9yUMr26dSJqF"  # daijin 보이스 (Voice Design으로 생성, 크레딧제)
 EDGE_VOICE = "de-DE-SeraphinaMultilingualNeural"  # 무료·무제한 기본 보이스 (사용자 선택 2026-07-05)
-EDGE_MP3 = "/tmp/daijin_edge.mp3"
-IN_WAV, OUT_WAV = "/tmp/daijin_in.wav", "/tmp/daijin_reply.wav"
 
 T_AUDIO_IN  = "daijin/audio/in"
 T_AUDIO_OUT = "daijin/audio/out"
@@ -50,7 +54,7 @@ T_SAY       = "daijin/say"    # 페이로드 텍스트를 그대로 TTS → 스�
 T_ASK       = "daijin/ask"    # 페이로드를 에이전트에 전달 → 스스로 표현해 말함 (보고용)
 
 # 허용 도구 — 사용자 결정(2026-07-04)으로 전면 개방. 보안 노트: 브로커 자격증명이
-# 곧 이 맥의 명령 입력 통로가 되므로, HiveMQ 비밀번호 관리가 곧 보안 경계다.
+# 곧 브레인 머신의 명령 입력 통로가 되므로, HiveMQ 비밀번호 관리가 곧 보안 경계다.
 ALLOWED_TOOLS = "Bash,WebSearch,WebFetch,Read,Glob,Grep,Write,Edit"
 # 속도: 모델은 secrets의 BRAIN_MODEL(기본 sonnet-5, 명령 판단엔 충분하고 첫 토큰이 빠름),
 # MCP(Gmail 등)는 매 턴 접속 비용만 들어서 끈다 (--strict-mcp-config + 빈 설정).
@@ -69,13 +73,21 @@ def _props():
         return (" 지금 홈 노드들에 붙어 있는 실제 소품과 할 수 있는 장난: " + t.replace("\n", " ") + " ") if t else ""
     return ""
 
+# 노드 소개 문구는 voice/nodes.json 에서 만든다 (예: "레드=dev1, 블루=dev2")
+_ns = sorted(NODES.items(), key=lambda kv: kv[1]["n"])
+_NODE_INTRO       = ", ".join(f'{d["name"]}={nid}' for nid, d in _ns)
+_NODE_NAMES_DOT   = "·".join(d["name"] for _, d in _ns)
+_NODE_NAMES_COMMA = ", ".join(d["name"] for _, d in _ns)
+_NODE_NUMS_DOT    = "·".join(f'{d["n"]}번' for _, d in _ns)
+_NODE_FORMS       = ", ".join([str(_ns[0][1]["n"]), f'{_ns[0][1]["n"]}번'] + _ns[0][1].get("aliases", [])[:1] + [_ns[0][1]["name"]])
+
 SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하고 친근하게 한국어로 "
        "2~3문장 이내로 짧게 답해. 이모지·마크다운·특수기호는 쓰지 마(음성으로 읽힘). "
        "너는 이 컴퓨터(네 브레인이 돌아가는 서버)에서 도구를 자유롭게 쓸 수 있어 — 웹 검색, 파일 읽고 쓰기, 셸 명령 실행. "
        "부탁받으면 직접 실행하고 결과를 짧게 요약해서 말해줘. "
        f"집 LED(각 노드의 온보드 RGB)는 'bash {VOICE}/dev.sh all led:<색>' (색: red green blue yellow cyan magenta white off; "
        "꺼=off, 켜=green). "
-       f"집안 홈 노드 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' (노드는 레드=dev1, 블루=dev2. 사용자는 레드·블루라고 부르고 텍스트로는 1번·2번으로 들어올 수 있어, 같은 뜻이야. dev.sh는 1, 1번, red, 레드 다 받아. 말할 때는 레드, 블루라고 불러) "
+       f"집안 홈 노드 제어는 'bash {VOICE}/dev.sh <노드|all> <명령>' (노드는 {_NODE_INTRO}. 사용자는 {_NODE_NAMES_DOT}라고 부르고 텍스트로는 {_NODE_NUMS_DOT}으로 들어올 수 있어, 같은 뜻이야. dev.sh는 {_NODE_FORMS} 다 받아. 말할 때는 {_NODE_NAMES_COMMA}라고 불러) "
        "(명령: led:색 · servo:0~180 · poke:각도[:ms]=갔다가 원위치(스위치 누르기·풍선 터뜨리기) · "
        "relay:on/off/pulse[:ms] · fan:on/off · step:±각도(스텝모터, 느림) · motor[:각도]=노드 종류 상관없이 모터 돌리기(서보면 갔다 옴, 스텝이면 회전; 모터 돌려달라면 이걸 써) · buzz:alarm/ok/fail/ms · ping · caps. "
        "ack까지 확인하되 말할 때는 ack라는 단어를 쓰지 말고 보냈어/갔어라고만 해. err:unknown이면 그 노드에 그 기능이 없는 거야). "
@@ -83,17 +95,12 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        "(OFFLINE=전원/네트워크 끊김, STALE=하트비트 끊김 — 발견하면 원인 추측과 함께 알려줘). "
        "네 몸(디바이스) 상태 — 온도, WiFi, 켜진 시간 — 를 물으면 "
        f"'bash {VOICE}/status.sh' 를 실행해서 JSON을 읽고 자연스럽게 말해줘 "
-       "(temp_c=칩 온도이니 몸 온도처럼, rssi=WiFi 신호세기(-50 좋음, -80 나쁨)). "
+       "(temp_c=칩 온도이니 몸 온도처럼, rssi=WiFi 신호세기(-50 좋음, -80 나쁨), "
+       "age_s=그 값이 몇 초 전 것인지: 150을 넘으면 지금 값이 아니니 그렇게 말해. FAIL이 나오면 디바이스가 꺼진 거야). "
        "단, 되돌리기 어렵거나 파괴적인 작업(파일 삭제·이동, 외부로 전송, 설치/제거)은 "
        "실행하기 전에 반드시 말로 확인을 받아. 도구 출력은 그대로 읽지 말고 핵심만 말해."
        + _props())
 EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
-
-def sec(key):
-    for line in open(SEC):
-        if line.startswith(key + "="):
-            return line.split("=", 1)[1].strip()
-    return ""
 
 def load_session():
     try:
@@ -103,32 +110,17 @@ def load_session():
         return None
 
 def save_session(sid):
-    if sid:
-        open(SESSION_FILE, "w").write(sid)
+    if not sid:
+        return
+    old = load_session()
+    if old and old != sid:
+        # 갈아타기 직전의 세션 id를 남겨 둔다. 잘못 새 세션으로 넘어갔을 때
+        # .daijin_session.prev 의 내용을 .daijin_session 에 되돌려 쓰면 기억이 돌아온다.
+        open(SESSION_FILE + ".prev", "w").write(old)
+    open(SESSION_FILE, "w").write(sid)
 
-# ---------- 로컬 확장 (선택) ----------
-# voice/local_hooks.py 가 있으면 불러온다. 저장소에 넣지 않는 개인 파일로(.gitignore), 이 설치본만의 동작을 얹는 자리다.
-# 없으면 아무 일도 없다. 정의할 수 있는 것 (전부 선택):
-#   STT_PROMPT_EXTRA = "..."             STT 어휘 프롬프트 앞에 붙일 문장 (자주 쓰는 말, 고유명사)
-#   intercept(text, kind, ctx) -> bool    True 를 돌려주면 에이전트를 거치지 않고 거기서 처리 끝 (단축 응답, 빠른 명령).
-#                                         kind: "voice"(말로 들어온 것) | "ask"(daijin/ask 로 들어온 것)
-#                                         ctx.say(문장) 으로 말한다. ctx.voice_dir, ctx.t0, ctx.sec(키) 도 쓸 수 있다.
-#   mute_reports() -> bool                True 면 fleet_watch 가 능동 보고를 쉰다 (fleet_watch.py 가 읽는다)
-def _load_hooks():
-    path = f"{VOICE}/local_hooks.py"
-    if not os.path.exists(path):
-        return None
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("daijin_local_hooks", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        print("🔌 로컬 확장 로드: local_hooks.py")
-        return mod
-    except Exception as e:
-        print(f"  ⚠️ local_hooks.py 로드 실패 (없는 셈 치고 계속): {e}")
-        return None
-HOOKS = _load_hooks()
+# ---------- 로컬 확장 (선택): voice/local_hooks.py, 인터페이스는 daijin_common.load_hooks 참고 ----------
+HOOKS = load_hooks(announce=True)
 
 def intercepted(client, text, kind, t0):
     fn = getattr(HOOKS, "intercept", None)
@@ -155,32 +147,46 @@ STT_PROMPT = (getattr(HOOKS, "STT_PROMPT_EXTRA", "") +
 # 예전 호칭 "일 번/이 번"과 dev1/dev2 표기도 호환용으로 받는다. STT는 이걸 "한 번", "두 번", "일번", "1 번" 등으로 적는다.
 # 전부 내부 ID "1번"/"2번"으로 통일. "한 번 더" 같은 횟수 표현과 겹치는 게 위험이라, 뒤에 "더/만/씩/에"가 오거나
 # "번 더/번 돌"처럼 횟수로 읽히는 꼴은 손대지 않는다.
+# 번호와 이름은 voice/nodes.json 에서 온다: 노드를 늘리면 여기 정규식도 따라 늘어난다.
+_KO_NUM = {1: ("일", "한"), 2: ("이", "두"), 3: ("삼", "세"), 4: ("사", "네"), 5: ("오", "다섯"), 6: ("육", "여섯")}
+_NUMS   = sorted(d["n"] for d in NODES.values())
+_DIGITS = "".join(str(n) for n in _NUMS)                              # "12"
+_KO2N   = {w: n for n in _NUMS for w in _KO_NUM.get(n, ())}           # {"일":1, "한":1, "이":2, "두":2}
 _NODE_ALIAS = re.compile(
     r"(?<![0-9])(?:"
-    r"(?:dev|데브|대브|대부|디브|devi)\s*([12])"                       # dev1, 대부 2
-    r"|(?:([12])|(일|한)|(이|두))\s*번(?:\s*(?:장치|노드|기기))?"      # 1번, 일 번, 한 번, 이 번, 두 번
+    rf"(?:dev|데브|대브|대부|디브|devi)\s*([{_DIGITS}])"                                   # dev1, 대부 2
+    rf"|(?:([{_DIGITS}])|({'|'.join(_KO2N)}))\s*번(?:\s*(?:장치|노드|기기))?"              # 1번, 일 번, 한 번, 이 번, 두 번
     r")(?![0-9])(?!\s*(?:더|만|씩|에|엔|째|은|는|처럼|만큼))", re.I)
 def _alias_sub(m):
-    n = m.group(1) or m.group(2) or ("1" if m.group(3) else "2")
+    n = m.group(1) or m.group(2) or str(_KO2N[m.group(3)])
     return n + "번"
 # 노드 호칭은 "레드/블루" (red/blue). 2026-09-22 실측: "일 번/이 번"은 받침 하나 차이라 소음 10dB부터 원본 PCM에서도
 # 뒤집혔고(4/16), 레드/블루는 같은 조건에서 0/16. 내부 ID는 그대로 1번/2번(dev1/dev2)이고 음성 입출력에서만 색 이름을 쓴다.
 # 한국어 색 이름(빨강/파랑)은 LED 색 명령("빨간 불 켜 줘")과 겹쳐서 노드 이름으로 받지 않는다.
-_NODE_NAME = re.compile(r"(?<![가-힣A-Za-z])(레드|red|블루|blue)(?![가-힣A-Za-z])", re.I)
+_NAME2N = {w.lower(): d["n"] for d in NODES.values() for w in [d["name"]] + d.get("aliases", [])}
+_NODE_NAME = re.compile(r"(?<![가-힣A-Za-z])(" + "|".join(re.escape(w) for w in _NAME2N) + r")(?![가-힣A-Za-z])", re.I)
 def _name_sub(m):
-    return "1번" if m.group(1).lower() in ("레드", "red") else "2번"
+    return f"{_NAME2N[m.group(1).lower()]}번"
 def normalize_nodes(t):
     t = _NODE_NAME.sub(_name_sub, t)
     return _NODE_ALIAS.sub(_alias_sub, t)
 
 _PROMPT_SENTS = [x.strip() for x in re.split(r"[.!?]", normalize_nodes(STT_PROMPT)) if x.strip()]
-def _looks_hallucinated(t):
+# 전사 신뢰도(세그먼트 평균 로그확률)가 이보다 높으면 프롬프트 예문과 똑같은 말이라도 진짜로 한 말로 본다.
+# 2026-10-02 실측(Groq large-v3-turbo): 예문과 같은 문장을 실제로 말한 음성은 -0.01 ~ -0.43, 잡음만 든 클립은 -0.99 ~ -1.08.
+CONFIDENT_LOGPROB = -0.6
+
+def _looks_hallucinated(t, logprob=None):
     """whisper는 무음·잡음에서 프롬프트 예문을 그대로 뱉는다. 같은 문장이 2회 이상 반복되거나
-    전사가 프롬프트 예문 하나로만 이뤄져 있으면 환청으로 본다."""
+    전사가 프롬프트 예문 하나로만 이뤄져 있으면 환청으로 본다.
+    다만 예문은 실제로 자주 하는 말이기도 하다("전부 꺼 줘"). STT 가 신뢰도를 알려 주고 그 값이 높으면
+    예문과 같아도 버리지 않는다. 신뢰도를 모르면(로컬 whisper) 예전처럼 버린다."""
     sents = [x.strip() for x in re.split(r"[.!?]", t) if x.strip()]
     if len(sents) >= 2 and len(set(sents)) == 1:
         return True
-    return len(sents) == 1 and sents[0] in _PROMPT_SENTS
+    if len(sents) == 1 and sents[0] in _PROMPT_SENTS:
+        return logprob is None or logprob < CONFIDENT_LOGPROB
+    return False
 
 # ---------- STT 백엔드 ----------
 # secrets의 STT_ENGINE: groq = Groq Whisper API (지금 로컬로 쓰는 것과 같은 large-v3-turbo, 무료 티어면 충분)
@@ -204,24 +210,28 @@ def _multipart(fields, filename, filedata, content_type="audio/wav"):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 def stt_groq(wav):
+    """(전사, 신뢰도). 신뢰도 = 세그먼트 avg_logprob 의 평균 (0 에 가까울수록 확실, 세그먼트가 없으면 None)."""
     # OpenAI 호환 엔드포인트. prompt는 로컬 whisper와 같은 어휘 바이어스 문장(레드/블루 오인식 교정).
     body, ctype = _multipart({"model": GROQ_MODEL, "language": "ko", "prompt": STT_PROMPT,
-                              "response_format": "json"},
+                              "response_format": "verbose_json"},      # 세그먼트별 avg_logprob 을 받으려고
                              "clip.wav", open(wav, "rb").read())
     req = urllib.request.Request(GROQ_URL, data=body, method="POST",
                                  # User-Agent 필수: Groq 앞단 Cloudflare가 urllib 기본값(Python-urllib)을 403(1010)으로 막는다
                                  headers={"Authorization": f"Bearer {sec('GROQ_API_KEY')}",
                                           "Content-Type": ctype, "User-Agent": "daijin-brain/1.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
-        return (json.loads(resp.read()).get("text") or "").strip()
+        d = json.loads(resp.read())
+    probs = [seg["avg_logprob"] for seg in d.get("segments") or [] if "avg_logprob" in seg]
+    return (d.get("text") or "").strip(), (sum(probs) / len(probs) if probs else None)
 
 def stt_whisper(wav):
     r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
                         "--prompt",STT_PROMPT,"-f",wav],
                        capture_output=True, text=True)
-    return r.stdout.strip()
+    return r.stdout.strip(), None            # whisper-cli 는 신뢰도를 내주지 않는다
 
 def stt(wav):
+    """(전사, 신뢰도 또는 None)."""
     engine = _stt_engine()
     if engine == "groq":
         try:
@@ -230,7 +240,7 @@ def stt(wav):
             print(f"  (Groq STT 실패: {e} → 로컬 whisper 폴백)")
     if not os.path.exists(MODEL):
         print(f"  ⚠️ STT 불가: 로컬 모델 없음({MODEL}) — secrets에 GROQ_API_KEY를 넣거나 모델을 내려받아야 해")
-        return ""
+        return "", None
     return stt_whisper(wav)
 
 def _claude_env():
@@ -242,61 +252,48 @@ def _claude_env():
         env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
     return env
 
-def _claude_once(text, resume_id):
-    cmd = [CLAUDE, "-p", text, "--output-format", "json",
-           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
-    if resume_id:
-        cmd += ["--resume", resume_id]
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=VOICE, stdin=subprocess.DEVNULL,
-                       env=_claude_env())
-    try:
-        data = json.loads(r.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    # 버전에 따라 단일 객체 또는 이벤트 배열(마지막이 type=='result') — 둘 다 처리
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, list):
-        for item in reversed(data):
-            if isinstance(item, dict) and item.get("type") == "result":
-                return item
-    return None
-
-def brain(text):
-    sid = load_session()
-    data = _claude_once(text, sid)
-    if (data is None or data.get("is_error")) and sid:
-        print("  (세션 재개 실패 → 새 세션으로)")
-        data = _claude_once(text, None)
-    if data is None:
-        return ""
-    save_session(data.get("session_id"))
-    return EMOJI.sub("", (data.get("result") or "")).strip()
-
 # ---------- 문장 스트리밍: Claude 답을 문장 단위로 실시간 yield ----------
 # 전체 답변 완성을 기다리지 않고 첫 문장부터 TTS·재생 → 체감 지연 대폭 감소
 # 마침표는 뒤에 공백이 와야 문장 끝. "36.1도"처럼 숫자 사이 마침표에서 끊겨 "36." "1도야"로 말하던 버그(2026-09-17).
 # 스트림 끝의 마지막 문장은 공백이 없어도 rest 플러시로 나간다.
 _SENT_END = re.compile(r"[!?…]+[\"')\]]*\s*|\.+[\"')\]]*\s+")
 
-def brain_stream(text):
-    def run(resume_id):
-        cmd = [CLAUDE, "-p", text, "--output-format", "stream-json",
-               "--include-partial-messages", "--verbose",
-               "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
-        if resume_id:
-            cmd += ["--resume", resume_id]
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, text=True, cwd=VOICE, env=_claude_env())
-    sid = load_session()
-    attempts = [sid, None] if sid else [None]
-    for attempt in attempts:
-        p = run(attempt)
-        buf, yielded, ok = "", False, False
+# 에이전트 한 턴의 상한. 스텝모터 한 바퀴(6초)나 웹 검색이 낀 턴도 보통 1분 안쪽이다.
+# 이걸 넘기면 멈춘 것으로 보고 죽인다 (안 그러면 워커가 영원히 막혀 이후의 모든 말이 큐에 쌓인다).
+BRAIN_TIMEOUT_S = 180
+# 세션 재개가 "그 세션이 없다"로 실패했을 때만 새 세션으로 넘어간다. 일시적 오류(네트워크, 사용량 한도, 과부하)에
+# 새 세션을 만들면 세션 파일이 덮여 대화 기억이 통째로 사라진다. 그 밖의 오류가 연달아 나면 그때 포기하고 넘어간다.
+_SESSION_GONE = "No conversation found"
+RESUME_GIVE_UP = 3
+_resume_failures = 0
+
+def _claude_stream(text, resume_id, st):
+    """claude -p 를 스트리밍으로 돌려 문장을 yield. 결과는 st 에 남긴다:
+    ok(정상 종료) · yielded(한 문장이라도 나옴) · timeout · noise(JSON 이 아닌 출력과 오류 문구, 진단용)."""
+    cmd = [CLAUDE, "-p", text, "--output-format", "stream-json",
+           "--include-partial-messages", "--verbose",
+           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
+    if resume_id:
+        cmd += ["--resume", resume_id]
+    # stderr 를 stdout 에 합친다: 인증 만료나 세션 없음 같은 오류는 JSON 이 아닌 줄로 나오므로 noise 로 모인다.
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         stderr=subprocess.STDOUT, text=True, cwd=VOICE, env=_claude_env())
+    def _kill():
+        st["timeout"] = True
+        p.kill()
+    killer = threading.Timer(BRAIN_TIMEOUT_S, _kill)
+    killer.daemon = True
+    killer.start()
+    buf = ""
+    try:
         for line in p.stdout:
             try:
                 obj = json.loads(line)
             except ValueError:
+                if line.strip():
+                    st["noise"].append(line.strip()[:300])
+                continue
+            if not isinstance(obj, dict):
                 continue
             t = obj.get("type")
             if t == "stream_event":
@@ -311,100 +308,154 @@ def brain_stream(text):
                         sent = EMOJI.sub("", buf[:m.end()]).strip()
                         buf = buf[m.end():]
                         if sent:
-                            yielded = True
+                            st["yielded"] = True
                             yield sent
                 elif ev.get("type") == "content_block_stop":
                     # 텍스트 블록이 끝나면(다음은 도구 호출) 마침표 뒤 공백이 없어도 바로 내보낸다.
                     # 안 그러면 "응, 알았어."가 도구 실행이 끝난 뒤 다음 문장과 붙어서 나온다(실측).
                     sent = EMOJI.sub("", buf).strip(); buf = ""
                     if sent:
-                        yielded = True
+                        st["yielded"] = True
                         yield sent
             elif t == "result":
-                ok = not obj.get("is_error")
-                if ok:
+                st["ok"] = not obj.get("is_error")
+                if st["ok"]:
                     save_session(obj.get("session_id"))
+                else:
+                    st["noise"].append(str(obj.get("result") or obj.get("subtype") or "is_error")[:300])
         p.wait()
-        rest = EMOJI.sub("", buf).strip()
-        if rest:
-            yielded = True
-            yield rest
-        if ok or yielded:
+    finally:
+        killer.cancel()
+    rest = EMOJI.sub("", buf).strip()
+    if rest and not st["timeout"]:
+        st["yielded"] = True
+        yield rest
+
+def _new_state():
+    return {"ok": False, "yielded": False, "timeout": False, "noise": []}
+
+def brain_stream(text):
+    global _resume_failures
+    sid = load_session()
+    st = _new_state()
+    yield from _claude_stream(text, sid, st)
+    if st["timeout"]:
+        print(f"  ⚠️ 에이전트 {BRAIN_TIMEOUT_S}초 초과 → 중단")
+        yield "미안, 너무 오래 걸려서 멈췄어."
+        return
+    if st["ok"] or st["yielded"]:
+        _resume_failures = 0
+        return
+    print(f"  ⚠️ 에이전트 실패: {' | '.join(st['noise'][-3:]) or '출력 없음'}")
+    gone = bool(sid) and any(_SESSION_GONE in n for n in st["noise"])
+    if sid and not gone:
+        _resume_failures += 1
+    if gone or (sid and _resume_failures >= RESUME_GIVE_UP):
+        print("  (세션을 찾을 수 없음 → 새 세션으로)" if gone else
+              f"  (세션 재개가 {_resume_failures}번 연속 실패 → 새 세션으로. 이전 id 는 .daijin_session.prev)")
+        st = _new_state()
+        yield from _claude_stream(text, None, st)
+        if st["ok"] or st["yielded"]:
+            _resume_failures = 0
             return
-        if attempt is not None:
-            print("  (세션 재개 실패 → 새 세션으로)")
+        print(f"  ⚠️ 새 세션도 실패: {' | '.join(st['noise'][-3:]) or '출력 없음'}")
     yield "미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"
 
-def mp3_to_wav16k(src, dst):
-    """mp3(24k) → PCM 16k mono WAV. ffmpeg가 있으면 그걸(맥·리눅스 공통), 없으면 macOS 내장 afconvert."""
+def mp3_to_pcm16k(mp3):
+    """mp3 바이트 → PCM 16k mono 16bit 바이트. ffmpeg 파이프(맥·리눅스 공통), 없으면 macOS 내장 afconvert."""
     if shutil.which(FFMPEG):
-        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", src,
-                        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", dst],
-                       check=True, capture_output=True, timeout=15)
-    elif IS_MAC and os.path.exists(AFCONVERT):
-        subprocess.run([AFCONVERT, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", src, dst],
-                       check=True, capture_output=True, timeout=15)
-    else:
-        raise RuntimeError("ffmpeg 없음 (리눅스: apt install ffmpeg)")
+        r = subprocess.run([FFMPEG, "-loglevel", "error", "-f", "mp3", "-i", "pipe:0",
+                            "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+                           input=mp3, capture_output=True, timeout=15, check=True)
+        return r.stdout
+    if IS_MAC and os.path.exists(AFCONVERT):
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = f"{d}/tts.mp3", f"{d}/tts.wav"
+            with open(src, "wb") as f:
+                f.write(mp3)
+            subprocess.run([AFCONVERT, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", src, dst],
+                           check=True, capture_output=True, timeout=15)
+            return wav_to_pcm(dst)
+    raise RuntimeError("ffmpeg 없음 (리눅스: apt install ffmpeg)")
+
+# ---------- TTS 엔진: 각각 PCM 16k 조각을 yield, 실패는 예외로 ----------
+def _tts_edge(text):
+    """MS 뉴럴 Seraphina, 무료 (맥·리눅스 공통). 브레인 프로세스 안에서 바로 부른다:
+    문장마다 파이썬을 새로 띄우던 때보다 문장당 0.5초 이상 빠르다 (2026-10-01 서버 실측 0.85~4.3초 → 0.24~0.43초)."""
+    if edge_tts is None:
+        raise RuntimeError("edge-tts 미설치 (pip install edge-tts)")
+    async def fetch():
+        async def collect():
+            out = bytearray()
+            async for ch in edge_tts.Communicate(text, EDGE_VOICE).stream():
+                if ch["type"] == "audio":
+                    out += ch["data"]
+            return bytes(out)
+        return await asyncio.wait_for(collect(), 20)
+    mp3 = asyncio.run(fetch())
+    if not mp3:
+        raise RuntimeError("빈 오디오")
+    yield mp3_to_pcm16k(mp3)
+
+def _tts_eleven(text):
+    """ElevenLabs 커스텀 보이스, 크레딧제(월 1만 무료). PCM 을 받는 대로 흘려보낸다."""
+    req = urllib.request.Request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream?output_format=pcm_16000",
+        data=json.dumps({"text": text, "model_id": "eleven_flash_v2_5"}).encode(),
+        headers={"xi-api-key": sec("ELEVEN_API_KEY"), "Content-Type": "application/json",
+                 "User-Agent": "daijin-brain/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        while True:
+            d = resp.read(8192)
+            if not d:
+                break
+            yield d
+
+def _tts_say(text):
+    """macOS 내장 Yuna. 네트워크 없이도 되는 맥 전용 최종 폴백."""
+    with tempfile.TemporaryDirectory() as d:
+        out = f"{d}/say.wav"
+        subprocess.run(["/usr/bin/say", "-v", TTS_VOICE, "-o", out,
+                        "--file-format=WAVE", "--data-format=LEI16@16000", text], check=True, timeout=30)
+        yield wav_to_pcm(out)
+
+_TTS_ENGINES = {"edge": _tts_edge, "eleven": _tts_eleven, "yuna": _tts_say}
+
+def _tts_order():
+    """secrets 의 TTS_ENGINE(기본 edge)을 먼저, 그다음은 쓸 수 있는 나머지 엔진 순서대로."""
+    first = sec("TTS_ENGINE") or "edge"
+    order = [first] + [e for e in ("edge", "eleven", "yuna") if e != first]
+    usable = {"edge": True, "eleven": bool(sec("ELEVEN_API_KEY")), "yuna": IS_MAC}
+    return [e for e in order if e in _TTS_ENGINES and usable[e]]
 
 def tts_stream(text):
-    """PCM 16k 조각을 yield. 엔진은 secrets.local.txt의 TTS_ENGINE으로 선택(브레인 재시작 필요):
-      edge   (기본) — MS 뉴럴 Seraphina, 무료·무제한 (맥·리눅스 공통)
-      eleven        — ElevenLabs 커스텀 보이스, 크레딧제(월 1만 무료)
-      yuna          — macOS 내장, 오프라인 보장 (맥에서만 최종 폴백; 리눅스엔 해당 없음)"""
+    """PCM 16k 조각을 yield. 엔진은 secrets.local.txt 의 TTS_ENGINE 으로 고른다 (매번 다시 읽으므로 재시작 불필요):
+      edge (기본) · eleven (ELEVEN_API_KEY 필요) · yuna (macOS 전용)
+    고른 엔진이 실패하면 쓸 수 있는 다음 엔진으로 넘어간다. edge 는 비공식 엔드포인트라 가끔 끊겨서 한 번 더 시도한다.
+    전부 실패하면 아무것도 내보내지 않는다 (그 문장은 건너뛴다)."""
     if not text:
         text = "잘 못 들었어, 다시 말해줄래?"
-    engine = sec("TTS_ENGINE") or "edge"
-    if engine == "eleven" and sec("ELEVEN_API_KEY"):
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
-                "?output_format=pcm_16000",
-                data=json.dumps({"text": text,
-                                 "model_id": "eleven_flash_v2_5"}).encode(),
-                headers={"xi-api-key": sec("ELEVEN_API_KEY"),
-                         "Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=20)
-            first = resp.read(8192)          # 실패면 여기서 예외 → 폴백
-            yield first
-            while True:
-                d = resp.read(8192)
-                if not d: break
-                yield d
-            return
-        except Exception as e:
-            print(f"  (ElevenLabs 실패: {e} → edge 폴백)")
-            engine = "edge"
-    if engine == "edge":
-        try:
-            # 브레인을 띄운 파이썬(sys.executable)에 edge-tts가 설치돼 있어야 한다 (pip install edge-tts)
-            subprocess.run([sys.executable, "-m", "edge_tts",
-                            "--voice", EDGE_VOICE, "--text", text,
-                            "--write-media", EDGE_MP3],
-                           check=True, capture_output=True, timeout=20)
-            mp3_to_wav16k(EDGE_MP3, OUT_WAV)
-            yield wav_to_pcm(OUT_WAV)
-            return
-        except Exception as e:
-            print(f"  (edge-tts 실패: {e} → {'Yuna 폴백' if IS_MAC else '이 문장은 건너뜀'})")
-    if not IS_MAC:
-        return                                  # 리눅스엔 오프라인 폴백 음성이 없다 — 조용히 넘어간다
-    subprocess.run(["/usr/bin/say","-v",TTS_VOICE,"-o",OUT_WAV,
-                    "--file-format=WAVE","--data-format=LEI16@16000",text])
-    yield wav_to_pcm(OUT_WAV)
-
-def tts(text, out):
-    """통 WAV 경로용 (구형 파이썬 가짜 디바이스 호환)"""
-    pcm = b"".join(tts_stream(text))
-    pcm_to_wav(pcm, out)
+    for name in _tts_order():
+        for attempt in range(2 if name == "edge" else 1):
+            sent = False
+            try:
+                for pcm in _TTS_ENGINES[name](text):
+                    sent = True
+                    yield pcm
+                if sent:
+                    return
+                raise RuntimeError("빈 오디오")
+            except Exception as e:
+                print(f"  (TTS {name} 실패: {e})")
+                if sent:
+                    return                   # 일부가 이미 나갔으면 다른 엔진으로 처음부터 다시 말하지 않는다
+    print(f"  ⚠️ TTS 전부 실패, 이 문장은 건너뜀: {text[:40]!r}")
 
 # ---------- 오디오 청킹 (docs/chunking-protocol.md) ----------
 # 메시지 = [clipId:1][seq:2 BE][flags:1(bit0=last)][페이로드]
 # 다운스트림(audio/out)은 IMA ADPCM 4:1 압축 — EU 브로커 RTT 300ms × ESP32 TCP창 5.7KB
 # = 최대 ~19KB/s라 PCM(32KB/s)은 물리적으로 불가. ADPCM은 8KB/s로 여유.
-CHUNK = 4096          # 업스트림 PCM 청크 (디바이스→브레인)
-CHUNK_OUT = 2048      # 다운스트림 ADPCM 청크 (=4096샘플=256ms)
+CHUNK_OUT = 2048      # ADPCM 청크 (=4096샘플=256ms). 디바이스가 올려 보내는 청크도 같은 크기다
 _rx = {"clip": None, "parts": {}}   # 수신 중인 클립 재조립 버퍼
 
 # ---------- IMA ADPCM 인코더 (16bit PCM → 4bit) ----------
@@ -424,7 +475,6 @@ class AdpcmEnc:
         self.vol = vol
 
     def encode(self, pcm):
-        import array
         data = self.rem + pcm
         odd = len(data) % 2
         if odd: data, self.rem = data[:-1], data[-1:]
@@ -466,7 +516,6 @@ class AdpcmDec:
         self.pred, self.idx = 0, 0
 
     def decode(self, data):
-        import array
         out = array.array("h")
         for b in data:
             for c in (b & 0x0F, b >> 4):
@@ -511,13 +560,17 @@ def publish_pcm_stream(client, pcm_iter):
     client.publish(T_AUDIO_OUT, hdr + buf, qos=0)
     return seq + 1
 
+def publish_no_reply(client):
+    """답할 것이 없다는 신호: 페이로드가 빈 마지막 청크 하나. 디바이스는 이걸 받으면 생각하는 얼굴을 풀고 대기로 돌아간다.
+    (이게 없으면 버린 클립마다 디바이스가 90초 동안 답을 기다린다.) 이 신호를 모르는 예전 펌웨어는 그냥 무시한다."""
+    client.publish(T_AUDIO_OUT, bytes([int(time.time()) & 0xFF, 0, 0, 1 | 2]), qos=0)
+
 def on_connect(client, userdata, flags, reason_code, properties):
     print(f"✅ HiveMQ 연결 (rc={reason_code}) → 구독 {T_AUDIO_IN}, {T_SAY}, {T_ASK}")
     client.subscribe(T_AUDIO_IN, qos=1)
     client.subscribe(T_SAY, qos=1)
     client.subscribe(T_ASK, qos=1)
 
-import array, math
 SPEECH_RMS = 40    # 16bit PCM 상위창 RMS. 2026-09-18 실측: 실제 발화가 212밖에 안 나와 260은 너무 높았음. 진짜 무음(0~20)만 거른다
 
 def speech_rms(pcm):
@@ -530,58 +583,55 @@ def speech_rms(pcm):
     vals.sort(); top = vals[-max(1, len(vals)//10):]
     return sum(top) / len(top)
 
-_last_reply_end = 0.0   # 마지막 답 발행이 끝난 시각 — 그 직후 도착한 클립은 스피커 누설일 가능성이 큼
-
-def handle_clip(client, pcm_or_wav, is_wav):
+def handle_clip(client, pcm):
     t0 = time.monotonic()
-    if not is_wav:
-        rms = speech_rms(pcm_or_wav)
-        if rms < SPEECH_RMS:
-            print(f"  🔇 말소리 없음(RMS {rms:.0f} < {SPEECH_RMS}) → 클립 무시")
-            return
-    if is_wav:
-        with open(IN_WAV, "wb") as f:
-            f.write(pcm_or_wav)
-    else:
-        pcm_to_wav(pcm_or_wav, IN_WAV)
-    user = normalize_nodes(stt(IN_WAV))
-    if user and _looks_hallucinated(user):
-        print(f"  🔇 환청 의심(프롬프트 예문 반복): {user!r} → 클립 무시")
+    rms = speech_rms(pcm)
+    if rms < SPEECH_RMS:
+        print(f"  🔇 말소리 없음(RMS {rms:.0f} < {SPEECH_RMS}) → 클립 무시")
+        publish_no_reply(client)
         return
-    print(f"  🗣️  나: {user}")
+    with tempfile.TemporaryDirectory() as d:
+        wav = f"{d}/clip.wav"
+        pcm_to_wav(pcm, wav)
+        heard, logprob = stt(wav)
+    user = normalize_nodes(heard)
+    conf = "" if logprob is None else f"  (음량 {rms:.0f}, 신뢰도 {logprob:.2f})"     # 잡음 클립을 가르는 기준을 잡을 때 볼 값
+    if user and _looks_hallucinated(user, logprob):
+        print(f"  🔇 환청 의심(프롬프트 예문 반복): {user!r}{conf} → 클립 무시")
+        publish_no_reply(client)
+        return
+    print(f"  🗣️  나: {user}{conf}")
     client.publish(T_TXT_IN, user)
-    if is_wav:  # 구형(파이썬 가짜 디바이스): 통 WAV로 응답
-        resp = brain(user) if user else "잘 못 들었어, 다시 말해줄래?"
-        if not resp:
-            resp = "미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"
-        print(f"  🤖 daijin: {resp}")
-        client.publish(T_TXT_OUT, resp)
-        tts(resp, OUT_WAV)
-        data = open(OUT_WAV, "rb").read()
-        client.publish(T_AUDIO_OUT, data)
-        print(f"  📤 답 발행(통WAV) {len(data)} bytes · ⏱️ {time.monotonic()-t0:.1f}s")
-    else:       # 신형(ESP32): 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
-        if user and intercepted(client, user, "voice", t0):
-            return
-        src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
-        speak_stream(client, src, t0)
+    if user and intercepted(client, user, "voice", t0):
+        return
+    # 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
+    src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
+    speak_stream(client, src, t0)
 
 # 말하기 직전 치환 — 프롬프트로 안 고쳐지는 습관어. TTS가 "ack"를 "액"으로 읽어 "액바닷서"가 됨(2026-09-16).
+def _no_batchim(word):
+    """마지막 글자에 받침이 없으면 True (한글이 아니면 False). 조사 고르기용: 레드가/레드는, 그린이/그린은."""
+    c = word[-1]
+    return "가" <= c <= "힣" and (ord(c) - 0xAC00) % 28 == 0
+_OPEN_NAMES = "|".join(re.escape(d["name"]) for d in NODES.values() if _no_batchim(d["name"]))   # 받침 없는 이름: 레드|블루
 _SPEAK_FIX = [
     (re.compile(r"(명령(?:을|은)?\s*)?보냈고\s*(?:둘|전부|모두|다)?\s*(?:ack|에크|애크|확인\s*응답)\s*(?:을|도)?\s*받았어"), "보냈어"),
     (re.compile(r"(?:ack|에크|애크)\s*(?:을|도|은|는|가)?\s*(?:받았어|왔어|받음|확인했어)"), "전달됐어"),
     (re.compile(r"(?:ack|에크|애크)\s*(?:를|을|도|은|는|가|이)?\s*(?:안\s*줘|없어|안\s*와|못\s*받았어)"), "응답이 없어"),
     (re.compile(r"\back\b", re.I), "응답"),
     # 노드 호칭: dev1/dev2, 1번(dev1) 같은 표기가 새어 나오면 전부 "1번"/"2번"으로 (TTS가 "대부 2"로 읽음)
-    (re.compile(r"([12])번\s*\(\s*dev\s*[12]\s*\)"), r"\1번"),
-    (re.compile(r"(?<![A-Za-z0-9])dev\s*([12])(?![0-9])", re.I), r"\1번"),
+    (re.compile(rf"([{_DIGITS}])번\s*\(\s*dev\s*[{_DIGITS}]\s*\)"), r"\1번"),
+    (re.compile(rf"(?<![A-Za-z0-9])dev\s*([{_DIGITS}])(?![0-9])", re.I), r"\1번"),
     # "번" 뒤 조사 정리: 받침 있는 "번" 뒤엔 이/은/을/이랑
     (re.compile(r"번가(?=\s|$)"), "번이"), (re.compile(r"번는(?=\s|$)"), "번은"), (re.compile(r"번를(?=\s|$)"), "번을"), (re.compile(r"번랑(?=\s|$)"), "번이랑"),
-    # 음성 호칭은 레드/블루 (받침 없음): 1번이/은/을/이랑 → 레드가/는/를/랑
-    (re.compile(r"(?<![0-9])1번"), "레드"), (re.compile(r"(?<![0-9])2번"), "블루"),
-    (re.compile(r"(레드|블루)이랑"), r"\1랑"), (re.compile(r"(레드|블루)이(?=\s|$|[,.!?])"), r"\1가"),
-    (re.compile(r"(레드|블루)은(?=\s|$|[,.!?])"), r"\1는"), (re.compile(r"(레드|블루)을(?=\s|$|[,.!?])"), r"\1를"),
 ]
+# 음성 호칭은 이름 (voice/nodes.json): 1번 → 레드, 2번 → 블루
+_SPEAK_FIX += [(re.compile(rf"(?<![0-9]){d['n']}번"), d["name"]) for d in NODES.values()]
+if _OPEN_NAMES:   # 받침 없는 이름은 조사를 바꾼다: 1번이/은/을/이랑 → 레드가/는/를/랑
+    _SPEAK_FIX += [
+        (re.compile(rf"({_OPEN_NAMES})이랑"), r"\1랑"), (re.compile(rf"({_OPEN_NAMES})이(?=\s|$|[,.!?])"), r"\1가"),
+        (re.compile(rf"({_OPEN_NAMES})은(?=\s|$|[,.!?])"), r"\1는"), (re.compile(rf"({_OPEN_NAMES})을(?=\s|$|[,.!?])"), r"\1를"),
+    ]
 def speak_fix(t):
     for pat, rep in _SPEAK_FIX:
         if "\\1" in rep:                                  # 역참조가 있는 치환은 그대로
@@ -602,7 +652,6 @@ def speak_stream(client, sentence_iter, t0):
                 yield pcm
             yield b"\x00" * 3200              # 문장 사이 0.1초 숨고르기
     n = publish_pcm_stream(client, gen())
-    global _last_reply_end; _last_reply_end = time.monotonic()
     client.publish(T_TXT_OUT, " ".join(sentences))
     print(f"  📤 답 발행 {n} 청크 · ⏱️ {time.monotonic()-t0:.1f}s")
 
@@ -622,7 +671,7 @@ def handle_ask(client, text):
         return
     speak_stream(client, brain_stream(text), t0)
 
-# 처리(whisper/Claude/TTS/발행)는 워커 스레드에서 — paho 네트워크 스레드(콜백)에서 하면
+# 처리(STT/Claude/TTS/발행)는 워커 스레드에서 — paho 네트워크 스레드(콜백)에서 하면
 # publish가 콜백 종료까지 실제 송신되지 않아 스트리밍이 무효화됨
 _clipq = queue.Queue()
 
@@ -630,8 +679,7 @@ def worker(client):
     while True:
         kind, data = _clipq.get()
         try:
-            if   kind == "wav": handle_clip(client, data, True)
-            elif kind == "pcm": handle_clip(client, data, False)
+            if   kind == "pcm": handle_clip(client, data)
             elif kind == "say": handle_say(client, data)
             elif kind == "ask": handle_ask(client, data)
         except Exception as e:
@@ -647,14 +695,10 @@ def on_message(client, userdata, msg):
     if msg.topic != T_AUDIO_IN:
         return
     p = msg.payload
-    if p[:4] == b"RIFF":                      # 구형: 통 WAV 한 방
-        print(f"\n🎧 통WAV 수신 {len(p)} bytes")
-        _clipq.put(("wav", p))
-        return
     if len(p) <= 4:
         return
     clip, seq, last = p[0], (p[1] << 8) | p[2], p[3] & 1
-    if _rx["clip"] != clip:                   # 새 클립 시작
+    if _rx["clip"] != clip or seq == 0:       # 새 클립 시작 (seq 0 도 기준: 디바이스가 재부팅하면 clipId 가 다시 0부터다)
         _rx["clip"], _rx["parts"] = clip, {}
         _rx["adpcm"] = bool(p[3] & 2)         # bit1 = ADPCM 압축 클립
     _rx["parts"][seq] = p[4:]
@@ -667,21 +711,14 @@ def on_message(client, userdata, msg):
         _rx["clip"], _rx["parts"] = None, {}
         _clipq.put(("pcm", data))
 
-c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-brain")
-c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
-c.tls_set(cert_reqs=ssl.CERT_REQUIRED)   # 시스템 기본 CA (HiveMQ=Let's Encrypt)
-c.reconnect_delay_set(min_delay=1, max_delay=60)
-c.on_connect = on_connect
-c.on_message = on_message
+def main():
+    c = cloud_client("daijin-brain")
+    c.on_connect = on_connect
+    c.on_message = on_message
+    threading.Thread(target=worker, args=(c,), daemon=True).start()
+    print("🤖 daijin 브레인(MQTT) 시작 — HiveMQ 연결 중...")
+    connect_with_retry(c)
+    c.loop_forever()
 
-threading.Thread(target=worker, args=(c,), daemon=True).start()
-
-print("🤖 daijin 브레인(MQTT) 시작 — HiveMQ 연결 중...")
-while True:  # 부팅 직후 네트워크 미준비 등 초기 연결 실패에 대한 재시도 (launchd 내성)
-    try:
-        c.connect(sec("MQTT_CLOUD_HOST"), int(sec("MQTT_CLOUD_PORT")), 60)
-        break
-    except Exception as e:
-        print(f"  초기 연결 실패({e}) — 10초 후 재시도")
-        time.sleep(10)
-c.loop_forever()
+if __name__ == "__main__":
+    main()

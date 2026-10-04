@@ -15,7 +15,6 @@ No network, no MQTT broker, no audio hardware, no secrets are touched.
 Run:  python3 -m unittest discover -s voice/tests   (from the repo root)
 """
 
-import importlib.util
 import math
 import os
 import sys
@@ -23,31 +22,17 @@ import types
 import unittest
 
 # ---------------------------------------------------------------------------
-# Import safety.
+# Import.
 #
-# daijin_mqtt.py is a script, not a library: at module level it constructs an MQTT
-# client, reads secrets.local.txt for the broker credentials, connects to HiveMQ and
-# finally calls loop_forever(). A plain `import daijin_mqtt` would therefore never
-# return. Rather than restructure the production file (a __main__ guard would be the
-# right fix, but that is a separate change), we load it defensively:
-#
-#   1. stub out `paho.mqtt.client` so the top-level import resolves with no paho
-#      installed and no client object can reach a socket;
-#   2. execute only the source *above* the first side-effecting top-level statement.
-#      Everything above that line is imports, constants, regexes, classes and defs.
-#
-# The tests still exercise the real production source — nothing is copied.
+# daijin_mqtt.py only connects to the broker from main(), so it imports like any module.
+# paho is stubbed when it is not installed, so the tests run on a bare Python.
 # ---------------------------------------------------------------------------
 
-SIDE_EFFECT_SENTINEL = "c = mqtt.Client("     # first top-level statement that acts
-MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
-                           "daijin_mqtt.py")
+VOICE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 
 
 def _install_paho_stub():
     """Minimal stand-in for paho.mqtt.client — importable, inert."""
-    if "paho.mqtt.client" in sys.modules:
-        return
     paho = types.ModuleType("paho")
     mqtt_pkg = types.ModuleType("paho.mqtt")
     client_mod = types.ModuleType("paho.mqtt.client")
@@ -68,23 +53,14 @@ def _install_paho_stub():
     sys.modules["paho.mqtt.client"] = client_mod
 
 
-def _load_daijin_mqtt():
+try:
+    import paho.mqtt.client  # noqa: F401
+except ImportError:
     _install_paho_stub()
-    with open(MODULE_PATH, encoding="utf-8") as f:
-        lines = f.readlines()
-    cut = next((i for i, ln in enumerate(lines) if ln.startswith(SIDE_EFFECT_SENTINEL)),
-               None)
-    if cut is None:
-        raise AssertionError(
-            "daijin_mqtt.py no longer starts its side effects with "
-            f"{SIDE_EFFECT_SENTINEL!r}; update SIDE_EFFECT_SENTINEL in this test.")
-    spec = importlib.util.spec_from_file_location("daijin_mqtt_under_test", MODULE_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    exec(compile("".join(lines[:cut]), MODULE_PATH, "exec"), mod.__dict__)
-    return mod
 
-
-dm = _load_daijin_mqtt()
+sys.path.insert(0, VOICE_DIR)
+import daijin_mqtt as dm  # noqa: E402
+import fleet_watch as fw  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +527,390 @@ class TestLocalHooks(unittest.TestCase):
             raise RuntimeError("boom")
         self._with_hooks(types.SimpleNamespace(intercept=intercept))
         self.assertFalse(dm.intercepted(None, "안녕", "voice", 0.0))
+
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+# Stand-in for the claude CLI. FAKE_MODE picks the behaviour; a resumed call is recognised by --resume.
+import json, os, sys, time
+mode = os.environ.get("FAKE_MODE", "ok")
+resumed = "--resume" in sys.argv
+def ev(o): print(json.dumps(o), flush=True)
+def say(text, sid):
+    ev({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}}})
+    ev({"type": "stream_event", "event": {"type": "content_block_stop"}})
+    ev({"type": "result", "is_error": False, "session_id": sid})
+if mode == "hang":
+    time.sleep(30)
+elif mode == "gone" and resumed:
+    print("No conversation found with session ID: old-session", file=sys.stderr); sys.exit(1)
+elif mode == "transient" and resumed:
+    ev({"type": "result", "is_error": True, "result": "API Error: 529 overloaded"}); sys.exit(1)
+else:
+    say("응, 알았어. 다 됐어.", "new-session" if not resumed else "old-session")
+'''
+
+
+class TestBrainStream(unittest.TestCase):
+    """brain_stream against a fake claude CLI: what gets spoken, and what happens to the pinned session."""
+
+    def setUp(self):
+        import tempfile, stat
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        fake = os.path.join(d, "claude")
+        with open(fake, "w") as f:
+            f.write(FAKE_CLAUDE)
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+        self.session = os.path.join(d, "session")
+        for name, val in (("CLAUDE", fake), ("SESSION_FILE", self.session), ("sec", lambda k: ""),
+                          ("_resume_failures", 0), ("BRAIN_TIMEOUT_S", 20)):
+            orig = getattr(dm, name)
+            setattr(dm, name, val)
+            self.addCleanup(setattr, dm, name, orig)
+        self.addCleanup(os.environ.pop, "FAKE_MODE", None)
+
+    def _run(self, mode, session=None):
+        os.environ["FAKE_MODE"] = mode
+        if session:
+            with open(self.session, "w") as f:
+                f.write(session)
+        return list(dm.brain_stream("안녕"))
+
+    def _saved(self, suffix=""):
+        try:
+            return open(self.session + suffix).read()
+        except FileNotFoundError:
+            return None
+
+    def test_first_turn_speaks_sentences_and_pins_the_session(self):
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
+        self.assertEqual(self._saved(), "new-session")
+
+    def test_missing_session_starts_a_new_one_and_keeps_the_old_id(self):
+        self.assertEqual(self._run("gone", session="old-session"), ["응, 알았어.", "다 됐어."])
+        self.assertEqual(self._saved(), "new-session")
+        self.assertEqual(self._saved(".prev"), "old-session")
+
+    def test_transient_error_apologises_but_keeps_the_memory(self):
+        out = self._run("transient", session="old-session")
+        self.assertEqual(out, ["미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"])
+        self.assertEqual(self._saved(), "old-session")          # not replaced by a fresh session
+
+    def test_repeated_failures_eventually_give_up_on_the_session(self):
+        for _ in range(dm.RESUME_GIVE_UP - 1):
+            self._run("transient", session="old-session")
+            self.assertEqual(self._saved(), "old-session")
+        self.assertEqual(self._run("transient"), ["응, 알았어.", "다 됐어."])
+        self.assertEqual(self._saved(), "new-session")
+        self.assertEqual(self._saved(".prev"), "old-session")
+
+    def test_a_hung_agent_is_killed_and_says_so(self):
+        dm.BRAIN_TIMEOUT_S = 0.5
+        import time
+        t = time.monotonic()
+        self.assertEqual(self._run("hang"), ["미안, 너무 오래 걸려서 멈췄어."])
+        self.assertLess(time.monotonic() - t, 10)
+
+
+class TestTtsFallback(unittest.TestCase):
+    """Engine order and fallback in tts_stream, with stand-in engines (no network, no audio tools)."""
+
+    def setUp(self):
+        self.calls = []
+        def engine(name, chunks=(b"\x01\x00",), fail_after=None):
+            def run(text):
+                self.calls.append(name)
+                for i, c in enumerate(chunks):
+                    if fail_after is not None and i == fail_after:
+                        raise RuntimeError(f"{name} down")
+                    yield c
+                if fail_after is not None and fail_after >= len(chunks):
+                    raise RuntimeError(f"{name} down")
+            return run
+        self.engine = engine
+        for name, val in (("_TTS_ENGINES", {"edge": engine("edge"), "eleven": engine("eleven"), "yuna": engine("yuna")}),
+                          ("IS_MAC", True), ("sec", lambda k: "")):
+            orig = getattr(dm, name)
+            setattr(dm, name, val)
+            self.addCleanup(setattr, dm, name, orig)
+
+    def test_order_starts_with_the_configured_engine_and_skips_unusable_ones(self):
+        self.assertEqual(dm._tts_order(), ["edge", "yuna"])                       # no ElevenLabs key
+        dm.sec = lambda k: {"TTS_ENGINE": "eleven", "ELEVEN_API_KEY": "k"}.get(k, "")
+        self.assertEqual(dm._tts_order(), ["eleven", "edge", "yuna"])
+        dm.IS_MAC = False
+        self.assertEqual(dm._tts_order(), ["eleven", "edge"])                     # no say on Linux
+
+    def test_a_failing_engine_falls_through_to_the_next(self):
+        dm.sec = lambda k: {"TTS_ENGINE": "eleven", "ELEVEN_API_KEY": "k"}.get(k, "")
+        dm._TTS_ENGINES["eleven"] = self.engine("eleven", fail_after=0)
+        self.assertEqual(list(dm.tts_stream("안녕")), [b"\x01\x00"])
+        self.assertEqual(self.calls, ["eleven", "edge"])
+
+    def test_edge_is_retried_once_before_moving_on(self):
+        dm._TTS_ENGINES["edge"] = self.engine("edge", fail_after=0)
+        self.assertEqual(list(dm.tts_stream("안녕")), [b"\x01\x00"])
+        self.assertEqual(self.calls, ["edge", "edge", "yuna"])
+
+    def test_a_sentence_already_half_spoken_is_not_restarted_on_another_engine(self):
+        dm._TTS_ENGINES["edge"] = self.engine("edge", chunks=(b"\x01\x00", b"\x02\x00"), fail_after=1)
+        self.assertEqual(list(dm.tts_stream("안녕")), [b"\x01\x00"])
+        self.assertEqual(self.calls, ["edge"])
+
+    def test_all_engines_down_yields_nothing(self):
+        dm.IS_MAC = False
+        dm._TTS_ENGINES["edge"] = self.engine("edge", fail_after=0)
+        self.assertEqual(list(dm.tts_stream("안녕")), [])
+
+
+class TestFleetWatch(unittest.TestCase):
+    """fleet_watch state transitions: what gets reported to daijin/ask, and what stays quiet."""
+
+    class Client:
+        def __init__(self):
+            self.asked = []
+        def publish(self, topic, payload, *a, **kw):
+            if topic == fw.T_ASK:
+                self.asked.append(payload)
+
+    class Msg:
+        def __init__(self, node, **status):
+            self.topic = f"daijin/dev/{node}/status"
+            self.payload = __import__("json").dumps(status).encode()
+
+    def setUp(self):
+        self.c = self.Client()
+        for name, val in (("nodes", {}), ("started", 0.0), ("local", None), ("_last_payload", {}), ("HOOKS", None)):
+            orig = getattr(fw, name)
+            setattr(fw, name, val)
+            self.addCleanup(setattr, fw, name, orig)
+
+    def test_first_sight_of_a_node_is_a_baseline_not_news(self):
+        fw.on_message(self.c, None, self.Msg("dev1", online=False))
+        self.assertEqual(self.c.asked, [])
+
+    def test_going_offline_and_coming_back_are_each_reported_once(self):
+        fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=100))
+        fw.on_message(self.c, None, self.Msg("dev1", online=False))
+        self.assertEqual(len(self.c.asked), 1)
+        self.assertIn("오프라인", self.c.asked[0])
+        fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=3))
+        self.assertEqual(len(self.c.asked), 2)
+        self.assertIn("다시 온라인", self.c.asked[1])
+        fw.on_message(self.c, None, self.Msg("dev1", online=False))        # flapping inside the cooldown
+        self.assertEqual(len(self.c.asked), 2)
+
+    def test_heartbeats_while_online_are_not_news(self):
+        for up in (10, 40, 70):
+            fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=up))
+        self.assertEqual(self.c.asked, [])
+
+    def test_local_hooks_can_mute_the_reports(self):
+        fw.HOOKS = types.SimpleNamespace(mute_reports=lambda: True)
+        fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=100))
+        fw.on_message(self.c, None, self.Msg("dev1", online=False))
+        self.assertEqual(self.c.asked, [])
+
+
+class TestClipProtocol(unittest.TestCase):
+    """The upstream wire format as the brain receives it: reassembly in on_message, and the no-reply signal."""
+
+    class Client:
+        def __init__(self):
+            self.sent = []
+        def publish(self, topic, payload=None, qos=0, **kw):
+            self.sent.append((topic, payload))
+
+    class Msg:
+        def __init__(self, payload, topic=None):
+            self.topic, self.payload = topic or dm.T_AUDIO_IN, payload
+
+    def setUp(self):
+        dm._rx.update({"clip": None, "parts": {}})
+        while not dm._clipq.empty():
+            dm._clipq.get_nowait()
+
+    def _chunks(self, pcm, clip_id, size=2048):
+        enc = dm.AdpcmEnc()
+        data = enc.encode(pcm) + enc.flush()
+        parts = [data[i:i + size] for i in range(0, len(data), size)]
+        return [bytes([clip_id, i >> 8, i & 0xFF, (1 if i == len(parts) - 1 else 0) | 2]) + p
+                for i, p in enumerate(parts)]
+
+    def test_adpcm_chunks_are_reassembled_into_one_pcm_clip(self):
+        pcm = pcm_bytes(sine(9000, 440.0, amp=12000))                      # ~0.56 s → 3 chunks
+        msgs = self._chunks(pcm, 7)
+        self.assertGreater(len(msgs), 1)
+        for m in msgs:
+            dm.on_message(None, None, self.Msg(m))
+        kind, got = dm._clipq.get_nowait()
+        self.assertEqual(kind, "pcm")
+        self.assertEqual(got, dm.AdpcmDec().decode(b"".join(m[4:] for m in msgs)))
+        self.assertTrue(dm._clipq.empty())
+
+    def test_seq_zero_starts_over_even_with_the_same_clip_id(self):
+        first = self._chunks(pcm_bytes(sine(9000, 440.0, amp=12000)), 0)
+        dm.on_message(None, None, self.Msg(first[0]))                  # device reboots mid-clip, id starts at 0 again
+        second = self._chunks(pcm_bytes(sine(3000, 880.0, amp=12000)), 0)
+        for m in second:
+            dm.on_message(None, None, self.Msg(m))
+        _, got = dm._clipq.get_nowait()
+        self.assertEqual(got, dm.AdpcmDec().decode(b"".join(m[4:] for m in second)))
+
+    def test_a_silent_clip_gets_the_no_reply_signal_instead_of_an_answer(self):
+        c = self.Client()
+        dm.handle_clip(c, b"\x00\x00" * 16000)
+        self.assertEqual(len(c.sent), 1)
+        topic, payload = c.sent[0]
+        self.assertEqual(topic, dm.T_AUDIO_OUT)
+        self.assertEqual(len(payload), 4)                              # header only
+        self.assertEqual((payload[1], payload[2], payload[3]), (0, 0, 1 | 2))
+
+    def test_say_and_ask_are_queued_as_text(self):
+        dm.on_message(None, None, self.Msg("안녕 ".encode(), dm.T_SAY))
+        dm.on_message(None, None, self.Msg("상태 알려줘".encode(), dm.T_ASK))
+        self.assertEqual(dm._clipq.get_nowait(), ("say", "안녕"))
+        self.assertEqual(dm._clipq.get_nowait(), ("ask", "상태 알려줘"))
+
+
+import nodes as nodes_mod          # noqa: E402
+import fleet_status                # noqa: E402
+import nodectl                     # noqa: E402
+
+
+class TestNodeTable(unittest.TestCase):
+    """voice/nodes.json is the one place node names live; everything else resolves through it."""
+
+    def test_every_spelling_resolves_to_the_node_id(self):
+        for word in ("레드", "red", "RED", "1", "1번", "dev1"):
+            self.assertEqual(nodes_mod.resolve(word), "dev1", word)
+        for word in ("블루", "Blue", "2", "2번", "dev2"):
+            self.assertEqual(nodes_mod.resolve(word), "dev2", word)
+        self.assertEqual(nodes_mod.resolve("all"), "all")
+        self.assertEqual(nodes_mod.resolve("dev9"), "dev9")             # unknown names pass through
+
+    def test_fleet_lines_use_spoken_names_and_judge_by_heartbeat_age(self):
+        now = 1_800_000_000
+        lines = fleet_status.render([
+            ("daijin/dev/dev1/status", '{"online":false,"node":"dev1"}'),
+            ("daijin/dev/dev2/status", '{"online":true,"ts":%d,"up_s":50,"rssi":-60,"chip_c":40.0}' % (now - 400)),
+            ("daijin/dev/dev2/status", '{"online":true,"ts":%d,"up_s":440,"rssi":-61,"chip_c":41.0}' % (now - 10)),
+        ], now=now)
+        self.assertEqual(len(lines), 2)                                  # the newer dev2 heartbeat wins
+        self.assertTrue(lines[0].startswith("레드: OFFLINE"))
+        self.assertTrue(lines[1].startswith("블루: ONLINE"), lines[1])
+        stale = fleet_status.describe("dev2", '{"online":true,"ts":%d}' % (now - 200), now=now)
+        self.assertIn("STALE(200초 무응답)", stale)
+
+
+class TestNodeCommand(unittest.TestCase):
+    """nodectl.cmd against a stand-in broker: what it prints and returns for each kind of answer."""
+
+    class M:
+        def __init__(self, topic, text, retain=False):
+            self.topic, self.payload, self.retain = topic, text.encode(), retain
+
+    def _broker(self, status, acks):
+        test, M = self, self.M
+        class FakeBroker:
+            local = True
+            def __init__(self):
+                self.published, self.inbox = [], []
+                test.broker = self
+            def subscribe(self, *topics):
+                if status is not None:
+                    self.inbox.append(M("daijin/dev/dev1/status", status, retain=True))
+                self.inbox.append(M("daijin/dev/dev1/state", "pong", retain=True))    # stale ack from an earlier command
+            def publish(self, topic, payload):
+                self.published.append((topic, payload))
+                if topic.endswith("/cmd") and payload in acks:
+                    self.inbox.append(M("daijin/dev/dev1/state", acks[payload]))
+                return True
+            def wait(self, want, timeout):
+                while self.inbox:
+                    m = self.inbox.pop(0)
+                    if want(m):
+                        return m
+                return None
+            def close(self):
+                pass
+        orig = nodectl.Broker
+        nodectl.Broker = FakeBroker
+        self.addCleanup(setattr, nodectl, "Broker", orig)
+
+    def _cmd(self, node, command):
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = nodectl.cmd(node, command)
+        return rc, buf.getvalue()
+
+    def test_offline_node_is_refused_without_sending(self):
+        self._broker('{"online":false,"node":"dev1"}', {})
+        rc, out = self._cmd("레드", "motor")
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL: dev1 오프라인", out)
+        self.assertEqual(self.broker.published, [])
+
+    def test_ack_is_this_commands_answer_not_the_retained_one(self):
+        self._broker('{"online":true,"ts":0}', {"led:red": "led:red"})
+        rc, out = self._cmd("1번", "led:red")
+        self.assertEqual(rc, 0)
+        self.assertIn("OK: dev1 <- led:red (ack: led:red)", out)
+
+    def test_unknown_command_reports_the_nodes_capabilities(self):
+        self._broker('{"online":true,"ts":0}', {"step:90": "err:unknown:step:90", "caps": "caps:led,ping,motor,servo,poke"})
+        rc, out = self._cmd("red", "step:90")
+        self.assertEqual(rc, 1)
+        self.assertIn("쓸 수 있는 기능: led,ping,motor,servo,poke", out)
+
+    def test_no_answer_is_a_failure(self):
+        self._broker('{"online":true,"ts":0}', {})
+        rc, out = self._cmd("dev1", "motor")
+        self.assertEqual(rc, 1)
+        self.assertIn("ack: 없음", out)
+
+    def test_servo_already_there_is_ok_with_a_hint(self):
+        self._broker(None, {"servo:90": "servo:90:nochange"})
+        rc, out = self._cmd("dev1", "servo:90")
+        self.assertEqual(rc, 0)
+        self.assertIn("상태 기록 없음", out)
+        self.assertIn("'motor'", out)
+
+
+class TestDeviceStatus(unittest.TestCase):
+    """status.sh output for the main device: offline by LWT, and how old an online report is."""
+
+    def test_lwt_offline_is_a_failure_line(self):
+        self.assertTrue(nodectl.device_status_line('{"online":false}').startswith("FAIL: 디바이스 오프라인"))
+
+    def test_online_report_carries_its_age(self):
+        import json
+        line = nodectl.device_status_line('{"online":true,"ts":1800000000,"temp_c":41.5,"rssi":-58}', now=1800000042)
+        d = json.loads(line)
+        self.assertEqual((d["age_s"], d["temp_c"], d["rssi"]), (42, 41.5, -58))
+
+    def test_old_firmware_json_passes_through(self):
+        import json
+        line = nodectl.device_status_line('{"temp_c":40.0,"ssid":"home","rssi":-60,"uptime_s":12,"heap":1000}')
+        self.assertEqual(json.loads(line)["temp_c"], 40.0)
+        self.assertNotIn("age_s", line)
+
+
+class TestHallucinationFilter(unittest.TestCase):
+    """Whisper echoes prompt sentences on noise, but the prompt sentences are also what people really say."""
+
+    def test_a_prompt_sentence_said_with_confidence_is_kept(self):
+        self.assertFalse(dm._looks_hallucinated("전부 꺼 줘.", logprob=-0.05))
+        self.assertFalse(dm._looks_hallucinated("응, 알았어", logprob=-0.4))
+
+    def test_a_prompt_sentence_with_low_or_unknown_confidence_is_dropped(self):
+        self.assertTrue(dm._looks_hallucinated("전부 꺼 줘.", logprob=-1.0))
+        self.assertTrue(dm._looks_hallucinated("전부 꺼 줘."))                     # local whisper: no score
+
+    def test_the_same_sentence_over_and_over_is_dropped_whatever_the_score(self):
+        self.assertTrue(dm._looks_hallucinated("감사합니다. 감사합니다. 감사합니다.", logprob=-0.1))
+
+    def test_ordinary_speech_is_never_touched(self):
+        self.assertFalse(dm._looks_hallucinated("오늘 날씨 어때?", logprob=-1.2))
+        self.assertFalse(dm._looks_hallucinated("오늘 날씨 어때?"))
