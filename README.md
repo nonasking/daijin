@@ -53,7 +53,7 @@ flowchart LR
 - **They meet at a cloud broker** → works on any network: home WiFi or a phone hotspot on LTE. The brain only goes outbound (no inbound exposure needed), so it can be a Mac at home **or a headless Linux server** — the device does not care which. See [Run the brain on a Linux server](#run-the-brain-on-a-linux-server-no-mac-needed).
 - **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers: a full round trip (record → STT → agent → TTS → playback) typically takes **6–22 s** depending on how much the agent thinks and does — streaming hides part of that, but this is a conversation, not real-time.
 - **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. **Both directions are IMA ADPCM-compressed 4:1** — the ~19KB/s bandwidth ceiling applies to the ESP32's send buffer too, so raw 32KB/s PCM can't keep up in either direction. Downstream plays through a jitter ring buffer; upstream is drained by a dedicated capture task so a blocking TLS publish never drops samples.
-- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker (certificate verification required), credentials kept only in a gitignored `secrets.local.txt`, the Mac makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one).
+- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker with certificate verification on every side (the firmware keeps verifying even when NTP is blocked), credentials kept only in gitignored files, the brain makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one). Give the device and the nodes their own broker logins limited to their topics, so a node left outside cannot reach the agent: [docs/broker-credentials.md](docs/broker-credentials.md).
 
 ### Why ADPCM? (a physics lesson)
 
@@ -100,18 +100,21 @@ sketches/   ESP32 firmware (arduino-cli)
   mic-diag            auto-sweeps every pin/slot combo to find I2S wiring empirically
 voice/      daijin
   daijin_mqtt.py      brain: MQTT client (STT → Claude → streaming TTS → ADPCM chunks) — runs on macOS or Linux
-  broker.sh           shared by the helpers: picks the local bridge or the cloud broker, finds the CA bundle (Mac/Linux)
+  daijin_common.py    shared by the brain, the fleet watcher and the tools: secrets, local hooks, broker client
+  nodes.json          the home nodes in one place: id, number, spoken name, LED colour, firmware flags
+  nodectl.py          node/device control on one broker connection; dev.sh, fleet.sh, status.sh, say.sh wrap it
+  broker.sh           broker choice and CA bundle for console.sh (Mac/Linux)
   daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
   talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
-  dev.sh              command a home node and verify its retained ack
+  dev.sh              command a home node and verify this command's ack
   fleet.sh            fleet status: ONLINE / STALE(heartbeat gap) / OFFLINE(broker LWT)
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
   install-agents.sh   macOS: register brain + fleet watcher as LaunchAgents
   install-services.sh Linux: register them as systemd user services (systemd/*.service)
-  test_device.py      fake-device round-trip test
+  test_device.py      device stand-in: sends a question as ADPCM chunks, decodes the reply (`--say "..."` needs no recording)
   mic_test_server.py  HTTP endpoint for mic verification
-  tests/              unit tests (ADPCM encoder ⇄ device decoder, sentence splitting) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
-docs/       roadmap · research · audio protocol
+  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS fallback, node table, node commands) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
+docs/       roadmap · research · audio protocol · broker credentials
 ```
 
 ## Stack
@@ -186,7 +189,8 @@ git clone https://github.com/nonasking/daijin.git && cd daijin
 cp secrets.local.example secrets.local.txt     # broker creds + GROQ_API_KEY + CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token` on the Mac)
 python3 -u voice/daijin_mqtt.py                # foreground first: tap BOOT, talk, watch the log
 bash voice/install-services.sh                 # then register as systemd user services (auto-start, auto-restart, survives logout via linger)
-journalctl --user -u daijin-brain -f           # or tail voice/daijin.log
+journalctl --user -u daijin-brain -f           # the services log to journald
+python3 voice/test_device.py --say "지금 몇 시야?"   # no device at hand: a stand-in sends the question and saves the spoken reply
 ```
 
 Run only one brain at a time against a broker: two subscribers on `daijin/audio/in` would both answer. Stop the Mac's LaunchAgent (`bash voice/install-agents.sh remove`) once the server is up.
@@ -209,7 +213,7 @@ Apache 2.0. See `LICENSE` and `NOTICE`.
 - Bandwidth-delay product is real: far broker × tiny TCP window = a hard throughput ceiling. Compress, or move the broker closer.
 - For latency, **stream sentences, not essays**: the user hears the first sentence while the rest is still being thought.
 - **Name nodes by sound, not by number.** Measured with whisper large-v3-turbo on the same 144 synthetic utterances (pink noise at ∞/20/10/5 dB): IMA ADPCM 4:1 costs about 1 CER point over raw PCM, mostly smeared consonants; with a vocabulary prompt about half that. The node names mattered more than the codec: 일 번 / 이 번 ("one"/"two") differ by one final consonant and were confused 4/16 times even from raw PCM, while red / blue were 0/16. Nodes are now called by colour and light up in it.
-- ESP32-S3 TLS needs **NTP time sync** (set a timeout — LTE carriers often block NTP; fall back gracefully).
+- ESP32-S3 TLS needs **the right time** to verify certificates, and LTE carriers often block NTP. Falling back to *no verification* hands the broker password to anyone on the same network; fall back to the `Date` header of a plain HTTP response instead (`tls_time.h`).
 - For a portable backend, a **cloud broker** beats a **home Mac + tunnel (unstable)**.
 
 ---
