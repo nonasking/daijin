@@ -36,10 +36,12 @@ flowchart LR
     BROKER{{"HiveMQ Cloud<br/>MQTT / TLS<br/>(both sides rendezvous outbound)"}}
 
     subgraph brain["Brain: Mac or Linux server (outbound only)"]
-        STT["Groq Whisper API / whisper.cpp<br/>(STT, Korean)"]
+        STT["whisper.cpp server / Groq Whisper API<br/>(STT, Korean)"]
         AGENT["Claude<br/>(claude -p, streaming)"]
-        TTS["Edge TTS (default) / ElevenLabs / macOS<br/>(sentence by sentence)"]
+        TTS["Supertonic (on-device) / Edge / ElevenLabs<br/>(sentence by sentence)"]
+        SELF[("self layer<br/>episodes · rebuff ledger<br/>drives · memories · persona")]
         STT --> AGENT --> TTS
+        SELF -. "current state" .-> AGENT
     end
 
     MIC -- "PCM chunks<br/>daijin/audio/in" --> BROKER
@@ -70,10 +72,22 @@ daijin **separates the "ears + mouth" (device) from the "brain" (agent) over MQT
 
 > The topic contract (`daijin/audio/*`, `daijin/text/*`) already acts as the interface, so swapping the brain or attaching an external agent is just *one adapter layer*. (Current brain = Claude; the extensions are roadmap.)
 
+## A self outside the model
+
+Where does daijin's "self" live? Not in the model. It lives next to the brain, in code and a SQLite file, so the model that turns it into words can be Claude today and a local model later without daijin becoming someone else. Design: [docs/design-self-layer.md](docs/design-self-layer.md).
+
+- **A body, wired to behaviour.** The device and nodes already report temperature, signal and outages. `initiative.py` turns them into drives (*contact*: hours since the last conversation; *node loss*: how long a node has been gone; *body*: heat and weak signal) and, when one rises far enough, speaks first.
+- **An admissibility filter before speaking.** Quiet hours, a daily budget, a per-drive interval that doubles after each refusal, hours to avoid, and never in the middle of a conversation. Every time it stays quiet, the reason is logged.
+- **A rebuff ledger.** Asking wrong is the default (a mother and infant are out of sync over 70% of the time; repair is what matters), so the ledger records what happened *after* daijin spoke first: engaged, a short acknowledgement, refused with a reason, told to stop, or no answer. Each outcome changes that drive's policy, and after a refusal the next line opens with an explanation or a promise — never a denial.
+- **A current-state block.** Every turn the agent is handed its body readings, which nodes are up, how its last proactive lines went, its top memories and its persona. It answers "블루 켜져 있어?" or "아까 나한테 뭐 물어봤어?" without calling a tool.
+- **Nights.** `reflect.py` looks back over the day in a fresh session: it writes memories (superseding, never deleting), corrects the ledger, fills a "wanted to ask less" column, and may propose a persona rewrite. Only a person can approve that, with `persona.py`.
+
 ## Current status
 
 - **Phase 2 shipped** — the device itself listens and speaks: tap BOOT to record, tap again to send; the reply streams back and plays with **zero underruns**, at home or on a phone hotspot outside.
-- **Voice**: free **Edge TTS** is the default engine (neural multilingual voice); a custom voice designed on ElevenLabs (streamed as PCM, flash model) is opt-in via `TTS_ENGINE=eleven`, with macOS TTS as the offline-safe final fallback.
+- **Voice**: **Supertonic** (`TTS_ENGINE=supertonic`) speaks Korean on the CPU with no network, about 0.2× real time even on a 2-vCPU VPS; **Edge TTS** (free neural voice) and a custom **ElevenLabs** voice remain, and the engines fall through to one another.
+- **Recording** ends by itself when the speaker goes quiet (energy VAD on the device), or with a second tap.
+- **Self layer** running: drives, the rebuff ledger, nightly reflection; see above.
 - **Device UX**: ready chirp through the speaker, dim-green idle LED, status colors for record/upload/play (LTE connects can take 30+ seconds — sound beats a blinking LED).
 - Earlier milestones: HTTP LAN control → MQTT LAN → HiveMQ Cloud portable control (verified from a phone on LTE) → cloud voice round-trip with a fake device.
 
@@ -103,6 +117,12 @@ voice/      daijin
   daijin_common.py    shared by the brain, the fleet watcher and the tools: secrets, local hooks, broker client
   nodes.json          the home nodes in one place: id, number, spoken name, LED colour, firmware flags
   nodectl.py          node/device control on one broker connection; dev.sh, fleet.sh, status.sh, say.sh wrap it
+  selfdb.py           the self outside the model: episodes, the rebuff ledger, drives, policy, memories, persona versions (SQLite)
+  initiative.py       drives → admissibility filter → proactive speech; the ledger on the bus (INITIATIVE_DRY_RUN=1 plans without speaking)
+  ledger_rules.py     reply classes, quiet hours, back-off, repair lines
+  reflect.py          nightly look back: memories, relabels, persona proposal
+  persona.py          show / approve / reject persona proposals; export, import, seed
+  replay_journal.py   load past brain logs from journald into the self layer
   broker.sh           broker choice and CA bundle for console.sh (Mac/Linux)
   daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
   talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
@@ -113,7 +133,7 @@ voice/      daijin
   install-services.sh Linux: register them as systemd user services (systemd/*.service)
   test_device.py      device stand-in: sends a question as ADPCM chunks, decodes the reply (`--say "..."` needs no recording)
   mic_test_server.py  HTTP endpoint for mic verification
-  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS fallback, node table, node commands) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
+  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
 docs/       roadmap · research · audio protocol · broker credentials
 ```
 
@@ -173,7 +193,7 @@ The brain is the only piece that ran on the Mac, and nothing in it needs macOS. 
 |---|---|
 | whisper.cpp on the GPU (~2 s per clip) | **Groq Whisper API** (`STT_ENGINE=groq`): the same `whisper-large-v3-turbo` model, same vocabulary prompt, free tier covers home use. Local whisper.cpp still works as the fallback if you download the model, but on a 2-vCPU VPS it takes tens of seconds per clip. |
 | `claude` logged in via browser | `claude setup-token` on your Mac → paste into `CLAUDE_CODE_OAUTH_TOKEN` in `secrets.local.txt` (1-year subscription token; Pro/Max). |
-| `afconvert`, `say` | `ffmpeg`. No offline TTS fallback on Linux; Edge TTS is the default anyway. |
+| `afconvert`, `say` | `ffmpeg`, and `pip install supertonic` for on-device Korean speech (`TTS_ENGINE=supertonic`). |
 | LaunchAgent | systemd user service (`install-services.sh`) |
 | The agent's shell is your Mac | The agent's shell is the server. Home nodes are still driven over MQTT, so `dev.sh`/`fleet.sh` work unchanged; anything that needed *the Mac itself* (its files, its apps) does not. |
 
@@ -188,7 +208,8 @@ curl -fsSL https://claude.ai/install.sh | bash      # Claude Code CLI → ~/.loc
 git clone https://github.com/nonasking/daijin.git && cd daijin
 cp secrets.local.example secrets.local.txt     # broker creds + GROQ_API_KEY + CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token` on the Mac)
 python3 -u voice/daijin_mqtt.py                # foreground first: tap BOOT, talk, watch the log
-bash voice/install-services.sh                 # then register as systemd user services (auto-start, auto-restart, survives logout via linger)
+bash voice/install-services.sh                 # then register brain, fleet watcher, initiative and the 03:30 reflect timer as systemd user services
+python3 voice/persona.py seed                  # first persona version from voice/props.txt; later: persona.py show / approve <id>
 journalctl --user -u daijin-brain -f           # the services log to journald
 python3 voice/test_device.py --say "지금 몇 시야?"   # no device at hand: a stand-in sends the question and saves the spoken reply
 ```
