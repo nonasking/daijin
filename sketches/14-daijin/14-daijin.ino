@@ -1,5 +1,6 @@
 // 14-daijin — AI 음성 대화 친구 디바이스 (Phase 2)
-// BOOT 을 한 번 누르면 녹음 시작, 한 번 더 누르면 끝 (최소 1초, 12초에서 자동 컷) → IMA ADPCM 청크로 HiveMQ 발행(daijin/audio/in)
+// BOOT 을 한 번 누르면 녹음 시작. 말이 끝나면(0.7초 무음) 알아서 끝나고, 한 번 더 눌러도 끝 (최소 1초, 12초에서 자동 컷)
+// → IMA ADPCM 청크로 HiveMQ 발행(daijin/audio/in)
 // 브레인 답(daijin/audio/out ADPCM 청크)을 받는 대로 지터 버퍼를 거쳐 스피커로 스트리밍 재생
 // 프로토콜: docs/chunking-protocol.md — [clipId:1][seq:2 BE][flags:1 (bit0=마지막, bit1=ADPCM)][ADPCM<=2048B]
 //   헤더만 있는 마지막 청크 = "답할 것 없음" (브레인이 무음·환청으로 버린 클립): 짧게 알리고 대기로 돌아간다
@@ -163,7 +164,7 @@ void logf(const char* fmt, ...) {
 // ---------- 재생: 링버퍼(지터 버퍼) — 0.4초 쌓이면 재생 시작 ----------
 // 네트워크 도착 간격이 출렁여도 버퍼가 흡수해 끊김 없는 재생
 #define RING_SZ  65536                          // 2초분
-#define PREBUF   12800                          // 0.4초 차면 재생 시작 (ADPCM 8KB/s vs 회선 ~19KB/s라 여유; 0.75→0.4로 체감 지연 단축)
+#define PREBUF   6400                           // 0.2초 차면 재생 시작 (ADPCM 8KB/s vs 회선 ~19KB/s라 여유; 0.75→0.4→0.2로 체감 지연 단축. 끊기면 12800 으로)
 static uint8_t ring[RING_SZ];
 static volatile size_t rw = 0, rr = 0;          // 누적 write/read 바이트
 static volatile bool gotLast = false;
@@ -287,25 +288,57 @@ inline size_t capAvail() { return capW - capR; }
 const size_t REC_MIN_B = SR * 1 * 2;                 // 최소 1초: 그 전의 눌림(시작 탭의 떨림 포함)은 버린다
 const size_t REC_MAX_B = SR * 12 * 2;                // 최대 12초 자동컷 (PCM 바이트)
 static volatile bool btnEdge = false;                // BOOT 이 눌리는 순간 인터럽트가 세운다
-static volatile bool stopTap = false;                // 녹음이 탭으로 끝났다 (false 로 끝났으면 자동컷)
+static volatile bool stopTap = false;                // 녹음이 탭으로 끝났다
 void IRAM_ATTR onBtnDown() { btnEdge = true; }
+
+// ---------- 발화 끝 자동 감지 (에너지 VAD, 2026-10-08) ----------
+// "말이 끝나고 탭하기까지의 공백"을 없앤다. 캡처 태스크가 32ms 블록마다 RMS 를 재고 바닥 소음을 따라간다.
+// 말소리 블록(바닥의 4배이자 VAD_MIN_SPEECH 이상)이 누적 300ms 를 넘긴 뒤, 700ms 동안 조용하면(바닥의 2.5배 아래) 녹음을 끝낸다.
+// 바닥은 말소리가 아닌 블록에서만 갱신한다 (말하는 동안 바닥이 따라 올라가 문장 중간에 끊기는 일을 막는다).
+// 최소 1초·최대 12초·탭 종료는 그대로. 시끄러운 곳에서 못 끝내면 탭하면 되고, -DVAD_AUTO_STOP=0 으로 끌 수 있다.
+// 아직 실기 보정 전: 로그의 "말 %ums · 바닥 %.0f · 최고 %d" 로 문턱을 맞춘다. (브레인 쪽 실측: 발화 상위창 RMS 1500~9000)
+#ifndef VAD_AUTO_STOP
+#define VAD_AUTO_STOP 1
+#endif
+const uint32_t VAD_SPEECH_MS  = 300;
+const uint32_t VAD_SILENCE_MS = 700;
+const float    VAD_MIN_SPEECH = 400.f;               // 이보다 조용한 블록은 말소리로 보지 않는다 (x2 게인 기준)
+static volatile bool stopVad = false;                // 녹음이 무음 감지로 끝났다
+static uint32_t vadSpeechMs = 0, vadSilenceMs = 0;
+static float vadFloor = 0; static int vadPeak = 0;
+
+void vadReset() { stopVad = false; vadSpeechMs = vadSilenceMs = 0; vadFloor = 0; vadPeak = 0; }
+void vadBlock(float rms, uint32_t ms) {
+  float onTh  = fmaxf(VAD_MIN_SPEECH, vadFloor * 4.f);
+  float offTh = fmaxf(VAD_MIN_SPEECH * 0.6f, vadFloor * 2.5f);
+  if (vadFloor <= 0.f || rms < vadFloor) vadFloor = rms;                 // 바닥은 바로 내려가고
+  else if (rms < onTh) vadFloor += (rms - vadFloor) * 0.05f;             // 말소리가 아닐 때만 천천히 올라간다
+  if (rms > onTh) { vadSpeechMs += ms; vadSilenceMs = 0; if (rms > vadPeak) vadPeak = (int)rms; }
+  else if (rms < offTh) vadSilenceMs += ms;
+}
 
 void captureTask(void*) {
   static int32_t raw[512];
   while (capturing) {
     size_t nb = i2sMic.readBytes((char*)raw, sizeof(raw));
-    for (size_t i = 0; i < nb/4; i++) {
+    size_t n = nb / 4; double sumsq = 0;
+    for (size_t i = 0; i < n; i++) {
       int32_t v = raw[i] >> 15;                      // x2 게인 (클리핑 방지)
       if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
       int16_t s = (int16_t)v;
+      sumsq += (double)s * s;
       if (CAP_SZ - capAvail() >= 2) {
         size_t off = capW % CAP_SZ;
         capRing[off] = s & 0xFF; capRing[(off + 1) % CAP_SZ] = (s >> 8) & 0xFF;
         capW += 2;
       } else capDrops++;                             // 링 포화 (발행이 0.75초 이상 정체)
     }
+    if (n) vadBlock(sqrtf((float)(sumsq / n)), (uint32_t)(n * 1000 / SR));
     if (capW < REC_MIN_B) btnEdge = false;
     else if (btnEdge || digitalRead(BTN) == LOW) { stopTap = true; capturing = false; }   // 종료 탭
+#if VAD_AUTO_STOP
+    else if (vadSpeechMs >= VAD_SPEECH_MS && vadSilenceMs >= VAD_SILENCE_MS) { stopVad = true; capturing = false; }   // 말 끝
+#endif
     if (capW >= REC_MAX_B) capturing = false;                                             // 자동컷
   }
   vTaskDelete(NULL);
@@ -320,7 +353,7 @@ void recordAndPublish() {
   logf("녹음+전송 시작 (clip %u, 탭-토글)\n", clipId);
   const size_t CHUNK_UP = 2048;                                // ADPCM 청크 (=4096샘플=256ms)
   static uint8_t msg[HDR + CHUNK];
-  capW = capR = 0; capDrops = 0; stopTap = false; btnEdge = false; capturing = true;
+  capW = capR = 0; capDrops = 0; stopTap = false; btnEdge = false; vadReset(); capturing = true;
   encPred = 0; encIdx = 0; encLo = -1;                         // 인코더 리셋 (브레인 디코더와 동기)
   xTaskCreatePinnedToCore(captureTask, "cap", 4096, NULL, 10, NULL, 0);
   size_t fill = 0; uint16_t seq = 0;
@@ -350,13 +383,20 @@ void recordAndPublish() {
       lastSent = last;
     }
   }
-  bool autoCut = !stopTap;                                     // 탭 없이 끝났으면 12초 상한에 걸린 것
+  bool autoCut = !stopTap && !stopVad;                         // 탭도 무음 감지도 아니면 12초 상한에 걸린 것
   led(40,40,0);                                                // 노랑 = 전송 마무리
   face(F_UPLOAD);
   if (capDrops) logf("경고: 캡처 링 포화로 %u 샘플 유실\n", (unsigned)capDrops);
-  logf("전송 완료: %u 청크 (%.1f초, %s)\n", seq, (capW / 2) / (float)SR, autoCut ? "자동컷" : "탭으로 종료");
+  logf("전송 완료: %u 청크 (%.1f초, %s) · 말 %ums · 바닥 %.0f · 최고 %d\n", seq, (capW / 2) / (float)SR,
+       stopTap ? "탭으로 종료" : (stopVad ? "무음 감지" : "자동컷"), (unsigned)vadSpeechMs, vadFloor, vadPeak);
   clipId++;
-  if (autoCut) {
+  if (stopVad) {
+    // 무음 감지로 끝났으면 사용자가 습관처럼 "종료" 탭을 할 수 있다. 짧은 확인음을 내고,
+    // 자동컷과 같은 방식으로 버튼이 1.5초 떼어져 있을 때까지 새 녹음을 받지 않는다.
+    softChirp(660.f, 100);
+    uint32_t quiet = millis();
+    while (millis() - quiet < 1500) { if (digitalRead(BTN) == LOW) quiet = millis(); delay(10); }
+  } else if (autoCut) {
     // 자동컷: 사용자는 아직 말하는 중이라 곧 "종료" 탭을 누른다. 그 탭이 새 녹음 시작으로 읽히면
     // 스피커 소리까지 10초 더 녹음돼 헛명령이 된다(2026-09-15 실측: 클립 3·4, 5·6, 8·9 쌍).
     // → 알림음 내고, 버튼이 1.5초 동안 계속 떼어져 있을 때까지 새 녹음을 받지 않는다.
