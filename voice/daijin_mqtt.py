@@ -14,15 +14,20 @@
 #   같은 디렉토리의 다른 claude 세션과 절대 섞이지 않음 (--continue 사용 금지).
 # - 서비스 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속 (daijin_common).
 
-import subprocess, re, os, sys, time, json, wave, threading, queue, shutil, uuid, types
+import subprocess, re, os, sys, time, json, wave, threading, queue, shutil, socket, uuid, types
 import array, asyncio, math, tempfile
-import urllib.request
+import urllib.request, urllib.parse
 try:
     import edge_tts                    # pip install edge-tts. 없으면 edge 엔진만 못 쓰고 다음 엔진으로 넘어간다
 except ImportError:
     edge_tts = None
+try:
+    import supertonic                  # pip install supertonic. 온디바이스 한국어 TTS (ONNX, CPU). 없으면 그 엔진만 빠진다
+except ImportError:
+    supertonic = None
 from daijin_common import VOICE, REPO, sec, load_hooks, cloud_client, connect_with_retry
-from nodes import NODES
+from nodes import NODES, spoken
+import selfdb
 
 HOME    = os.path.expanduser("~")
 # 헬퍼 스크립트(dev.sh 등)가 쓸 파이썬 = 브레인을 띄운 이 파이썬 (paho 가 깔려 있는 것). 에이전트의 셸과 local_hooks 가 물려받는다.
@@ -52,14 +57,24 @@ T_TXT_OUT   = "daijin/text/out"
 # 능동 발화 — 다이진이 먼저 말하는 경로 (음성 입력 없이 텍스트로 발화 트리거)
 T_SAY       = "daijin/say"    # 페이로드 텍스트를 그대로 TTS → 스피커 (알림·차임용)
 T_ASK       = "daijin/ask"    # 페이로드를 에이전트에 전달 → 스스로 표현해 말함 (보고용)
+# 브레인 자신의 상태 (디바이스·노드의 status 와 같은 꼴). 꺼지면 last will 이 offline 으로 덮는다.
+T_BRAIN_STATUS = "daijin/brain/status"   # retained JSON: online, ts, up_s, turns, model, host
+T_BRAIN_TURN   = "daijin/brain/turn"     # 턴마다 JSON 한 줄: 단계별 소요 시간 (계측, retained 아님)
+T_BRAIN_ALERT  = "daijin/brain/alert"    # retained JSON: 사람이 봐야 할 문제 (인증 만료 등). 해결되면 빈 페이로드로 지운다
 
 # 허용 도구 — 사용자 결정(2026-07-04)으로 전면 개방. 보안 노트: 브로커 자격증명이
 # 곧 브레인 머신의 명령 입력 통로가 되므로, HiveMQ 비밀번호 관리가 곧 보안 경계다.
 ALLOWED_TOOLS = "Bash,WebSearch,WebFetch,Read,Glob,Grep,Write,Edit"
-# 속도: 모델은 secrets의 BRAIN_MODEL(기본 sonnet-5, 명령 판단엔 충분하고 첫 토큰이 빠름),
+# 속도: 모델은 secrets 의 BRAIN_MODEL (기본 claude-sonnet-5-5), 추론 강도는 BRAIN_EFFORT (기본 low: 대화·명령 판단엔 충분하고
+# 첫 토큰이 가장 빠르다. 2026-10-08 맥 실측, 한 글자 답: sonnet-5-5 low 2.6초, haiku-5-5 low 1.7초, sonnet-5 7.7초).
+# 한 턴의 도구 호출 상한은 BRAIN_MAX_TURNS (기본 12: 플릿 조회 + 노드 명령 몇 개면 4~6턴). 폭주하면 여기서 끊긴다.
 # MCP(Gmail 등)는 매 턴 접속 비용만 들어서 끈다 (--strict-mcp-config + 빈 설정).
+# 주의: --bare 는 쓰지 않는다. 구독 토큰(CLAUDE_CODE_OAUTH_TOKEN)을 읽지 않아 서버에서 인증이 깨진다.
+DEFAULT_MODEL = "claude-sonnet-5-5"
 def _speed_opts():
-    return ["--model", sec("BRAIN_MODEL") or "claude-sonnet-5",
+    return ["--model", sec("BRAIN_MODEL") or DEFAULT_MODEL,
+            "--effort", sec("BRAIN_EFFORT") or "low",
+            "--max-turns", sec("BRAIN_MAX_TURNS") or "12",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
 def _props():
@@ -101,6 +116,99 @@ SYS = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻하
        "실행하기 전에 반드시 말로 확인을 받아. 도구 출력은 그대로 읽지 말고 핵심만 말해."
        + _props())
 EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
+
+# ---------- 지금 상태 블록 ----------
+# 브레인이 디바이스·노드 상태 토픽을 구독해 마지막 값을 들고 있다가, 턴마다 시스템 프롬프트 끝에 붙인다.
+# 모델이 물어볼 필요 없는 것(몸, 노드, 먼저 말 건 이력, 기억, 인격)을 미리 주는 것: 도구 호출이 줄고 지어낼 틈이 없어진다.
+# 값이 오래됐으면 오래됐다고 같이 적는다. 설계는 docs/design-self-layer.md §7.
+T_DEV_STATUS  = "daijin/status"
+T_NODE_STATUS = "daijin/dev/+/status"
+_body = {"device": None, "device_ts": 0, "nodes": {}}     # nodes: id -> (json dict, 수신 시각)
+STATE_MAX_CHARS = 600
+
+def note_status(topic, payload):
+    try:
+        d = json.loads(payload)
+    except (ValueError, TypeError):
+        return
+    if topic == T_DEV_STATUS:
+        _body["device"], _body["device_ts"] = d, time.time()
+    elif topic.startswith("daijin/dev/"):
+        _body["nodes"][topic.split("/")[2]] = (d, time.time())
+
+def _age(sec_):
+    return f"{int(sec_)}초 전" if sec_ < 120 else f"{int(sec_ // 60)}분 전" if sec_ < 7200 else f"{int(sec_ // 3600)}시간 전"
+
+def state_block(now=None):
+    now = time.time() if now is None else now
+    parts = []
+    d = _body["device"]
+    if d:
+        if d.get("online") is False:
+            parts.append("몸(디바이스): 꺼져 있음")
+        else:
+            age = now - (d.get("ts") or _body["device_ts"])
+            parts.append(f"몸: 온도 {d.get('temp_c', '?')}도, 신호 {d.get('rssi', '?')}, 켜진 지 {int((d.get('uptime_s') or 0) // 60)}분"
+                         + (f" ({_age(age)} 값)" if age > 150 else ""))
+    nodes = []
+    for nid, (nd, rts) in sorted(_body["nodes"].items()):
+        name = spoken(nid)
+        if nd.get("online"):
+            beat = nd.get("ts") or 0
+            stale = beat > 1_700_000_000 and now - beat > 90
+            nodes.append(f"{name} 켜짐" + (" (하트비트 끊김)" if stale else ""))
+        else:
+            nodes.append(f"{name} 꺼짐")
+    if nodes:
+        parts.append("노드: " + ", ".join(nodes))
+    try:
+        asks = selfdb.recent_asks(3)
+        if asks:
+            kor = {"engaged": "대화로 이어짐", "acknowledged": "짧게 답함", "refused_context": "사정이 있어 거절",
+                   "negative": "싫어함", "unanswered": "응답 없음", None: "응답 기다리는 중"}
+            parts.append("내가 먼저 말 건 기록: " + " / ".join(
+                f"{_age(now - a['ts'])} '{a['text'][:24]}' → {kor.get(a['response_class'], a['response_class'])}" for a in asks))
+        mems = selfdb.top_memories(5, 200)
+        if mems:
+            parts.append("기억: " + " · ".join(m["text"] for m in mems))
+        cur = selfdb.persona_current()
+        if cur:
+            parts.append("나에 대해: " + cur["text"].replace("\n", " ")[:300])
+    except Exception as e:
+        print(f"  (상태 블록: DB 읽기 실패 {e})")
+    if not parts:
+        return ""
+    text = " [지금 상태, 이미 최신이니 다시 조회하지 않아도 돼] " + " | ".join(parts)
+    return text[:STATE_MAX_CHARS]
+
+def sys_prompt():
+    return SYS + state_block()
+
+# ---------- 그 사이 내가 먼저 한 말 ----------
+# daijin/say 로 나간 말은 에이전트를 거치지 않아 고정 세션의 대화 이력에 없다. 그러면 모델은 상태 블록에 기록이 있어도
+# 자기 이력을 더 믿고 "먼저 말 건 적 없어"라고 답한다 (2026-10-10 실측: 같은 질문에 새 세션은 맞게, 고정 세션의 복제는 틀리게 답함).
+# 그래서 에이전트에 넘기는 말 앞에, 직전 에이전트 턴 이후 say 로 나간 말을 붙인다. 이 줄이 세션 이력에 남으므로 이후로도 기억된다.
+PROACTIVE_MAX = 5
+PROACTIVE_MAX_CHARS = 300
+
+def with_proactive_context(text, now=None):
+    now = time.time() if now is None else now
+    try:
+        eps = [e for e in selfdb.episodes_since(now - 86400) if e["ts"] <= now]
+    except Exception as e:
+        print(f"  (그 사이 한 말: DB 읽기 실패 {e})")
+        return text
+    last_agent = max((e["ts"] for e in eps if e["kind"] in ("voice", "ask") and e["reply"]), default=0)
+    said = [e for e in eps if e["kind"] == "say" and e["reply"] and e["ts"] > last_agent][-PROACTIVE_MAX:]
+    if not said:
+        return text
+    lines, used = [], 0
+    for e in said:
+        line = f"{time.strftime('%H:%M', time.localtime(e['ts']))} \"{e['reply']}\""
+        if used + len(line) > PROACTIVE_MAX_CHARS:
+            break
+        lines.append(line); used += len(line)
+    return f"(지난 대화 뒤에 네가 먼저 스피커로 한 말: {' / '.join(lines)}) " + text
 
 def load_session():
     try:
@@ -194,9 +302,25 @@ def _looks_hallucinated(t, logprob=None):
 # 비우면 GROQ_API_KEY가 있을 때 groq, 없으면 whisper. groq가 실패하면 로컬 모델이 있을 때 폴백.
 GROQ_URL   = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
+WHISPER_URL_DEFAULT = "http://127.0.0.1:18080/inference"   # whisper.cpp 의 whisper-server (voice/systemd/whisper-server.service)
 
 def _stt_engine():
-    return sec("STT_ENGINE") or ("groq" if sec("GROQ_API_KEY") else "whisper")
+    """secrets 의 STT_ENGINE 이 비어 있으면: whisper_server 가 떠 있으면 그것, 아니면 Groq 키가 있을 때 groq, 아니면 로컬 whisper-cli."""
+    e = sec("STT_ENGINE")
+    if e:
+        return e
+    if _whisper_server_up():
+        return "whisper_server"
+    return "groq" if sec("GROQ_API_KEY") else "whisper"
+
+def _whisper_server_up():
+    url = sec("WHISPER_URL") or WHISPER_URL_DEFAULT
+    try:
+        host, port = urllib.parse.urlparse(url).hostname, urllib.parse.urlparse(url).port or 80
+        socket.create_connection((host, port), timeout=0.3).close()
+        return True
+    except OSError:
+        return False
 
 def _multipart(fields, filename, filedata, content_type="audio/wav"):
     """multipart/form-data 본문 조립 (stdlib만으로 — requests 의존 없이). (body, Content-Type) 반환."""
@@ -209,20 +333,28 @@ def _multipart(fields, filename, filedata, content_type="audio/wav"):
     body += f"--{boundary}--\r\n".encode("utf-8")
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
-def stt_groq(wav):
-    """(전사, 신뢰도). 신뢰도 = 세그먼트 avg_logprob 의 평균 (0 에 가까울수록 확실, 세그먼트가 없으면 None)."""
-    # OpenAI 호환 엔드포인트. prompt는 로컬 whisper와 같은 어휘 바이어스 문장(레드/블루 오인식 교정).
-    body, ctype = _multipart({"model": GROQ_MODEL, "language": "ko", "prompt": STT_PROMPT,
-                              "response_format": "verbose_json"},      # 세그먼트별 avg_logprob 을 받으려고
-                             "clip.wav", open(wav, "rb").read())
-    req = urllib.request.Request(GROQ_URL, data=body, method="POST",
-                                 # User-Agent 필수: Groq 앞단 Cloudflare가 urllib 기본값(Python-urllib)을 403(1010)으로 막는다
-                                 headers={"Authorization": f"Bearer {sec('GROQ_API_KEY')}",
-                                          "Content-Type": ctype, "User-Agent": "daijin-brain/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+def stt_http(url, wav, headers=None, model=None, timeout=20):
+    """OpenAI 호환 전사 엔드포인트(Groq, whisper.cpp 서버) 공통. (전사, 신뢰도).
+    신뢰도 = 세그먼트 avg_logprob 의 평균 (0 에 가까울수록 확실, 세그먼트가 없으면 None). prompt 는 로컬 whisper 와 같은
+    어휘 바이어스 문장(레드/블루 오인식 교정). verbose_json 이라야 세그먼트가 온다 (whisper-server 도 지원, 2026-10-10 확인)."""
+    fields = {"language": "ko", "prompt": STT_PROMPT, "response_format": "verbose_json"}
+    if model:
+        fields["model"] = model
+    body, ctype = _multipart(fields, "clip.wav", open(wav, "rb").read())
+    # User-Agent 필수: Groq 앞단 Cloudflare가 urllib 기본값(Python-urllib)을 403(1010)으로 막는다
+    h = {"Content-Type": ctype, "User-Agent": "daijin-brain/1.0", **(headers or {})}
+    req = urllib.request.Request(url, data=body, method="POST", headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         d = json.loads(resp.read())
     probs = [seg["avg_logprob"] for seg in d.get("segments") or [] if "avg_logprob" in seg]
     return (d.get("text") or "").strip(), (sum(probs) / len(probs) if probs else None)
+
+def stt_groq(wav):
+    return stt_http(GROQ_URL, wav, headers={"Authorization": f"Bearer {sec('GROQ_API_KEY')}"}, model=GROQ_MODEL)
+
+def stt_whisper_server(wav):
+    """로컬 whisper.cpp 서버. 맥 M1 Pro 실측 RTF 0.4 (verbose_json). 모델은 서버가 들고 있어 model 필드가 없다."""
+    return stt_http(sec("WHISPER_URL") or WHISPER_URL_DEFAULT, wav, timeout=60)
 
 def stt_whisper(wav):
     r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
@@ -231,8 +363,14 @@ def stt_whisper(wav):
     return r.stdout.strip(), None            # whisper-cli 는 신뢰도를 내주지 않는다
 
 def stt(wav):
-    """(전사, 신뢰도 또는 None)."""
+    """(전사, 신뢰도 또는 None). 순서: 고른 엔진 → (whisper_server 였으면 groq) → 로컬 whisper-cli."""
     engine = _stt_engine()
+    if engine == "whisper_server":
+        try:
+            return stt_whisper_server(wav)
+        except Exception as e:
+            print(f"  (whisper 서버 STT 실패: {e} → {'Groq' if sec('GROQ_API_KEY') else '로컬 whisper'} 폴백)")
+            engine = "groq" if sec("GROQ_API_KEY") else "whisper"
     if engine == "groq":
         try:
             return stt_groq(wav)
@@ -266,13 +404,17 @@ BRAIN_TIMEOUT_S = 180
 _SESSION_GONE = "No conversation found"
 RESUME_GIVE_UP = 3
 _resume_failures = 0
+# 인증 문제(토큰 만료·취소, 401)는 다시 시도해도 소용없고 사람이 토큰을 갱신해야 한다.
+# 새 세션으로 넘어가지 않고(기억 보존), 말로 알리고, daijin/brain/alert 에 retained 로 남긴다.
+_AUTH_FAIL = re.compile(r"401|unauthori[sz]ed|authentication|invalid.{0,20}(api key|token)|token.{0,20}(expired|revoked|invalid)|not logged in|please run /login", re.I)
+AUTH_FAIL_SENTENCE = "브레인 인증에 문제가 생겼어. 서버에서 토큰을 확인해 줘."
 
 def _claude_stream(text, resume_id, st):
     """claude -p 를 스트리밍으로 돌려 문장을 yield. 결과는 st 에 남긴다:
     ok(정상 종료) · yielded(한 문장이라도 나옴) · timeout · noise(JSON 이 아닌 출력과 오류 문구, 진단용)."""
     cmd = [CLAUDE, "-p", text, "--output-format", "stream-json",
            "--include-partial-messages", "--verbose",
-           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", SYS] + _speed_opts()
+           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", sys_prompt()] + _speed_opts()
     if resume_id:
         cmd += ["--resume", resume_id]
     # stderr 를 stdout 에 합친다: 인증 만료나 세션 없음 같은 오류는 JSON 이 아닌 줄로 나오므로 noise 로 모인다.
@@ -347,6 +489,10 @@ def brain_stream(text):
         _resume_failures = 0
         return
     print(f"  ⚠️ 에이전트 실패: {' | '.join(st['noise'][-3:]) or '출력 없음'}")
+    if any(_AUTH_FAIL.search(n) for n in st["noise"]):
+        _alert("auth", "claude CLI 인증 실패: " + (st["noise"][-1][:160] if st["noise"] else ""))
+        yield AUTH_FAIL_SENTENCE
+        return
     gone = bool(sid) and any(_SESSION_GONE in n for n in st["noise"])
     if sid and not gone:
         _resume_failures += 1
@@ -411,6 +557,36 @@ def _tts_eleven(text):
                 break
             yield d
 
+def f32_44k_to_pcm16k(samples):
+    """Supertonic 출력(float32 44.1kHz mono numpy) → PCM 16k 16bit. ffmpeg 파이프 (맥·리눅스 공통)."""
+    import numpy as np
+    raw = np.asarray(samples, dtype=np.float32).ravel().tobytes()
+    r = subprocess.run([FFMPEG, "-loglevel", "error", "-f", "f32le", "-ar", "44100", "-ac", "1", "-i", "pipe:0",
+                        "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+                       input=raw, capture_output=True, timeout=15, check=True)
+    return r.stdout
+
+_supertonic = {"tts": None, "voice": None, "style": None}
+
+def _tts_supertonic(text):
+    """Supertonic 3 (Supertone, 99M, ONNX, CPU). 한국어 포함 31개 언어, 외부 호출 없음.
+    2026-10-10 실측: 한국어 RTF 맥 M1 Pro 0.13, Hetzner 2vCPU 0.18~0.23 (4 steps). 모델은 첫 호출에 3~4초 로드 후 상주.
+    보이스는 내장 프리셋 M1~M5, F1~F5 (secrets SUPERTONIC_VOICE, 기본 M1). 품질·속도 조절은 SUPERTONIC_STEPS (기본 4)."""
+    if supertonic is None:
+        raise RuntimeError("supertonic 미설치 (pip install supertonic)")
+    if _supertonic["tts"] is None:
+        _supertonic["tts"] = supertonic.TTS()
+    voice = sec("SUPERTONIC_VOICE") or "M1"
+    if _supertonic["voice"] != voice:
+        _supertonic["style"] = _supertonic["tts"].get_voice_style(voice)
+        _supertonic["voice"] = voice
+    try:
+        steps = int(sec("SUPERTONIC_STEPS") or "4")
+    except ValueError:
+        steps = 4
+    wav, _dur = _supertonic["tts"].synthesize(text, _supertonic["style"], total_steps=steps, lang="ko")
+    yield f32_44k_to_pcm16k(wav)
+
 def _tts_say(text):
     """macOS 내장 Yuna. 네트워크 없이도 되는 맥 전용 최종 폴백."""
     with tempfile.TemporaryDirectory() as d:
@@ -419,18 +595,19 @@ def _tts_say(text):
                         "--file-format=WAVE", "--data-format=LEI16@16000", text], check=True, timeout=30)
         yield wav_to_pcm(out)
 
-_TTS_ENGINES = {"edge": _tts_edge, "eleven": _tts_eleven, "yuna": _tts_say}
+_TTS_ENGINES = {"supertonic": _tts_supertonic, "edge": _tts_edge, "eleven": _tts_eleven, "yuna": _tts_say}
 
 def _tts_order():
-    """secrets 의 TTS_ENGINE(기본 edge)을 먼저, 그다음은 쓸 수 있는 나머지 엔진 순서대로."""
+    """secrets 의 TTS_ENGINE(기본 edge)을 먼저, 그다음은 쓸 수 있는 나머지 엔진 순서대로.
+    supertonic 은 패키지가 깔려 있을 때만 후보가 된다 (로컬이라 폴백 순서에서도 앞쪽)."""
     first = sec("TTS_ENGINE") or "edge"
-    order = [first] + [e for e in ("edge", "eleven", "yuna") if e != first]
-    usable = {"edge": True, "eleven": bool(sec("ELEVEN_API_KEY")), "yuna": IS_MAC}
+    order = [first] + [e for e in ("supertonic", "edge", "eleven", "yuna") if e != first]
+    usable = {"supertonic": supertonic is not None, "edge": True, "eleven": bool(sec("ELEVEN_API_KEY")), "yuna": IS_MAC}
     return [e for e in order if e in _TTS_ENGINES and usable[e]]
 
 def tts_stream(text):
     """PCM 16k 조각을 yield. 엔진은 secrets.local.txt 의 TTS_ENGINE 으로 고른다 (매번 다시 읽으므로 재시작 불필요):
-      edge (기본) · eleven (ELEVEN_API_KEY 필요) · yuna (macOS 전용)
+      supertonic (로컬, pip install supertonic) · edge (기본) · eleven (ELEVEN_API_KEY 필요) · yuna (macOS 전용)
     고른 엔진이 실패하면 쓸 수 있는 다음 엔진으로 넘어간다. edge 는 비공식 엔드포인트라 가끔 끊겨서 한 번 더 시도한다.
     전부 실패하면 아무것도 내보내지 않는다 (그 문장은 건너뛴다)."""
     if not text:
@@ -570,6 +747,9 @@ def on_connect(client, userdata, flags, reason_code, properties):
     client.subscribe(T_AUDIO_IN, qos=1)
     client.subscribe(T_SAY, qos=1)
     client.subscribe(T_ASK, qos=1)
+    client.subscribe(T_DEV_STATUS, qos=0)      # 지금 상태 블록용 (retained 라 접속 즉시 마지막 값이 온다)
+    client.subscribe(T_NODE_STATUS, qos=0)
+    publish_status(client)                 # 접속 즉시 online (끊겼을 때 남은 will 의 offline 을 덮는다)
 
 SPEECH_RMS = 40    # 16bit PCM 상위창 RMS. 2026-09-18 실측: 실제 발화가 212밖에 안 나와 260은 너무 높았음. 진짜 무음(0~20)만 거른다
 
@@ -585,28 +765,37 @@ def speech_rms(pcm):
 
 def handle_clip(client, pcm):
     t0 = time.monotonic()
+    turn = Turn("voice", t0)
+    turn.info["clip_s"] = round(len(pcm) / 32000, 2)
     rms = speech_rms(pcm)
+    turn.info["rms"] = int(rms)
     if rms < SPEECH_RMS:
         print(f"  🔇 말소리 없음(RMS {rms:.0f} < {SPEECH_RMS}) → 클립 무시")
         publish_no_reply(client)
+        turn.info["dropped"] = "silence"; turn.done(client)
         return
     with tempfile.TemporaryDirectory() as d:
         wav = f"{d}/clip.wav"
         pcm_to_wav(pcm, wav)
         heard, logprob = stt(wav)
+    turn.mark("stt")
+    if logprob is not None: turn.info["stt_conf"] = round(logprob, 2)
     user = normalize_nodes(heard)
     conf = "" if logprob is None else f"  (음량 {rms:.0f}, 신뢰도 {logprob:.2f})"     # 잡음 클립을 가르는 기준을 잡을 때 볼 값
     if user and _looks_hallucinated(user, logprob):
         print(f"  🔇 환청 의심(프롬프트 예문 반복): {user!r}{conf} → 클립 무시")
         publish_no_reply(client)
+        turn.info["dropped"] = "hallucination"; turn.done(client)
         return
     print(f"  🗣️  나: {user}{conf}")
+    turn.text_in = user
     client.publish(T_TXT_IN, user)
     if user and intercepted(client, user, "voice", t0):
+        turn.info["path"] = "hook"; turn.done(client)
         return
     # 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
-    src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
-    speak_stream(client, src, t0)
+    src = brain_stream(with_proactive_context(user)) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
+    speak_stream(client, src, t0, turn)
 
 # 말하기 직전 치환 — 프롬프트로 안 고쳐지는 습관어. TTS가 "ack"를 "액"으로 읽어 "액바닷서"가 됨(2026-09-16).
 def _no_batchim(word):
@@ -640,26 +829,100 @@ def speak_fix(t):
             t = pat.sub(lambda m: (m.group(1) or "") + rep if m.re.groups else rep, t)
     return re.sub(r"\s{2,}", " ", t).strip()
 
-def speak_stream(client, sentence_iter, t0):
-    """문장 이터레이터를 스트리밍 TTS→ADPCM 발행. 음성 응답과 능동 발화의 공통 출구."""
+# ---------- 브레인 상태·알림·계측 ----------
+_client = None            # main() 이 세팅. 워커 밖(brain_stream)에서 알림을 띄울 때 쓴다
+_started = time.time()
+_turns = 0
+_alerts = {}              # kind -> 마지막으로 알린 시각 (같은 문제를 매 턴 떠들지 않게)
+ALERT_COOLDOWN_S = 600
+
+def _alert(kind, text):
+    """사람이 봐야 할 문제. retained 로 남겨 두어 나중에 붙는 대시보드도 본다. 해결되면 clear_alert()."""
+    now = time.time()
+    if now - _alerts.get(kind, 0) < ALERT_COOLDOWN_S:
+        return
+    _alerts[kind] = now
+    print(f"  🚨 alert[{kind}]: {text}")
+    if _client is not None:
+        _client.publish(T_BRAIN_ALERT, json.dumps({"kind": kind, "text": text, "ts": int(now)}, ensure_ascii=False), qos=1, retain=True)
+
+def clear_alert():
+    if _client is not None:
+        _client.publish(T_BRAIN_ALERT, b"", qos=1, retain=True)
+
+def brain_status(online=True):
+    return json.dumps({"online": online, "ts": int(time.time()), "up_s": int(time.time() - _started),
+                       "turns": _turns, "model": sec("BRAIN_MODEL") or DEFAULT_MODEL,
+                       "stt": _stt_engine(), "tts": (_tts_order() or ["?"])[0],
+                       "host": socket.gethostname()}, ensure_ascii=False)
+
+def publish_status(client):
+    client.publish(T_BRAIN_STATUS, brain_status(), qos=1, retain=True)
+
+def heartbeat(client):
+    """60초마다 상태를 retained 로 올리고, HEARTBEAT_URL(secrets, 선택)이 있으면 거기도 찍는다:
+    Uptime Kuma 의 Push 모니터나 healthchecks.io 같은 곳. 브레인이 죽으면 그쪽이 알린다."""
+    while True:
+        time.sleep(60)
+        try:
+            publish_status(client)
+            url = sec("HEARTBEAT_URL")
+            if url:
+                urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "daijin-brain/1.0"}), timeout=10).read()
+        except Exception as e:
+            print(f"  (heartbeat 실패: {e})")
+
+class Turn:
+    """한 턴의 단계별 시각. 끝나면 JSON 한 줄을 로그와 daijin/brain/turn 에 남긴다.
+    kind: voice(말로 들어옴) | ask | say. 시간은 전부 t0(클립 디코드 완료 또는 메시지 수신) 기준 초."""
+    def __init__(self, kind, t0=None):
+        self.kind, self.t0 = kind, (time.monotonic() if t0 is None else t0)
+        self.marks, self.info = {}, {}
+        self.text_in, self.text_out = None, None   # selfdb.episodes 에 남길 들린 말·한 말
+    def mark(self, name):
+        self.marks.setdefault(name, round(time.monotonic() - self.t0, 2))
+    def done(self, client):
+        global _turns
+        _turns += 1
+        self.mark("done")
+        d = {"kind": self.kind, **self.info, **self.marks, "ts": int(time.time())}
+        line = json.dumps(d, ensure_ascii=False)
+        print(f"  ⏱ turn {line}")
+        if not self.info.get("dropped"):            # 무음·환청으로 버린 클립은 대화가 아니다
+            selfdb.episode(self.kind, user_text=self.text_in, reply=self.text_out, stt_conf=self.info.get("stt_conf"),
+                           rms=self.info.get("rms"), clip_s=self.info.get("clip_s"), turn_json=line)
+        try:
+            client.publish(T_BRAIN_TURN, line, qos=0)
+        except Exception as e:
+            print(f"  (turn 발행 실패: {e})")
+
+def speak_stream(client, sentence_iter, t0, turn=None):
+    """문장 이터레이터를 스트리밍 TTS→ADPCM 발행. 음성 응답과 능동 발화의 공통 출구.
+    turn 이 있으면 첫 문장(first_sent), 첫 소리(first_audio), 끝(done)을 기록한다."""
     sentences = []
     def gen():
         for s in sentence_iter:
             s = speak_fix(s)
+            if turn: turn.mark("first_sent")
             sentences.append(s)
             print(f"  🤖 daijin: {s}  (+{time.monotonic()-t0:.1f}s)")
             for pcm in tts_stream(s):
+                if turn: turn.mark("first_audio")
                 yield pcm
             yield b"\x00" * 3200              # 문장 사이 0.1초 숨고르기
     n = publish_pcm_stream(client, gen())
     client.publish(T_TXT_OUT, " ".join(sentences))
+    if turn: turn.text_out = " ".join(sentences)
     print(f"  📤 답 발행 {n} 청크 · ⏱️ {time.monotonic()-t0:.1f}s")
+    if turn:
+        turn.info.update(sentences=len(sentences), chunks=n)
+        turn.done(client)
 
 def handle_say(client, text):
     """daijin/say — 받은 텍스트를 그대로 말한다 (에이전트 미경유, 알림·차임용)"""
     t0 = time.monotonic()
     print(f"\n📢 say: {text}")
-    speak_stream(client, iter([text]), t0)
+    speak_stream(client, iter([text]), t0, Turn("say", t0))
 
 def handle_ask(client, text):
     """daijin/ask — 상황 텍스트를 에이전트에 넣고, 다이진이 스스로 표현해 말한다.
@@ -669,7 +932,8 @@ def handle_ask(client, text):
     client.publish(T_TXT_IN, f"[ask] {text}")
     if intercepted(client, text, "ask", t0):
         return
-    speak_stream(client, brain_stream(text), t0)
+    turn = Turn("ask", t0); turn.text_in = text
+    speak_stream(client, brain_stream(with_proactive_context(text)), t0, turn)
 
 # 처리(STT/Claude/TTS/발행)는 워커 스레드에서 — paho 네트워크 스레드(콜백)에서 하면
 # publish가 콜백 종료까지 실제 송신되지 않아 스트리밍이 무효화됨
@@ -683,7 +947,12 @@ def worker(client):
             elif kind == "say": handle_say(client, data)
             elif kind == "ask": handle_ask(client, data)
         except Exception as e:
-            print(f"  ⚠️ 처리 오류: {e}")
+            print(f"  ⚠️ 처리 오류: {e!r}")
+            _alert("worker", f"{kind} 처리 중 예외: {e!r}"[:200])
+            try:
+                publish_no_reply(client)          # 디바이스가 생각하는 얼굴로 90초 기다리지 않게
+            except Exception:
+                pass
 
 def on_message(client, userdata, msg):
     if msg.topic == T_SAY:
@@ -691,6 +960,9 @@ def on_message(client, userdata, msg):
         return
     if msg.topic == T_ASK:
         _clipq.put(("ask", msg.payload.decode("utf-8", "replace").strip()))
+        return
+    if msg.topic == T_DEV_STATUS or msg.topic.startswith("daijin/dev/"):
+        note_status(msg.topic, msg.payload)
         return
     if msg.topic != T_AUDIO_IN:
         return
@@ -712,10 +984,14 @@ def on_message(client, userdata, msg):
         _clipq.put(("pcm", data))
 
 def main():
+    global _client
     c = cloud_client("daijin-brain")
+    c.will_set(T_BRAIN_STATUS, brain_status(online=False), qos=1, retain=True)   # 죽으면 브로커가 offline 으로 표시
     c.on_connect = on_connect
     c.on_message = on_message
+    _client = c
     threading.Thread(target=worker, args=(c,), daemon=True).start()
+    threading.Thread(target=heartbeat, args=(c,), daemon=True).start()
     print("🤖 daijin 브레인(MQTT) 시작 — HiveMQ 연결 중...")
     connect_with_retry(c)
     c.loop_forever()

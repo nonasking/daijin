@@ -38,6 +38,13 @@ def spoken(nid):
     """노드 id → 말로 부르는 이름. 표에 없는 id 는 그대로."""
     return NODES[nid]["name"] if nid in NODES else nid
 
+def subject(nid):
+    """말로 부르는 이름 + 주격 조사: 레드가, 블루가, 그린이. 받침이 있으면 '이', 없으면 '가'."""
+    name = spoken(nid)
+    c = name[-1]
+    has_batchim = "가" <= c <= "힣" and (ord(c) - 0xAC00) % 28 != 0
+    return name + ("이" if has_batchim else "가")
+
 def flash_flags(nid):
     d = NODES[nid]
     return f'{d["flash"]} -DNODE_COLOR="{d["color"]}"'

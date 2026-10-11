@@ -1,0 +1,15 @@
+# whisper.cpp 서버 — 로컬 음성 인식 (홈서버·맥 등 GPU 나 넉넉한 CPU 가 있는 곳에서만). 2vCPU VPS 에서는 켜지 않는다.
+# 브레인은 STT_ENGINE=whisper_server, WHISPER_URL=http://127.0.0.1:18080/inference 로 붙는다 (안 떠 있으면 Groq 로 넘어간다).
+# 설치: WITH_WHISPER=1 bash voice/install-services.sh   (whisper-server 실행 파일과 모델 파일이 있어야 한다)
+[Unit]
+Description=whisper.cpp server (local STT, large-v3-turbo, Korean)
+After=network.target
+
+[Service]
+ExecStart=__WHISPER_SERVER__ -m __WHISPER_MODEL__ -l ko --host 127.0.0.1 --port 18080
+Restart=always
+RestartSec=5
+Environment=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

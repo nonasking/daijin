@@ -1,0 +1,11 @@
+# 매일 03:30 (서버 시간대) 에 daijin-reflect.service 를 한 번 띄운다. 꺼져 있던 시간을 넘겼으면 켜진 뒤 바로 한 번.
+[Unit]
+Description=daijin nightly reflection at 03:30
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

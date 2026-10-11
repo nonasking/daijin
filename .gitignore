@@ -28,6 +28,8 @@ IMG_*.HEIC
 
 # daijin 런타임 파일
 voice/.daijin_session
+voice/daijin.db
+voice/daijin.db-*
 voice/daijin.log
 voice/__pycache__/
 

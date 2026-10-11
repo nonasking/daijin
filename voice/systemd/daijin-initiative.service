@@ -1,0 +1,19 @@
+# initiative — 추동·허용 필터·거절 장부, systemd 사용자 서비스 (리눅스). voice/install-services.sh 가 자리를 채워 설치한다.
+# secrets 의 INITIATIVE_DRY_RUN=1 이면 말하지 않고 daijin/initiative/plan 에 계획만 찍는다 (첫 주).
+[Unit]
+Description=daijin initiative (drives -> admissibility filter -> proactive speech; the rebuff ledger)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=__REPO__/voice
+ExecStart=__PYTHON__ -u __REPO__/voice/initiative.py
+Restart=always
+RestartSec=5
+Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=__HOME__
+Environment=PYTHONUNBUFFERED=1
+# 로그: journalctl --user -u daijin-initiative -f
+
+[Install]
+WantedBy=default.target
