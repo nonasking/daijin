@@ -82,12 +82,26 @@ Where does daijin's "self" live? Not in the model. It lives next to the brain, i
 - **A current-state block.** Every turn the agent is handed its body readings, which nodes are up, how its last proactive lines went, its top memories and its persona. It answers "블루 켜져 있어?" or "아까 나한테 뭐 물어봤어?" without calling a tool.
 - **Nights.** `reflect.py` looks back over the day in a fresh session: it writes memories (superseding, never deleting), corrects the ledger, fills a "wanted to ask less" column, and may propose a persona rewrite. Only a person can approve that, with `persona.py`.
 
+## Thinking without outside services
+
+The goal is that daijin keeps talking even if every outside AI service is gone. Each piece now has a way to run at home:
+
+- **Thinking engines are swappable.** `BRAIN_ENGINE=claude` (default), `local` (any OpenAI-compatible endpoint: Ollama, llama.cpp, LM Studio, vLLM), or an order such as `claude,local`, which falls back to the local model when Claude gives no answer. The local engine gets three tools only (node command, fleet status, device status), invented commands are refused, and a reply that claims an action no command carried out is replaced with the truth. Its conversation memory comes from the self layer instead of a model session.
+- **Some answers need no model.** Clear short commands ("레드 모터 돌려 줘") and time, date and weekday questions are answered by rules in about 2 seconds (`fastpath.py`). A 4B model got the weekday wrong one time in three; the clock does not.
+- **Ears and voice at home.** A whisper.cpp server for speech recognition, Supertonic for speech, both on the CPU or GPU of the machine running them.
+- **A home broker when the internet is gone.** With `MQTT_LOCAL_HOST` in the firmware secrets (a `.local` name is looked up with mDNS), the device and nodes move to a mosquitto on the home WiFi after three failed cloud connects or when there is no clock to check certificates, and go back to the cloud every five minutes.
+- **Offline mode.** `voice/offline-mode.sh start` runs the whole brain on one Mac with all of the above. Measured on an M1 Pro with qwen3.5:4b: rule answers 2-3 s, conversation 9-17 s.
+- **A home helper for the server.** `voice/mac-helper.sh` keeps whisper running on a Mac and exposes it and Ollama to the server over Tailscale only, so the server falls back to the Mac's model when Claude fails.
+
+The local model is clearly weaker than Claude: it misplaces dates, cannot search the web, and rarely draws memories out of a day in reflection. It is a floor to stand on, not a replacement yet.
+
 ## Current status
 
 - **Phase 2 shipped** — the device itself listens and speaks: tap BOOT to record, tap again to send; the reply streams back and plays with **zero underruns**, at home or on a phone hotspot outside.
 - **Voice**: **Supertonic** (`TTS_ENGINE=supertonic`) speaks Korean on the CPU with no network, about 0.2× real time even on a 2-vCPU VPS; **Edge TTS** (free neural voice) and a custom **ElevenLabs** voice remain, and the engines fall through to one another.
 - **Recording** ends by itself when the speaker goes quiet (energy VAD on the device), or with a second tap.
 - **Self layer** running: drives, the rebuff ledger, nightly reflection; see above.
+- **Local thinking and offline mode** working end to end; the firmware falls back to a home broker (checked on the device and both nodes with a test build that treats the cloud as down).
 - **Device UX**: ready chirp through the speaker, dim-green idle LED, status colors for record/upload/play (LTE connects can take 30+ seconds — sound beats a blinking LED).
 - Earlier milestones: HTTP LAN control → MQTT LAN → HiveMQ Cloud portable control (verified from a phone on LTE) → cloud voice round-trip with a fake device.
 
@@ -109,11 +123,15 @@ sketches/   ESP32 firmware (arduino-cli)
   13-cloud-led        HiveMQ Cloud (portable ✅)
   14-daijin           the daijin device: mic → cloud → speaker ✅
   15-home-node        home fleet node: one firmware per NODE_NAME — retained heartbeat, MQTT LWT, servo/relay/DHT/PIR switches
+                      (both: broker_choice.h falls back to a home broker when the cloud is out of reach)
   test-mic            mic verification (record → HTTP → whisper)
   test-speaker        speaker verification (I2S tone melody)
   mic-diag            auto-sweeps every pin/slot combo to find I2S wiring empirically
 voice/      daijin
-  daijin_mqtt.py      brain: MQTT client (STT → Claude → streaming TTS → ADPCM chunks) — runs on macOS or Linux
+  daijin_mqtt.py      brain: MQTT client (STT → thinking engine → streaming TTS → ADPCM chunks) — runs on macOS or Linux
+  local_mind.py       the local thinking engine: any OpenAI-compatible endpoint, three tools, guards against claimed actions
+  fastpath.py         rules for clear commands and clock questions, no model
+  ollama/             Modelfile for the local model with a context large enough for daijin
   daijin_common.py    shared by the brain, the fleet watcher and the tools: secrets, local hooks, broker client
   nodes.json          the home nodes in one place: id, number, spoken name, LED colour, firmware flags
   nodectl.py          node/device control on one broker connection; dev.sh, fleet.sh, status.sh, say.sh wrap it
@@ -131,9 +149,11 @@ voice/      daijin
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
   install-agents.sh   macOS: register brain + fleet watcher as LaunchAgents
   install-services.sh Linux: register them as systemd user services (systemd/*.service)
+  offline-mode.sh     run everything on this machine with no outside services (home broker, local model, whisper.cpp, Supertonic)
+  mac-helper.sh       keep whisper.cpp running on a Mac and expose it and Ollama to the server over Tailscale only
   test_device.py      device stand-in: sends a question as ADPCM chunks, decodes the reply (`--say "..."` needs no recording)
   mic_test_server.py  HTTP endpoint for mic verification
-  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
+  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer, the local engine) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
 docs/       roadmap · research · audio protocol · broker credentials
 ```
 
