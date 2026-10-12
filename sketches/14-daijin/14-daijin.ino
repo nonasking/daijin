@@ -18,6 +18,7 @@
 #include "secrets.h"     // WIFI_SSID/PASS, MQTT_HOST/PORT/USER/PASS
 #include "ca_cert.h"     // ISRG Root X1 (Let's Encrypt)
 #include "tls_time.h"    // 시계 맞추기: NTP, 막히면 HTTP Date (인증서 검증을 끄지 않기 위해)
+#include "broker_choice.h" // 클라우드에 못 붙으면 집 우체국으로 (secrets.h 에 MQTT_LOCAL_HOST 가 있을 때만)
 
 // 시각을 끝내 못 맞췄을 때 인증서 검증 없이라도 붙을지. 0(기본) = 붙지 않고 시각이 잡힐 때까지 계속 시도한다.
 // 1 로 빌드하면 예전처럼 검증 없이 붙는다: 같은 망의 누구든 브로커 행세로 MQTT 비밀번호를 가로챌 수 있으니 급할 때만.
@@ -48,6 +49,7 @@ const size_t HDR      = 4;
 WiFiMulti wifiMulti;      // 홈 WiFi + 아이폰 핫스팟 중 잡히는 곳 자동 접속
 WiFiClientSecure tls;
 PubSubClient mqtt(tls);
+BrokerChoice broker;
 I2SClass i2sMic, i2sSpk;
 uint8_t clipId = 0;
 bool playing = false;
@@ -430,10 +432,13 @@ bool mqttTry() {
   if (lastTry && millis() - lastTry < 3000) return false;
   lastTry = millis();
   led(30,0,30);                                                // 보라 = MQTT 연결 중
+  if (broker.choose()) logf("우체국 바꿈 → %s\n", broker.name());
   String cid = "daijin-dev-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  if (mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASS, T_STATUS, 1, true, WILL_OFFLINE)) {
+  bool ok = mqtt.connect(cid.c_str(), broker.user(), broker.pass(), T_STATUS, 1, true, WILL_OFFLINE);
+  ok = broker.result(ok);
+  if (ok) {
     mqtt.subscribe(T_AUDIO_OUT, 0);     // QoS0: ACK 게이팅 없이 TCP 스트리밍
-    logf("MQTT 연결 OK\n");
+    logf("MQTT 연결 OK (%s)\n", broker.name());
     statusDue = true;                   // 접속 즉시 online 상태를 올려 LWT 의 offline 을 덮는다
     led(0,30,0); delay(200); LED_IDLE;
     return true;
@@ -443,8 +448,11 @@ bool mqttTry() {
 }
 
 // 시계가 맞아야 인증서를 검증할 수 있다. NTP → HTTP Date 순으로 시도 (tls_time.h).
+// 집 우체국이 설정돼 있으면 시각을 못 얻어도 기다리지 않는다: 인터넷이 끊긴 것이니 집 우체국으로 간다 (broker_choice.h).
 void setupTls() {
-  if (syncClock()) { tls.setCACert(ISRG_ROOT_X1); logf("TLS: CA 검증 모드 (시각: %s)\n", clockSource); return; }
+  if (syncClock()) { broker.begin(tls, mqtt, true); logf("TLS: CA 검증 모드 (시각: %s)\n", clockSource); return; }
+  if (broker.enabled()) { broker.begin(tls, mqtt, false); logf("TLS: 시각 동기 실패 → 집 우체국으로 시작 (5분마다 클라우드 재시도)\n"); return; }
+  broker.begin(tls, mqtt, false);
 #if ALLOW_INSECURE_TLS
   tls.setInsecure(); logf("TLS: 시각 동기 실패 → 검증 없이 접속 (ALLOW_INSECURE_TLS=1)\n");
 #else
@@ -477,9 +485,8 @@ void setup() {
   WiFi.setSleep(true);
   logf("WiFi OK %s (%s)\n", WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
 
-  setupTls();
+  setupTls();                                    // 우체국(클라우드/집)도 여기서 정해진다
 
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMqtt);
   mqtt.setBufferSize(HDR + CHUNK + 128);                       // 수신 청크 수용
   mqtt.setKeepAlive(60); mqtt.setSocketTimeout(30);
@@ -508,11 +515,11 @@ void publishStatus() {
   if (!statusDue && millis() - last < 60000 && last != 0) return;
   statusDue = false;
   last = millis();
-  char js[224];
+  char js[256];
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"ts\":%ld,\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u}",
+    "{\"online\":true,\"ts\":%ld,\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u,\"broker\":\"%s\"}",
     (long)time(nullptr), temperatureRead(), WiFi.SSID().c_str(), WiFi.RSSI(),
-    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap());
+    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap(), broker.name());
   mqtt.publish(T_STATUS, (const uint8_t*)js, strlen(js), true);   // retained
 }
 

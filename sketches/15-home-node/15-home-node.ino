@@ -44,6 +44,7 @@
 #include "secrets.h"              // MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS (+ WIFI_SSID*)
 #include "ca_cert.h"              // ISRG_ROOT_X1
 #include "tls_time.h"             // 시계 맞추기: NTP, 막히면 HTTP Date (인증서 검증을 끄지 않기 위해)
+#include "broker_choice.h"        // 클라우드에 못 붙으면 집 우체국으로 (secrets.h 에 MQTT_LOCAL_HOST 가 있을 때만)
 
 // 시각을 끝내 못 맞췄을 때 인증서 검증 없이라도 붙을지. 0(기본) = 붙지 않고 재부팅해서 다시 시도한다.
 // 1 로 빌드하면 예전처럼 검증 없이 붙는다: 같은 망의 누구든 브로커 행세로 MQTT 비밀번호를 가로챌 수 있으니 급할 때만.
@@ -112,6 +113,7 @@ const int PIR_PIN = 7; bool pirLast = false;
 WiFiMulti        multi;
 WiFiClientSecure net;
 PubSubClient     mqtt(net);
+BrokerChoice     broker;
 WiFiManager      wm;
 String clientId;
 
@@ -276,13 +278,13 @@ void heartbeat() {
 #if FEAT_DHT
   float rt = dht.readTemperature(), rh = dht.readHumidity();
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"room_c\":%.1f,\"room_rh\":%.0f,\"heap\":%u}",
+    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"room_c\":%.1f,\"room_rh\":%.0f,\"heap\":%u,\"broker\":\"%s\"}",
     NODE_NAME, (long)time(nullptr), millis()/1000UL, WiFi.RSSI(), temp, WiFi.SSID().c_str(),
-    isnan(rt) ? -1 : rt, isnan(rh) ? -1 : rh, ESP.getFreeHeap());
+    isnan(rt) ? -1 : rt, isnan(rh) ? -1 : rh, ESP.getFreeHeap(), broker.name());
 #else
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"heap\":%u}",
-    NODE_NAME, (long)time(nullptr), millis()/1000UL, WiFi.RSSI(), temp, WiFi.SSID().c_str(), ESP.getFreeHeap());
+    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"heap\":%u,\"broker\":\"%s\"}",
+    NODE_NAME, (long)time(nullptr), millis()/1000UL, WiFi.RSSI(), temp, WiFi.SSID().c_str(), ESP.getFreeHeap(), broker.name());
 #endif
   mqtt.publish(T_STATUS, (const uint8_t*)js, strlen(js), true);
 }
@@ -348,8 +350,11 @@ void setup() {
   Serial.printf("WiFi OK: %s (%s)\n", WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
 
   // 시계가 맞아야 인증서를 검증할 수 있다 (하트비트 타임스탬프도 이 시계). NTP → HTTP Date 순 (tls_time.h).
-  if (syncClock()) { net.setCACert(ISRG_ROOT_X1); Serial.printf("time OK (%s) → CA 검증\n", clockSource); }
+  // 집 우체국이 설정돼 있으면 시각을 못 얻어도 재부팅하지 않고 집 우체국으로 간다 (인터넷이 끊긴 것, broker_choice.h).
+  if (syncClock()) { broker.begin(net, mqtt, true); Serial.printf("time OK (%s) → CA 검증\n", clockSource); }
+  else if (broker.enabled()) { broker.begin(net, mqtt, false); Serial.println("시각 동기 실패 → 집 우체국으로 시작 (5분마다 클라우드 재시도)"); }
   else {
+    broker.begin(net, mqtt, false);
 #if ALLOW_INSECURE_TLS
     net.setInsecure(); Serial.println("시각 동기 실패 → setInsecure (ALLOW_INSECURE_TLS=1)");
 #else
@@ -359,7 +364,6 @@ void setup() {
 #endif
   }
 
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMessage);
   mqtt.setKeepAlive(15);                           // 죽음을 ~30초 내 감지 (LWT)
   mqtt.setSocketTimeout(30);
@@ -372,11 +376,13 @@ void loop() {
   }
   if (!mqtt.connected()) {
     neopixelWrite(RGB_PIN, 40, 40, 0);             // 노랑 = 브로커 연결 시도 (빨강은 레드 노드 이름 색이라 피함)
-    Serial.print("MQTT 연결...");
+    if (broker.choose()) Serial.printf("우체국 바꿈 → %s\n", broker.name());
+    Serial.printf("MQTT 연결 (%s)...", broker.name());
     // LWT: 연결이 끊기면 브로커가 status에 offline을 retained로 남긴다
     String will = String("{\"online\":false,\"node\":\"" NODE_NAME "\"}");
-    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS,
-                     T_STATUS, 1, true, will.c_str())) {
+    bool ok = mqtt.connect(clientId.c_str(), broker.user(), broker.pass(), T_STATUS, 1, true, will.c_str());
+    ok = broker.result(ok);
+    if (ok) {
       Serial.println(" OK");
       mqtt.subscribe(T_CMD);
       mqtt.subscribe(T_ALL);
