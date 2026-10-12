@@ -25,9 +25,10 @@ try:
     import supertonic                  # pip install supertonic. 온디바이스 한국어 TTS (ONNX, CPU). 없으면 그 엔진만 빠진다
 except ImportError:
     supertonic = None
-from daijin_common import VOICE, REPO, sec, load_hooks, cloud_client, connect_with_retry
+from daijin_common import VOICE, REPO, sec, load_hooks, cloud_client, connect_with_retry, broker
 from nodes import NODES, spoken
 import selfdb
+import local_mind, fastpath
 
 HOME    = os.path.expanduser("~")
 # 헬퍼 스크립트(dev.sh 등)가 쓸 파이썬 = 브레인을 띄운 이 파이썬 (paho 가 깔려 있는 것). 에이전트의 셸과 local_hooks 가 물려받는다.
@@ -313,11 +314,12 @@ def _stt_engine():
         return "whisper_server"
     return "groq" if sec("GROQ_API_KEY") else "whisper"
 
-def _whisper_server_up():
+def _whisper_server_up(timeout=1.5):
+    """whisper 서버 포트가 열려 있나. 사설망 너머의 맥도 잡도록 1.5초 (꺼져 있으면 여기서 바로 판정해 Groq 로 넘긴다)."""
     url = sec("WHISPER_URL") or WHISPER_URL_DEFAULT
     try:
         host, port = urllib.parse.urlparse(url).hostname, urllib.parse.urlparse(url).port or 80
-        socket.create_connection((host, port), timeout=0.3).close()
+        socket.create_connection((host, port), timeout=timeout).close()
         return True
     except OSError:
         return False
@@ -363,8 +365,11 @@ def stt_whisper(wav):
     return r.stdout.strip(), None            # whisper-cli 는 신뢰도를 내주지 않는다
 
 def stt(wav):
-    """(전사, 신뢰도 또는 None). 순서: 고른 엔진 → (whisper_server 였으면 groq) → 로컬 whisper-cli."""
+    """(전사, 신뢰도 또는 None). 순서: 고른 엔진 → (whisper_server 였으면 groq, groq 였으면 닿는 whisper_server) → 로컬 whisper-cli."""
     engine = _stt_engine()
+    if engine == "whisper_server" and not _whisper_server_up():
+        print(f"  (whisper 서버에 닿지 않음 → {'Groq' if sec('GROQ_API_KEY') else '로컬 whisper'})")
+        engine = "groq" if sec("GROQ_API_KEY") else "whisper"
     if engine == "whisper_server":
         try:
             return stt_whisper_server(wav)
@@ -375,7 +380,13 @@ def stt(wav):
         try:
             return stt_groq(wav)
         except Exception as e:
-            print(f"  (Groq STT 실패: {e} → 로컬 whisper 폴백)")
+            alt = sec("WHISPER_URL") and _whisper_server_up()
+            print(f"  (Groq STT 실패: {e} → {'whisper 서버' if alt else '로컬 whisper'} 폴백)")
+            if alt:
+                try:
+                    return stt_whisper_server(wav)
+                except Exception as e2:
+                    print(f"  (whisper 서버 STT 도 실패: {e2} → 로컬 whisper)")
     if not os.path.exists(MODEL):
         print(f"  ⚠️ STT 불가: 로컬 모델 없음({MODEL}) — secrets에 GROQ_API_KEY를 넣거나 모델을 내려받아야 해")
         return "", None
@@ -476,14 +487,16 @@ def _claude_stream(text, resume_id, st):
 def _new_state():
     return {"ok": False, "yielded": False, "timeout": False, "noise": []}
 
-def brain_stream(text):
+def claude_think(text, out):
+    """Claude 로 한 턴. 문장을 yield 한다. 끝까지 아무 말도 못 하고 실패하면 out["failed"] 에 이유를 남기고 사과 문장은 내지 않는다
+    (다음 엔진으로 넘어갈 수 있게). 시간 초과와 인증 실패는 그 자체가 답이라 문장을 낸다."""
     global _resume_failures
     sid = load_session()
     st = _new_state()
     yield from _claude_stream(text, sid, st)
     if st["timeout"]:
         print(f"  ⚠️ 에이전트 {BRAIN_TIMEOUT_S}초 초과 → 중단")
-        yield "미안, 너무 오래 걸려서 멈췄어."
+        out["failed"] = "timeout"
         return
     if st["ok"] or st["yielded"]:
         _resume_failures = 0
@@ -491,7 +504,7 @@ def brain_stream(text):
     print(f"  ⚠️ 에이전트 실패: {' | '.join(st['noise'][-3:]) or '출력 없음'}")
     if any(_AUTH_FAIL.search(n) for n in st["noise"]):
         _alert("auth", "claude CLI 인증 실패: " + (st["noise"][-1][:160] if st["noise"] else ""))
-        yield AUTH_FAIL_SENTENCE
+        out["failed"] = "auth"
         return
     gone = bool(sid) and any(_SESSION_GONE in n for n in st["noise"])
     if sid and not gone:
@@ -505,7 +518,134 @@ def brain_stream(text):
             _resume_failures = 0
             return
         print(f"  ⚠️ 새 세션도 실패: {' | '.join(st['noise'][-3:]) or '출력 없음'}")
-    yield "미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"
+    out["failed"] = "error"
+
+# ---------- 생각 엔진 ----------
+# secrets 의 BRAIN_ENGINE: claude(기본) · local · 또는 "claude,local" 처럼 쉼표로 순서를 주면 앞의 엔진이 아무 말도 못 하고 실패할 때
+# 다음 엔진으로 넘어간다. local 은 OpenAI 호환 엔드포인트(Ollama 등)에 붙는 local_mind.py. 외부 AI 서비스 없이 생각하는 길.
+LOCAL_HISTORY_TURNS = 8
+LOCAL_HISTORY_S = 48 * 3600      # "어제 무슨 얘기 했지?"에 답하려면 하루 넘게 필요하다
+
+def engines():
+    names = [e.strip() for e in (sec("BRAIN_ENGINE") or "claude").split(",") if e.strip()]
+    return [e for e in names if e in ("claude", "local")] or ["claude"]
+
+DAY_WORDS = (("그저께", 2), ("그제", 2), ("엊그제", 2), ("어제", 1), ("어젯밤", 1), ("오늘", 0))
+DAY_TURNS = 6
+
+def local_history(text="", now=None):
+    """로컬 엔진의 대화 기억 (Claude 의 고정 세션 대신). (history, day_note) 를 돌려준다.
+    history: 최근 이틀의 에이전트 턴 최대 8개. 지금과 똑같은 질문의 예전 턴은 뺀다 (작은 모델이 예전 답을 그대로 베낀다).
+    day_note: 말에 "어제", "그저께" 같은 날이 나오면 그날의 대화를 최대 6턴 요약한 참고 글 (시스템 프롬프트에 붙는다)."""
+    now = time.time() if now is None else now
+    norm = lambda t: re.sub(r"[\s.,!?~]", "", t or "")
+    try:
+        eps = [e for e in selfdb.episodes_since(now - LOCAL_HISTORY_S) if e["kind"] in ("voice", "ask") and e["user_text"] and e["reply"]
+               and norm(e["user_text"]) != norm(text)]
+        recent = eps[-LOCAL_HISTORY_TURNS:]
+        day = next((d for w, d in DAY_WORDS if w in (text or "")), None)
+        note = ""
+        if day is not None:
+            lt = time.localtime(now)
+            start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)) - day * 86400
+            those = [e for e in selfdb.episodes_since(start) if e["ts"] < start + 86400 and e["kind"] == "voice"
+                     and e["user_text"] and e["reply"] and norm(e["user_text"]) != norm(text)][-DAY_TURNS:]
+            word = next(w for w, d in DAY_WORDS if w in (text or ""))
+            label = f"{word}({time.strftime('%m월 %d일', time.localtime(start))})"
+            if those:
+                note = (f" [{label} 대화 기록, 사람이 그날 일을 물으면 이걸 보고 답해] " +
+                        " / ".join(f"{time.strftime('%H:%M', time.localtime(e['ts']))} 사람: {e['user_text'][:40]} → 너: {e['reply'][:40]}" for e in those))
+            else:
+                note = f" [{label} 대화 기록: 없음]"
+    except Exception:
+        return [], ""
+    return [(e["user_text"], e["reply"]) for e in recent], note
+
+def local_think(text, out):
+    if not local_mind.reachable():
+        print(f"  (로컬 모델에 닿지 않음: {local_mind.url()})")
+        out["failed"] = "unreachable"
+        return
+    try:
+        history, day_note = local_history(text)
+        now_note = " [지금: " + time.strftime("%Y년 %m월 %d일 ", time.localtime()) + "월화수목금토일"[time.localtime().tm_wday] + "요일 " + time.strftime("%H:%M", time.localtime()) + "]"
+        reply = local_mind.think(text, system_extra=now_note + state_block() + day_note, history=history)
+    except Exception as e:
+        print(f"  ⚠️ 로컬 모델 실패: {e!r}")
+        out["failed"] = "error"
+        return
+    reply = EMOJI.sub("", reply).strip()
+    if not reply:
+        out["failed"] = "empty"
+        return
+    yield from split_sentences(reply)
+
+def split_sentences(text):
+    buf = text
+    while True:
+        m = _SENT_END.search(buf)
+        if not m:
+            break
+        sent = buf[:m.end()].strip(); buf = buf[m.end():]
+        if sent:
+            yield sent
+    if buf.strip():
+        yield buf.strip()
+
+_THINKERS = {"claude": claude_think, "local": local_think}
+_last_engine = {"name": None}
+
+def brain_stream(text):
+    """생각 한 턴. 엔진을 순서대로 시도하고, 한 문장이라도 나온 엔진에서 멈춘다."""
+    order = engines()
+    for i, name in enumerate(order):
+        out = {}
+        said = False
+        for sent in _THINKERS[name](text, out):
+            said = True
+            yield sent
+        if said:
+            _last_engine["name"] = name
+            return
+        reason = out.get("failed", "empty")
+        if i + 1 < len(order):
+            print(f"  (생각 엔진 {name} 실패: {reason} → {order[i + 1]} 로)")
+            continue
+        _last_engine["name"] = None
+        if reason == "timeout":
+            yield "미안, 너무 오래 걸려서 멈췄어."
+        elif reason == "auth":
+            yield AUTH_FAIL_SENTENCE
+        else:
+            yield "미안, 지금 생각이 잘 안 돼. 다시 말해줄래?"
+
+# ---------- 명령 지름길 ----------
+def fast_commands_on():
+    v = sec("FAST_COMMANDS")
+    if v in ("0", "1"):
+        return v == "1"
+    return engines()[0] == "local"          # 기본: 로컬 엔진이 앞일 때만 (Claude 경로의 동작은 바꾸지 않는다)
+
+def try_fastpath(text):
+    """규칙으로 분명한 명령이면 실행하고 말할 문장을 돌려준다. 아니면 None."""
+    if not fast_commands_on():
+        return None
+    clock = fastpath.answer_clock(text)
+    if clock:
+        print(f"  ⚡ 지름길(시계): {clock}")
+        return clock
+    parsed = fastpath.parse(text)
+    if not parsed:
+        return None
+    node, cmd = parsed
+    try:
+        r = subprocess.run(["bash", os.path.join(VOICE, "dev.sh"), node, cmd], capture_output=True, text=True, timeout=40)
+        out = (r.stdout + r.stderr).strip()
+        ok = r.returncode == 0 and out.startswith("OK")
+    except Exception as e:
+        out, ok = str(e), False
+    print(f"  ⚡ 지름길: {node} <- {cmd} → {out.splitlines()[0][:80] if out else ''}")
+    return fastpath.reply_for(node, cmd, ok, out)
 
 def mp3_to_pcm16k(mp3):
     """mp3 바이트 → PCM 16k mono 16bit 바이트. ffmpeg 파이프(맥·리눅스 공통), 없으면 macOS 내장 afconvert."""
@@ -743,7 +883,7 @@ def publish_no_reply(client):
     client.publish(T_AUDIO_OUT, bytes([int(time.time()) & 0xFF, 0, 0, 1 | 2]), qos=0)
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    print(f"✅ HiveMQ 연결 (rc={reason_code}) → 구독 {T_AUDIO_IN}, {T_SAY}, {T_ASK}")
+    print(f"✅ 우체국({broker()}) 연결 (rc={reason_code}) → 구독 {T_AUDIO_IN}, {T_SAY}, {T_ASK}")
     client.subscribe(T_AUDIO_IN, qos=1)
     client.subscribe(T_SAY, qos=1)
     client.subscribe(T_ASK, qos=1)
@@ -794,6 +934,11 @@ def handle_clip(client, pcm):
         turn.info["path"] = "hook"; turn.done(client)
         return
     # 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
+    fast = try_fastpath(user) if user else None
+    if fast:
+        turn.info["path"] = "fast"
+        speak_stream(client, iter([fast]), t0, turn)
+        return
     src = brain_stream(with_proactive_context(user)) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
     speak_stream(client, src, t0, turn)
 
@@ -852,7 +997,8 @@ def clear_alert():
 
 def brain_status(online=True):
     return json.dumps({"online": online, "ts": int(time.time()), "up_s": int(time.time() - _started),
-                       "turns": _turns, "model": sec("BRAIN_MODEL") or DEFAULT_MODEL,
+                       "turns": _turns, "engine": ",".join(engines()),
+                       "model": (sec("BRAIN_MODEL") or DEFAULT_MODEL) if engines()[0] == "claude" else local_mind.model(),
                        "stt": _stt_engine(), "tts": (_tts_order() or ["?"])[0],
                        "host": socket.gethostname()}, ensure_ascii=False)
 
@@ -992,7 +1138,7 @@ def main():
     _client = c
     threading.Thread(target=worker, args=(c,), daemon=True).start()
     threading.Thread(target=heartbeat, args=(c,), daemon=True).start()
-    print("🤖 daijin 브레인(MQTT) 시작 — HiveMQ 연결 중...")
+    print(f"🤖 daijin 브레인 시작 — 우체국 {broker()}, 생각 {','.join(engines())} — 연결 중...")
     connect_with_retry(c)
     c.loop_forever()
 

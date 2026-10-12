@@ -85,7 +85,20 @@ def extract_json(text):
     except ValueError:
         return None
 
+def reflect_engine():
+    """REFLECT_ENGINE 이 있으면 그것, 없으면 브레인의 첫 엔진 (claude | local)."""
+    import daijin_mqtt as dm
+    e = (sec("REFLECT_ENGINE") or "").strip()
+    return e if e in ("claude", "local") else dm.engines()[0]
+
 def run_model(prompt, timeout_s=300):
+    """(JSON dict 또는 None, 오류 문구). 엔진은 reflect_engine()."""
+    if reflect_engine() == "local":
+        import local_mind
+        try:
+            return extract_json(local_mind.complete_json(prompt, timeout=max(timeout_s, 600))), None
+        except Exception as e:
+            return None, f"로컬 모델 실패: {e!r}"
     cmd, env = _claude_cmd(prompt)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, env=env, stdin=subprocess.DEVNULL)
     try:
@@ -120,6 +133,9 @@ def apply(out, start, end, now=None):
     ids = {a["id"] for a in selfdb.asks_since(start) if a["ts"] < end}
     for lab in out.get("ask_labels") or []:
         aid = lab.get("ask_id")
+        if isinstance(aid, str):                  # 작은 모델은 "ask5" 처럼 프롬프트의 표기를 그대로 돌려준다
+            digits = re.sub(r"\D", "", aid)
+            aid = int(digits) if digits else None
         if aid not in ids:
             continue
         cls = lab.get("response_class")
@@ -167,7 +183,7 @@ def main():
         print(prompt); print("-" * 60)
     if not selfdb.episodes_since(start) and not selfdb.asks_since(start):
         print(f"{time.strftime('%Y-%m-%d', time.localtime(start))}: 돌아볼 것이 없다."); return 0
-    print(f"🌙 {time.strftime('%Y-%m-%d', time.localtime(start))} 반성 시작 (프롬프트 {len(prompt)}자)")
+    print(f"🌙 {time.strftime('%Y-%m-%d', time.localtime(start))} 반성 시작 (엔진 {reflect_engine()}, 프롬프트 {len(prompt)}자)")
     out, err = run_model(prompt)
     if out is None:
         print(f"  ⚠️ 모델 출력을 JSON 으로 읽지 못함: {err}")

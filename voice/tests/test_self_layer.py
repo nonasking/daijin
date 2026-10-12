@@ -475,7 +475,7 @@ class TestReflect(DbCase):
                              "replaces": "사용자는 아침 잔소리를 싫어한다"},
                             {"kind": "fact", "text": "사용자는 아침 잔소리를 싫어한다"},            # already known → skipped
                             {"kind": "weird", "text": "중요도 없는 것"}],
-               "ask_labels": [{"ask_id": aid, "response_class": "refused_context", "wanted_to_ask_less": True},
+               "ask_labels": [{"ask_id": f"ask{aid}", "response_class": "refused_context", "wanted_to_ask_less": True},
                               {"ask_id": 999, "response_class": "negative"}],
                "persona_new": "나는 다이진이야. 바쁠 땐 안 물어.", "persona_change_summary": "바쁠 때 안 묻기", "note": "오늘 한 줄"}
         done = reflect.apply(out, start, end, now=end)

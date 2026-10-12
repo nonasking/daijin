@@ -1,0 +1,5 @@
+# 다이진용 로컬 모델: qwen3.5:4b 에 문맥 길이만 늘린 것.
+# Ollama 기본 문맥(4096)에서는 "지금 상태" + 대화 기록 + 생각이 넘쳐 빈 답이 나왔다 (2026-10-11 실측). 16384 면 넉넉하다.
+# 만들기: ollama create daijin-qwen -f voice/ollama/Modelfile.daijin   그리고 secrets 에 LOCAL_LLM_MODEL=daijin-qwen
+FROM qwen3.5:4b
+PARAMETER num_ctx 16384
