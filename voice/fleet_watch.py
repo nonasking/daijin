@@ -9,7 +9,7 @@
 # 실행: python3 -u fleet_watch.py  (상시 구동은 LaunchAgent com.daijin.fleetwatch)
 
 import json, time
-from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
+from daijin_common import sec, load_hooks, cloud_client, connect_with_retry, broker
 from nodes import subject
 
 T_STATUS = "daijin/dev/+/status"
@@ -167,7 +167,8 @@ def main():
     c.on_connect = on_connect
     c.on_message = on_message
     print("👁️ fleet_watch 시작")
-    start_local_mirror()
+    if broker() == "cloud":
+        start_local_mirror()          # 이미 집 우체국에 붙어 있으면 미러가 자기 자신을 되먹여 무한히 돈다
     connect_with_retry(c)
     c.loop_start()
     try:

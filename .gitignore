@@ -30,6 +30,8 @@ IMG_*.HEIC
 voice/.daijin_session
 voice/daijin.db
 voice/daijin.db-*
+voice/.offline/
+voice/daijin.db.new
 voice/daijin.log
 voice/__pycache__/
 

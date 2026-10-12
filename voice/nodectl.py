@@ -13,14 +13,18 @@
 # 그래서 구독을 먼저 열고, retain 표시가 없는(=지금 막 발행된) 메시지만 이번 명령의 ACK 로 친다.
 import json, os, queue, socket, sys, threading, time
 import paho.mqtt.client as mqtt
-from daijin_common import sec, cloud_client
+from daijin_common import sec, cloud_client, broker_address, broker
 from nodes import resolve
 import fleet_status
 
 LOCAL = ("127.0.0.1", 1883)
 
 def local_up():
-    if os.environ.get("DAIJIN_BROKER") == "cloud":     # 로컬 브리지가 의심스러울 때 클라우드 직결로 확인: DAIJIN_BROKER=cloud bash dev.sh ...
+    """집 우체국을 쓸까. BROKER=local (비상 모드) 일 때만.
+    예전엔 집 mosquitto 가 떠 있기만 하면 그쪽을 먼저 봤는데, 노드가 집 우체국에 붙었다 클라우드로 돌아가면
+    집 쪽에 '오프라인' 유언이 retained 로 남고, 브리지로 오는 하트비트는 retained 가 아니라 덮어쓰지 못한다.
+    2026-10-12 실측: 레드가 클라우드에서 멀쩡한데 맥의 dev.sh 가 "오프라인 — 명령 안 보냄"."""
+    if broker() != "local":
         return False
     try:
         socket.create_connection(LOCAL, timeout=0.3).close()
@@ -38,7 +42,7 @@ class Broker:
             host, port = LOCAL
         else:
             c = cloud_client("")                      # 빈 id = 브로커가 임시 id 를 준다 (동시에 여러 번 불러도 충돌 없음)
-            host, port = sec("MQTT_CLOUD_HOST"), int(sec("MQTT_CLOUD_PORT"))
+            host, port = broker_address()
         self.c, self.msgs = c, queue.Queue()
         self._connected, self._subscribed = threading.Event(), threading.Event()
         c.on_connect = lambda *a: self._connected.set()
