@@ -16,7 +16,7 @@
        설치 후 케이블 재연결
 
 [ ] 4. 보드 정상 확인 — 01-blink
-       cd ~/esp32-iot/sketches
+       cd ~/dev/esp32-iot/sketches
        PORT=/dev/cu.usbXXXX        # 2번에서 본 포트
        arduino-cli upload --fqbn esp32:esp32:esp32s3 -p $PORT 01-blink
        → 온보드 RGB가 빨강·초록·파랑 깜빡이면 보드 정상 ✅
