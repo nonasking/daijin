@@ -59,7 +59,8 @@ def build_prompt(start, end):
         else:
             lines.append(f"[ep{e['id']} {t}] (다이진이 먼저 말함) {e['reply']}")
     ask_lines = [f"[ask{a['id']} {time.strftime('%H:%M', time.localtime(a['ts']))} {a['source']}/{a['drive']}] 말함: {a['text'][:80]}"
-                 f"  → 지금 분류: {a['response_class'] or '열림'}" + (f", 사람 답: {a['response_text'][:60]}" if a["response_text"] else "")
+                 f"  → 지금 분류: {a['response_class'] or '열림'}" +
+                 (f", 사람 답({int(a['latency_s'] or 0) // 60}분 {int(a['latency_s'] or 0) % 60}초 뒤): {a['response_text'][:60]}" if a["response_text"] else "")
                  for a in asks]
     mem_lines = [f"- ({m['kind']}, 중요도 {m['importance']}) {m['text']}" for m in mems][:40]
     day = time.strftime("%Y-%m-%d", time.localtime(start))
@@ -67,6 +68,10 @@ def build_prompt(start, end):
             "할 일 셋.\n"
             "1) 기억: 앞으로의 대화에 도움이 될 사실·선호·규칙·사건을 뽑아라. 사람이 한 말에 근거한 것만, 추측은 넣지 마라. 이미 있는 기억과 같은 뜻이면 replaces 로 대체하라. 하루에 0~5개면 충분하다.\n"
             "2) 장부: 네가 먼저 말 건 것(asks)마다, 사람의 답을 다시 읽고 분류가 맞는지 보라. 틀렸으면 고치고, 맞으면 null. 그리고 '그때 덜 묻고 싶었는데 물었는가'를 솔직하게 wanted_to_ask_less 로 답하라. 아무 근거가 없으면 null.\n"
+            "   분류 뜻: engaged=그 말에 이어 대화함, acknowledged=짧게 받아 줌(응, 알았어), refused_context=지금은 안 된다는 이유를 댐(바빠, 나중에), "
+            "negative=그만하라거나 짜증을 냄, unanswered=그 말에 대한 답이 없음. 창 안에 들어온 말이라도 네 말과 상관없는 새 이야기나 질문이면 거절이 아니다: "
+            "engaged 나 unanswered 로 두고, 거절(refused_context, negative)은 사람이 네 말을 물리친 게 분명할 때만 붙여라. "
+            "답은 네가 말한 뒤 10분 안에 들어온 말만이다: 그보다 뒤의 대화는 네 말에 대한 답이 아니니 unanswered 를 engaged 로 바꾸지 마라.\n"
             "3) 인격: 현재 인격 글을 읽고, 오늘 배운 것 때문에 고쳐야 할 문장이 있으면 글 전체를 다시 써서 persona_new 에 넣어라. 바꿀 이유가 분명할 때만. 사람이 승인해야 반영된다.\n\n"
             f"현재 인격 글:\n{cur['text'] if cur else '(아직 없음)'}\n\n"
             f"이미 있는 기억:\n" + ("\n".join(mem_lines) or "(없음)") + "\n\n"
