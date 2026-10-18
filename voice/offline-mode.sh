@@ -9,6 +9,9 @@
 #        bash voice/offline-mode.sh status
 #        bash voice/offline-mode.sh sync     (인터넷이 될 때) 서버의 자아 층 DB 를 이 기계로 복사해 둔다
 #                                           서버: secrets 의 SELF_SYNC_FROM=user@host (예: daijin@1.2.3.4)
+#                                           아직 서버로 올리지 않은 비상 모드 기록이 있으면 덮어쓰지 않고 멈춘다 (먼저 push)
+#        bash voice/offline-mode.sh push     (인터넷이 돌아오면) 지난 sync 뒤에 이 기계에서 쌓인 대화·장부·기억을 서버 DB 에 합친다
+#                                           (selfdb_merge.py: 파일을 덮어쓰지 않고 행을 합친다, 두 번 돌려도 안전)
 # 주의: 인터넷이 될 때 켜 두어도 서버 브레인과 부딪히지 않는다 (음성 토픽은 집↔클라우드 사이를 건너지 않는다).
 #       다만 기기가 클라우드에 붙어 있는 동안은 이쪽 브레인에 말이 오지 않는다.
 set -e
@@ -61,9 +64,25 @@ case "${1:-status}" in
     done ;;
   sync)
     FROM="$(sec SELF_SYNC_FROM)"; [ -n "$FROM" ] || { echo "secrets 에 SELF_SYNC_FROM=user@host 가 필요하다"; exit 1; }
+    if [ -f "$VOICE/daijin.db" ] && [ "${2:-}" != "--force" ]; then
+      n="$("$PY" "$VOICE/selfdb_merge.py" unpushed "$VOICE/daijin.db")"
+      [ "$n" = "0" ] || { echo "이 기계에 아직 서버로 올리지 않은 기록이 ${n}건 있다. 먼저: bash voice/offline-mode.sh push (버리려면 sync --force)"; exit 1; }
+    fi
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$FROM" 'cd ~/esp32-iot/voice && sqlite3 daijin.db ".backup /tmp/daijin-sync.db" 2>/dev/null || ~/venv/bin/python3 -c "import sqlite3; s=sqlite3.connect(\"daijin.db\"); d=sqlite3.connect(\"/tmp/daijin-sync.db\"); s.backup(d)"'
     scp -q "$FROM:/tmp/daijin-sync.db" "$VOICE/daijin.db.new" && ssh -o BatchMode=yes "$FROM" 'rm -f /tmp/daijin-sync.db'
     mv "$VOICE/daijin.db.new" "$VOICE/daijin.db"; rm -f "$VOICE/daijin.db-wal" "$VOICE/daijin.db-shm"
+    "$PY" "$VOICE/selfdb_merge.py" mark "$VOICE/daijin.db" pulled
     echo "자아 층 DB 를 $FROM 에서 가져왔다 ($(du -h "$VOICE/daijin.db" | cut -f1))" ;;
-  *) echo "사용: offline-mode.sh start|stop|status|sync"; exit 2 ;;
+  push)
+    FROM="$(sec SELF_SYNC_FROM)"; [ -n "$FROM" ] || { echo "secrets 에 SELF_SYNC_FROM=user@host 가 필요하다"; exit 1; }
+    [ -f "$VOICE/daijin.db" ] || { echo "이 기계에 자아 층 DB 가 없다"; exit 1; }
+    SINCE="$("$PY" "$VOICE/selfdb_merge.py" since "$VOICE/daijin.db")"
+    [ "$SINCE" != "0" ] || { echo "이 DB 는 sync 로 가져온 표시가 없다: 어디서부터 올릴지 몰라 멈춘다"; exit 1; }
+    NOW="$(date +%s)"; SNAP="$RUN/push-snapshot.db"; rm -f "$SNAP"
+    "$PY" -c "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d)" "$VOICE/daijin.db" "$SNAP"
+    scp -q "$SNAP" "$FROM:/tmp/daijin-push.db"
+    ssh -o BatchMode=yes "$FROM" "cd ~/esp32-iot/voice && ~/venv/bin/python3 selfdb_merge.py /tmp/daijin-push.db daijin.db $SINCE; rc=\$?; rm -f /tmp/daijin-push.db; exit \$rc"
+    "$PY" "$VOICE/selfdb_merge.py" mark "$VOICE/daijin.db" pushed "$NOW"; rm -f "$SNAP"
+    echo "$(date -r "$SINCE" '+%m-%d %H:%M') 이후의 기록을 $FROM 의 자아 층에 합쳤다" ;;
+  *) echo "사용: offline-mode.sh start|stop|status|sync|push"; exit 2 ;;
 esac
