@@ -252,7 +252,15 @@ class TestLedgerRules(unittest.TestCase):
         self.assertEqual(ledger_rules.apply_outcome(p, "unanswered", 9), {"backoff_level": 2})   # capped while presence is unknown
 
     def test_repair_lines_never_deny(self):
-        self.assertEqual(ledger_rules.repair_line("explain", trigger="레드가 7시간째 꺼져 있어서"), "아까는 레드가 7시간째 꺼져 있어서라서 말 걸었어.")
+        import time
+        now = time.mktime((2026, 10, 12, 18, 0, 0, 0, 0, -1))
+        self.assertEqual(ledger_rules.repair_line("explain", trigger="레드가 7시간째 꺼져 있어서"), "아까는 레드가 7시간째 꺼져 있어서 말 걸었어.")
+        self.assertEqual(ledger_rules.repair_line("explain", trigger="14시간째 얘기를 못 해서", asked_ts=now - 4 * 3600, now=now),
+                         "아까는 14시간째 얘기를 못 해서 말 걸었어.")
+        self.assertEqual(ledger_rules.repair_line("explain", trigger="14시간째 얘기를 못 해서", asked_ts=now - 22 * 3600, now=now),
+                         "어제는 14시간째 얘기를 못 해서 말 걸었어.")
+        self.assertEqual(ledger_rules.repair_line("explain", trigger="신호가 약해서", asked_ts=now - 3 * 86400, now=now),
+                         "지난번엔 신호가 약해서 말 걸었어.")
         self.assertEqual(ledger_rules.repair_line("promise", promise="저녁엔 안 물을게"), "앞으로는 저녁엔 안 물을게.")
         with self.assertRaises(ValueError):
             ledger_rules.repair_line("deny")
@@ -372,6 +380,10 @@ class TestInitiativeFilter(DbCase):
         self.addCleanup(setattr, initiative, "sec", orig)
         self.body = initiative.Body()
         self.noon = 1_800_000_000 - (time.localtime(1_800_000_000).tm_hour - 12) * 3600   # some day at 12:xx local
+        self.device_on(self.noon)
+
+    def device_on(self, at):
+        self.body.note(initiative.T_DEV_STATUS, b'{"online": true, "rssi": -55}', now=at)
 
     def _ok(self, name="contact", value=0.9, now=None, hooks=None):
         return initiative.admissible(name, value, self.body, hooks or types.SimpleNamespace(), now or self.noon)
@@ -381,7 +393,9 @@ class TestInitiativeFilter(DbCase):
         self.assertEqual(self._ok(hooks=types.SimpleNamespace(mute_reports=lambda: True)), (False, "muted_by_hooks"))
         night = self.noon + 12 * 3600
         self.assertEqual(self._ok(now=night), (False, "quiet_hours"))
+        self.device_on(night)
         self.assertEqual(self._ok("body", 0.95, now=night), (True, None))                      # danger overrides quiet
+        self.device_on(self.noon)
         for i in range(3):
             selfdb.open_ask("contact", "say", f"x{i}", initiative.SOURCE, ts=self.noon - 60)
         self.assertEqual(self._ok(), (False, "daily_budget"))
@@ -395,6 +409,27 @@ class TestInitiativeFilter(DbCase):
         self.assertEqual(self._ok(), (False, "brain_busy"))
         self.body.last_brain_turn = 0
         self.assertEqual(self._ok(), (True, None))
+
+    def test_no_one_to_hear_means_no_speaking(self):
+        self.assertEqual(self._ok(now=self.noon + initiative.DEVICE_FRESH_S + 1), (False, "device_offline"))   # heartbeats stopped
+        self.body.note(initiative.T_DEV_STATUS, b'{"online": false}', now=self.noon)                          # the broker's will
+        self.assertEqual(self._ok(), (False, "device_offline"))
+        self.body.device = None                                                                             # never seen
+        self.assertEqual(self._ok(), (False, "device_offline"))
+        self.device_on(self.noon)                                                                           # plugged back in
+        self.assertEqual(self._ok(), (True, None))
+
+    def test_a_line_held_back_for_a_dead_device_leaves_the_ledger_and_policy_alone(self):
+        c = FakeClient(); ledger = initiative.Ledger()
+        self.body.note(initiative.T_DEV_STATUS, b'{"online": false}', now=self.noon)
+        selfdb.episode("voice", user_text="안녕", ts=self.noon - 30 * 3600)
+        initiative.tick(c, self.body, ledger, types.SimpleNamespace(), dry_run=False, now=self.noon)
+        self.assertEqual(c.out, [])
+        self.assertEqual(selfdb.asks_since(0), [])
+        self.assertEqual(selfdb.policy_get("contact", initiative.DRIVES["contact"]["base_interval_s"])["backoff_level"], 0)
+        self.device_on(self.noon + 30)                                                                      # it says hello once it is on
+        initiative.tick(c, self.body, ledger, types.SimpleNamespace(), dry_run=False, now=self.noon + 30)
+        self.assertEqual([p for t, p in c.out if t == initiative.T_SAY], ["오늘은 아직 얘기를 못 했네."])
 
     def test_dry_run_tick_plans_without_speaking_and_keeps_the_interval(self):
         c = FakeClient()
@@ -438,12 +473,12 @@ class TestInitiativeFilter(DbCase):
         self.assertEqual(selfdb.policy_get("fleet", 1)["backoff_level"], 0)                       # fleet lines never touch policy
 
     def test_repair_is_prefixed_after_a_refusal(self):
-        selfdb.open_ask("contact", "say", "오늘은 아직 얘기를 못 했네.", initiative.SOURCE, trigger="t", ts=self.noon - 90000)
+        selfdb.open_ask("contact", "say", "오늘은 아직 얘기를 못 했네.", initiative.SOURCE, trigger="14시간째 얘기를 못 해서", ts=self.noon - 90000)
         selfdb.close_ask(selfdb.recent_asks(1)[0]["id"], "refused_context", response_text="바빠", response_ts=self.noon - 89990)
         info = initiative.compute_drives(self.body, self.noon - 20 * 3600, self.noon)["contact"][2]
         line, strategy = initiative.compose("contact", info, self.noon)
         self.assertEqual(strategy, "explain")
-        self.assertTrue(line.startswith("아까는 20시간째 얘기를 못 해서라서 말 걸었어. 오늘은"), line)
+        self.assertTrue(line.startswith("어제는 14시간째 얘기를 못 해서 말 걸었어. 오늘은"), line)    # the reason it spoke then, a day ago
 
 
 import reflect               # noqa: E402
@@ -517,3 +552,87 @@ class TestPersonaCli(DbCase):
         g = os.path.join(self.dir, "out.md")
         self.assertEqual(run("export", g)[0], 0)
         self.assertEqual(open(g).read(), "나는 다이진이야. 밤엔 조용해.\n")
+
+
+import selfdb_merge          # noqa: E402
+
+
+class TestOfflineMerge(unittest.TestCase):
+    """offline-mode.sh push: rows made on the Mac after the last sync go into the server DB without clobbering it."""
+
+    def setUp(self):
+        self.addCleanup(selfdb.use, None)
+        d = tempfile.mkdtemp()
+        self.server, self.mac = os.path.join(d, "server.db"), os.path.join(d, "mac.db")
+        self.t0 = 1_800_000_000
+        selfdb.use(self.server)                                     # the shared past: both sides have it
+        old_ask = selfdb.open_ask("contact", "say", "오늘은 아직 얘기를 못 했네.", "initiative", trigger="t", ts=self.t0 - 500)
+        selfdb.add_memory("fact", "사람은 커피를 좋아한다", ts=self.t0 - 400)
+        selfdb.policy_update("contact", base_interval_s=28800, backoff_level=1, last_ask_ts=self.t0 - 500, avoid_hours='["14"]')
+        selfdb.use(None)
+        import sqlite3
+        src, dst = sqlite3.connect(self.server), sqlite3.connect(self.mac)
+        src.backup(dst); src.close(); dst.close()                   # offline-mode.sh sync (backup API, WAL included)
+        selfdb_merge.mark(self.mac, "pulled", ts=self.t0)
+        self.old_ask = old_ask
+
+    def test_offline_rows_are_added_with_new_ids_and_links(self):
+        selfdb.use(self.server)                                     # the server kept running meanwhile
+        selfdb.episode("voice", user_text="서버에서 한 말", reply="응", ts=self.t0 + 50)
+        selfdb.use(self.mac)                                        # the Mac, offline
+        a = selfdb.open_ask("contact", "say", "어제는 바빴지?", "initiative", trigger="u", ts=self.t0 + 100)
+        selfdb.close_ask(a, "engaged", response_text="응 좀", response_ts=self.t0 + 110)
+        e = selfdb.episode("voice", user_text="응 좀", reply="고생했어", ts=self.t0 + 112, ask_id=a)
+        selfdb.add_memory("event", "사람이 부산 출장을 다녀왔다", source_episode=e, ts=self.t0 + 200)
+        selfdb.policy_update("contact", backoff_level=0, last_ask_ts=self.t0 + 100, avoid_hours='["09"]')
+        selfdb.use(None)
+        self.assertEqual(selfdb_merge.unpushed(self.mac), 3)
+
+        done = selfdb_merge.merge(self.mac, self.server, self.t0)
+        self.assertEqual((done["asks"], done["episodes"], done["memories"], done["policy"]), (1, 1, 1, 1))
+        selfdb.use(self.server)
+        eps = selfdb.episodes_since(self.t0)
+        self.assertEqual([x["user_text"] for x in eps], ["서버에서 한 말", "응 좀"])
+        ask = selfdb.recent_asks(1)[0]
+        self.assertEqual((ask["text"], ask["response_class"]), ("어제는 바빴지?", "engaged"))
+        self.assertEqual(eps[1]["ask_id"], ask["id"])               # the link follows the new id
+        mem = [m for m in selfdb.valid_memories() if "부산" in m["text"]][0]
+        self.assertEqual(mem["source_episode"], eps[1]["id"])
+        pol = selfdb.policy_get("contact", 28800)
+        self.assertEqual((pol["backoff_level"], pol["last_ask_ts"]), (0, self.t0 + 100))
+        self.assertEqual(json.loads(pol["avoid_hours"]), ["09", "14"])   # hours to avoid are joined
+        self.assertEqual(len(selfdb.recent_asks(10)), 2)            # the shared past is not doubled
+
+        again = selfdb_merge.merge(self.mac, self.server, self.t0)  # running it twice is harmless
+        self.assertEqual((again["asks"], again["episodes"], again["memories"]), (0, 0, 0))
+
+    def test_a_memory_replaced_offline_is_closed_on_the_server_too(self):
+        selfdb.use(self.mac)
+        old = [m for m in selfdb.valid_memories()][0]
+        selfdb.add_memory("fact", "사람은 요즘 차를 마신다", supersedes=old["id"], ts=self.t0 + 300)
+        selfdb.use(None)
+        done = selfdb_merge.merge(self.mac, self.server, self.t0)
+        self.assertEqual((done["memories"], done["retired"]), (1, 1))
+        selfdb.use(self.server)
+        self.assertEqual([m["text"] for m in selfdb.valid_memories()], ["사람은 요즘 차를 마신다"])
+
+    def test_the_server_keeps_its_newer_policy(self):
+        selfdb.use(self.server)
+        selfdb.policy_update("contact", backoff_level=3, last_ask_ts=self.t0 + 900)
+        selfdb.use(self.mac)
+        selfdb.policy_update("contact", backoff_level=0, last_ask_ts=self.t0 + 100)
+        selfdb.use(None)
+        selfdb_merge.merge(self.mac, self.server, self.t0)
+        selfdb.use(self.server)
+        self.assertEqual(selfdb.policy_get("contact", 28800)["backoff_level"], 3)
+
+    def test_sync_marks_and_nothing_unpushed_after_a_push(self):
+        self.assertEqual(selfdb_merge.last_sync(self.mac), self.t0)
+        self.assertEqual(selfdb_merge.unpushed(self.mac), 0)
+        selfdb.use(self.mac)
+        selfdb.episode("voice", user_text="비상 모드에서", reply="응", ts=self.t0 + 10)
+        selfdb.use(None)
+        self.assertEqual(selfdb_merge.unpushed(self.mac), 1)
+        selfdb_merge.mark(self.mac, "pushed", ts=self.t0 + 20)
+        self.assertEqual(selfdb_merge.unpushed(self.mac), 0)
+        self.assertEqual(selfdb_merge.last_sync(self.server), None)    # the marks stay on the Mac

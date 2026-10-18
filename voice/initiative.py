@@ -35,6 +35,7 @@ DRIVES = {
     "body":      {"threshold": 0.5, "base_interval_s": 2 * 3600,  "channel": "say"},
 }
 BODY_DANGER = 0.9      # 이 위면 조용한 시간에도 말한다 (온도 68도쯤)
+DEVICE_FRESH_S = 180   # 기기는 60초마다 상태를 보낸다. 이만큼 소식이 없으면 꺼진 것으로 보고 말을 걸지 않는다
 
 def clamp(x):
     return max(0.0, min(1.0, x))
@@ -137,7 +138,15 @@ def admissible(name, value, body, hooks, now=None):
         return False, "avoid_hour"
     if now - body.last_brain_turn < 30:
         return False, "brain_busy"
+    if not device_listening(body, now):
+        return False, "device_offline"
     return True, None
+
+def device_listening(body, now):
+    """기기가 켜져 있어 말이 실제로 들리나. 꺼진 기기에 한 말은 아무도 못 듣는데 장부엔 '답 없음'으로 남아
+    간격만 늘린다 (2026-10-15 08:00 실제로 그랬다: 기기가 꺼진 채 contact 가 말했고 backoff 가 2 로 올랐다)."""
+    d = body.device
+    return bool(d) and d.get("online") is not False and now - body.device_rx < DEVICE_FRESH_S
 
 # ---------- 장부 관찰 ----------
 class Ledger:
@@ -220,7 +229,8 @@ def compose(name, info, now):
         promise = rules.promise_for({"backoff_level": pol["backoff_level"], "avoid_hours": rules.avoid_hours(pol) or None,
                                      "muted_until": pol["muted_until"]})
         if prev[0]["repair_strategy"] != "explain":
-            repair = ("explain", rules.repair_line("explain", trigger=info["trigger"]))
+            repair = ("explain", rules.repair_line("explain", trigger=prev[0]["trigger"] or info["trigger"],
+                                                   asked_ts=prev[0]["ts"], now=now))
         else:
             repair = ("promise", rules.repair_line("promise", promise=promise))
     line = info["line"]
@@ -230,6 +240,8 @@ def compose(name, info, now):
         line = line + f" (먼저 이렇게 사과해 줘: {repair[1]})"
     return line, (repair[0] if repair else None)
 
+_held = {}     # drive -> 지난 틱에 말 안 한 이유. 같은 이유가 이어지면 로그를 되풀이하지 않는다 (기기가 꺼진 사흘에 2천 줄이 쌓였다)
+
 def tick(client, body, ledger, hooks, dry_run, now=None):
     now = time.time() if now is None else now
     drives = compute_drives(body, selfdb.last_voice_ts(), now)
@@ -238,9 +250,11 @@ def tick(client, body, ledger, hooks, dry_run, now=None):
         selfdb.record_drive(name, value, inputs, ts=now)
         ok, why = admissible(name, value, body, hooks, now)
         if not ok:
-            if value >= DRIVES[name]["threshold"]:
-                print(f"[{time.strftime('%H:%M:%S')}] {name}={value:.2f} 말 안 함: {why}")
+            if value >= DRIVES[name]["threshold"] and _held.get(name) != why:
+                print(f"[{time.strftime('%H:%M:%S')}] {name}={value:.2f} 말 안 함: {why} (바뀔 때까지 다시 안 적음)")
+            _held[name] = why
             continue
+        _held.pop(name, None)
         if spoke:
             continue                       # 한 틱에 하나만
         line, repair = compose(name, info, now)

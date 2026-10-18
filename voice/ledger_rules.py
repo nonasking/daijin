@@ -82,10 +82,20 @@ def apply_outcome(policy, response_class, asked_hour, repairs_in_a_row=0, now=No
 def needs_repair(last_class):
     return last_class in ("negative", "refused_context")
 
-def repair_line(strategy, trigger=None, promise=None):
-    """복구 한 문장. explain 은 왜 말 걸었는지, promise 는 무엇이 바뀌는지. 부인은 없다."""
+def when_word(asked_ts, now):
+    """지난번 말을 건 때를 가리키는 말: 오늘이면 "아까는", 어제면 "어제는", 그 전이면 "지난번엔"."""
+    days = (time.localtime(now).tm_yday - time.localtime(asked_ts).tm_yday) % 366 if now - asked_ts < 7 * 86400 else 7
+    return "아까는" if days == 0 else "어제는" if days == 1 else "지난번엔"
+
+def repair_line(strategy, trigger=None, promise=None, asked_ts=None, now=None):
+    """복구 한 문장. explain 은 지난번에 왜 말 걸었는지, promise 는 무엇이 바뀌는지. 부인은 없다.
+    trigger 는 "…해서" 꼴 (예: "14시간째 얘기를 못 해서"). 2026-10-12 실제로 "못 해서라서"가 나가서 이음을 고쳤다."""
     if strategy == "explain":
-        return f"아까는 {trigger}라서 말 걸었어." if trigger else "아까는 걱정돼서 말 걸었어."
+        when = when_word(asked_ts, time.time() if now is None else now) if asked_ts else "아까는"
+        if not trigger:
+            return f"{when} 걱정돼서 말 걸었어."
+        reason = trigger if trigger.endswith("서") else trigger + "라서"
+        return f"{when} {reason} 말 걸었어."
     if strategy == "promise":
         return f"앞으로는 {promise}." if promise else "앞으로는 덜 물을게."
     raise ValueError(strategy)
