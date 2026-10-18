@@ -40,3 +40,4 @@ voice/__pycache__/
 *.pyc
 voice/fleetwatch.log
 voice/archive/
+voice/.vadlab/

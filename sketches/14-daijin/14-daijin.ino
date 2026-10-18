@@ -1,5 +1,5 @@
 // 14-daijin — AI 음성 대화 친구 디바이스 (Phase 2)
-// BOOT 을 한 번 누르면 녹음 시작. 말이 끝나면(0.7초 무음) 알아서 끝나고, 한 번 더 눌러도 끝 (최소 1초, 12초에서 자동 컷)
+// BOOT 을 한 번 누르면 녹음 시작. 말이 끝나면(1.5초 무음) 알아서 끝나고, 한 번 더 눌러도 끝 (최소 1초, 20초에서 자동 컷)
 // → IMA ADPCM 청크로 HiveMQ 발행(daijin/audio/in)
 // 브레인 답(daijin/audio/out ADPCM 청크)을 받는 대로 지터 버퍼를 거쳐 스피커로 스트리밍 재생
 // 프로토콜: docs/chunking-protocol.md — [clipId:1][seq:2 BE][flags:1 (bit0=마지막, bit1=ADPCM)][ADPCM<=2048B]
@@ -151,7 +151,7 @@ void hush(int ms) {                             // 무음 (팝 방지, 음 사�
 void chirp() {                                  // "띠링" = 준비 완료 (LTE에선 연결에 30초+ 걸려 소리로 알림)
   tone16(660.f, 6000, 100); tone16(980.f, 6000, 100); hush(16);
 }
-void cutChirp() {                               // "뚜-뚜" 낮게 두 번 = 12초 자동컷. 이 소리 들리면 이미 전송됐으니 버튼 누르지 말 것
+void cutChirp() {                               // "뚜-뚜" 낮게 두 번 = 최대 길이 자동컷. 이 소리 들리면 이미 전송됐으니 버튼 누르지 말 것
   for (int r = 0; r < 2; r++) { tone16(440.f, 5000, 100); hush(100); }
 }
 void softChirp(float hz, int ms) {              // 낮은 단음: 320Hz 짧게 = "답할 것 없음", 220Hz 길게 = 전송 실패
@@ -270,7 +270,7 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
 }
 
 // ---------- 녹음(탭-토글): BOOT 한 번 = 시작, 한 번 더 = 종료·전송 ----------
-// 고정 4초의 문제(말 시작 전 낭비·끝 잘림 → STT 오인식) 해결. 최소 1초, 최대 12초 자동컷 (REC_MIN_B / REC_MAX_B).
+// 고정 4초의 문제(말 시작 전 낭비·끝 잘림 → STT 오인식) 해결. 최소 1초, 최대 20초 자동컷 (REC_MIN_B / REC_MAX_B).
 //
 // 캡처 태스크 분리 (2026-08-16): I2SClass의 DMA 버퍼는 6×240프레임 ≈ 90ms 고정이라,
 // 같은 루프에서 TLS 발행(수십~수백 ms 블로킹)을 하면 그동안의 샘플이 유실됐다
@@ -288,35 +288,51 @@ inline size_t capAvail() { return capW - capR; }
 // (증상: 종료 탭을 했는데도 12초 자동컷까지 녹음 → 긴 무음이 붙어 STT 가 문장 끝을 흘림).
 // 캡처 태스크는 전송과 상관없이 32ms 마다 돌고, 그보다 짧은 눌림은 인터럽트가 잡아 둔다.
 const size_t REC_MIN_B = SR * 1 * 2;                 // 최소 1초: 그 전의 눌림(시작 탭의 떨림 포함)은 버린다
-const size_t REC_MAX_B = SR * 12 * 2;                // 최대 12초 자동컷 (PCM 바이트)
+#ifndef REC_MAX_S
+#define REC_MAX_S 20                                 // 12초였다: 보정용 대화 녹음 10개 중 2개가 12초에 닿았고 하나는 말 도중에 잘렸다
+#endif
+const size_t REC_MAX_B = SR * REC_MAX_S * 2;         // 최대 길이 자동컷 (PCM 바이트). 녹음은 흘려보내므로 RAM 과 상관없다
 static volatile bool btnEdge = false;                // BOOT 이 눌리는 순간 인터럽트가 세운다
 static volatile bool stopTap = false;                // 녹음이 탭으로 끝났다
 void IRAM_ATTR onBtnDown() { btnEdge = true; }
 
-// ---------- 발화 끝 자동 감지 (에너지 VAD, 2026-10-08) ----------
+// ---------- 발화 끝 자동 감지 (에너지 VAD) ----------
 // "말이 끝나고 탭하기까지의 공백"을 없앤다. 캡처 태스크가 32ms 블록마다 RMS 를 재고 바닥 소음을 따라간다.
-// 말소리 블록(바닥의 4배이자 VAD_MIN_SPEECH 이상)이 누적 300ms 를 넘긴 뒤, 700ms 동안 조용하면(바닥의 2.5배 아래) 녹음을 끝낸다.
-// 바닥은 말소리가 아닌 블록에서만 갱신한다 (말하는 동안 바닥이 따라 올라가 문장 중간에 끊기는 일을 막는다).
-// 최소 1초·최대 12초·탭 종료는 그대로. 시끄러운 곳에서 못 끝내면 탭하면 되고, -DVAD_AUTO_STOP=0 으로 끌 수 있다.
-// 아직 실기 보정 전: 로그의 "말 %ums · 바닥 %.0f · 최고 %d" 로 문턱을 맞춘다. (브레인 쪽 실측: 발화 상위창 RMS 1500~9000)
+// 말소리 블록(바닥의 4배이자 VAD_ON_MIN 이상)이 누적 300ms 를 넘긴 뒤, 연속으로 VAD_SILENCE_MS 동안 조용하면
+// (바닥의 2.5배이자 VAD_OFF_MIN 아래) 녹음을 끝낸다. 최소 1초·최대 길이·탭 종료는 그대로, -DVAD_AUTO_STOP=0 으로 끈다.
+//
+// 실기 보정 (탭으로 끝낸 실제 대화 녹음 10개를 voice/vad_lab.py 로 다시 돌려 봄, vad1 → vad2):
+//   예전 설정(0.7초, 문턱 400/240)은 10개 중 7개를 말 도중에 끊었다. 원인 셋:
+//   - 생각하며 쉬는 틈이 0.7초보다 길다: 말 도중 0.5초 넘는 쉼이 20번, 1초 넘는 쉼이 4번 (가장 긴 것 1.4초, "그렇지. … 왜냐하면").
+//   - 이 마이크 거리에서 말소리는 블록 RMS 100~1700, 쉼은 10~60 이다. 문턱 바닥값 400/240 은 작은 말끝을 침묵으로 셌다.
+//   - 바닥이 "말소리 문턱 아래인 블록"에서 올라가서, 길게 말하는 동안 작은 말소리에 끌려 44 → 124 까지 올랐다
+//     (그러면 문턱도 따라 올라 보통 크기의 말까지 말로 안 세었다). 이제는 무음 문턱 아래인 블록에서만 올라간다.
+//   새 설정(1.5초, 150/80, 연속 무음, 조용한 블록에서만 바닥 갱신)은 같은 녹음에서 말 도중 끊김 0개, 말이 끝나고 1.5초 뒤에 끝낸다.
+//   더 빨리 끝내고 싶으면 예전처럼 탭하면 된다. 문턱이 낮아진 만큼 시끄러운 곳(조용할 때도 RMS 80 을 자주 넘는 곳)에선
+//   무음이 이어지지 않아 알아서 안 끝날 수 있다: 그땐 탭, 아니면 최대 길이에서 끝난다.
+//   문턱을 바꿀 땐 vad_lab.py 의 변형에 먼저 넣어 녹음으로 확인한다 (이 방의 조용한 블록: 중앙 26, 99% 71).
 #ifndef VAD_AUTO_STOP
 #define VAD_AUTO_STOP 1
 #endif
-const uint32_t VAD_SPEECH_MS  = 300;
-const uint32_t VAD_SILENCE_MS = 700;
-const float    VAD_MIN_SPEECH = 400.f;               // 이보다 조용한 블록은 말소리로 보지 않는다 (x2 게인 기준)
+#ifndef VAD_SILENCE_MS
+#define VAD_SILENCE_MS 1500
+#endif
+const uint32_t VAD_SPEECH_MS = 300;
+const float    VAD_ON_MIN    = 150.f;                // 이보다 조용한 블록은 말소리로 보지 않는다 (x2 게인 기준)
+const float    VAD_OFF_MIN   = 80.f;                 // 이보다 조용해야 무음으로 센다
 static volatile bool stopVad = false;                // 녹음이 무음 감지로 끝났다
 static uint32_t vadSpeechMs = 0, vadSilenceMs = 0;
 static float vadFloor = 0; static int vadPeak = 0;
 
 void vadReset() { stopVad = false; vadSpeechMs = vadSilenceMs = 0; vadFloor = 0; vadPeak = 0; }
 void vadBlock(float rms, uint32_t ms) {
-  float onTh  = fmaxf(VAD_MIN_SPEECH, vadFloor * 4.f);
-  float offTh = fmaxf(VAD_MIN_SPEECH * 0.6f, vadFloor * 2.5f);
+  float onTh  = fmaxf(VAD_ON_MIN, vadFloor * 4.f);
+  float offTh = fmaxf(VAD_OFF_MIN, vadFloor * 2.5f);
   if (vadFloor <= 0.f || rms < vadFloor) vadFloor = rms;                 // 바닥은 바로 내려가고
-  else if (rms < onTh) vadFloor += (rms - vadFloor) * 0.05f;             // 말소리가 아닐 때만 천천히 올라간다
+  else if (rms < offTh) vadFloor += (rms - vadFloor) * 0.05f;            // 조용한 블록에서만 천천히 올라간다
   if (rms > onTh) { vadSpeechMs += ms; vadSilenceMs = 0; if (rms > vadPeak) vadPeak = (int)rms; }
   else if (rms < offTh) vadSilenceMs += ms;
+  else vadSilenceMs = 0;                                                 // 작은 말소리·숨: 쉼이 아니다 (연속된 무음만 센다)
 }
 
 void captureTask(void*) {
@@ -385,7 +401,7 @@ void recordAndPublish() {
       lastSent = last;
     }
   }
-  bool autoCut = !stopTap && !stopVad;                         // 탭도 무음 감지도 아니면 12초 상한에 걸린 것
+  bool autoCut = !stopTap && !stopVad;                         // 탭도 무음 감지도 아니면 최대 길이에 걸린 것
   led(40,40,0);                                                // 노랑 = 전송 마무리
   face(F_UPLOAD);
   if (capDrops) logf("경고: 캡처 링 포화로 %u 샘플 유실\n", (unsigned)capDrops);
