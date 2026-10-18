@@ -23,6 +23,8 @@ T_SAY    = "daijin/say"
 STALE_S    = 90     # 하트비트(30초 주기)가 이 시간 이상 끊기면 STALE
 COOLDOWN_S = 60     # 노드별 최소 보고 간격
 BASELINE_S = 3      # 시작 후 이 시간 동안의 retained는 베이스라인 (무보고)
+OFF_GRACE_S = 90    # 꺼짐은 이만큼 기다렸다 말한다. 그 안에 다시 켜지면 둘 다 말하지 않는다 (재부팅·플래시·케이블 바꾸기).
+                    # 2026-10-12 실측: 보드를 꽂았다 뺐다 하는 하루 동안 "꺼졌어/켜졌어"를 27번 말했다.
 
 started = time.time()
 nodes = {}   # name -> {"online": bool, "ts": float(수신시각), "beat": int(하트비트 ts), "alerted_at": float, "stale_alerted": bool}
@@ -123,9 +125,22 @@ def on_message(client, userdata, msg):
         print(f"[{time.strftime('%H:%M:%S')}] 베이스라인 {node}: {'ONLINE' if online else 'OFFLINE'}")
         return
     if was_online and not online:
-        report(client, node, lines_offline(node), "off")
+        nodes[node]["off_since"] = now                    # 바로 말하지 않는다: pending_check 가 OFF_GRACE_S 뒤에 말한다
+        print(f"[{time.strftime('%H:%M:%S')}] {node} 꺼짐, {OFF_GRACE_S}초 기다렸다 보고")
     elif (not was_online) and online:
-        report(client, node, lines_online(node, d.get("up_s", "?")), "on")
+        if nodes[node].pop("off_since", None) is not None:
+            print(f"[{time.strftime('%H:%M:%S')}] {node} 잠깐 꺼졌다 다시 켜짐 (업타임 {d.get('up_s', '?')}초), 보고 안 함")
+        else:
+            report(client, node, lines_online(node, d.get("up_s", "?")), "on")
+
+def pending_check(client, now=None):
+    """OFF_GRACE_S 동안 다시 켜지지 않은 노드의 꺼짐을 이제 말한다."""
+    now = time.time() if now is None else now
+    for node, st in nodes.items():
+        since = st.get("off_since")
+        if since is not None and not st.get("online") and now - since >= OFF_GRACE_S:
+            st.pop("off_since")
+            report(client, node, lines_offline(node), "off")
 
 def stale_check(client):
     now = time.time()
@@ -174,6 +189,7 @@ def main():
     try:
         while True:
             time.sleep(15)
+            pending_check(c)
             stale_check(c)
     except KeyboardInterrupt:
         pass

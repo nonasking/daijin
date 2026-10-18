@@ -710,12 +710,23 @@ class TestFleetWatch(unittest.TestCase):
     def test_going_offline_and_coming_back_are_spoken_once_each_in_plain_words(self):
         fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=100))
         fw.on_message(self.c, None, self.Msg("dev1", online=False))
+        self.assertEqual(self.c.said, [])                                   # not yet: it may be a reboot
+        fw.pending_check(self.c, now=fw.time.time() + fw.OFF_GRACE_S + 1)
         self.assertEqual(self.c.said, ["레드가 방금 꺼졌어. 전원이나 네트워크를 확인해 줘."])
+        fw.pending_check(self.c, now=fw.time.time() + fw.OFF_GRACE_S + 30)   # said once
         fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=3))
         self.assertEqual(self.c.said[-1], "레드가 다시 켜졌어. 방금 재부팅한 것 같아.")
-        fw.on_message(self.c, None, self.Msg("dev1", online=False))        # flapping inside the cooldown
         self.assertEqual(len(self.c.said), 2)
         self.assertEqual(self.c.asked, [])                                  # the agent is not involved
+
+    def test_a_short_outage_is_not_news(self):
+        fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=100))
+        for _ in range(5):                                                  # unplugged and replugged, flashed, rebooted
+            fw.on_message(self.c, None, self.Msg("dev1", online=False))
+            fw.pending_check(self.c, now=fw.time.time() + 10)
+            fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=4))
+        fw.pending_check(self.c, now=fw.time.time() + fw.OFF_GRACE_S + 1)
+        self.assertEqual(self.c.said, [])
 
     def test_a_long_uptime_return_is_not_called_a_reboot(self):
         fw.on_message(self.c, None, self.Msg("dev2", online=False))
@@ -726,6 +737,7 @@ class TestFleetWatch(unittest.TestCase):
         fw.sec = lambda k: "ask" if k == "FLEET_REPORT" else ""
         fw.on_message(self.c, None, self.Msg("dev1", online=True, ts=0, up_s=100))
         fw.on_message(self.c, None, self.Msg("dev1", online=False))
+        fw.pending_check(self.c, now=fw.time.time() + fw.OFF_GRACE_S + 1)
         self.assertEqual(self.c.said, [])
         self.assertEqual(len(self.c.asked), 1)
         self.assertIn("[시스템 알림]", self.c.asked[0])
