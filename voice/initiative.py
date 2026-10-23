@@ -11,9 +11,9 @@
 #   복구   : 직전이 거절이었던 추동으로 다시 말할 때는 설명이나 약속 한 문장을 앞에 붙인다. 부인은 없다.
 #
 # 실행: python3 -u initiative.py [--dry-run] [--once]   (상시 구동은 systemd daijin-initiative)
-import argparse, json, sys, threading, time
+import argparse, json, re, time
 from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
-from nodes import NODES, subject, spoken
+from nodes import spoken, mentioned
 import selfdb, ledger_rules as rules
 
 T_DEV_STATUS  = "daijin/status"
@@ -83,7 +83,10 @@ def compute_drives(body, last_voice_ts, now=None):
                       {"trigger": f"{int((gap or 0) // 3600)}시간째 얘기를 못 해서", "line": "오늘은 아직 얘기를 못 했네."})
     # node_loss: 가장 오래 꺼져 있는 노드. 24시간이면 1. 6시간(0.25)부터 후보.
     worst, worst_h = None, 0.0
+    excused = selfdb.node_excused()
     for nid, t0 in body.offline_since.items():
+        if nid in excused:
+            continue                               # 사람이 일부러 꺼 뒀다고 한 노드는 걱정하지 않는다
         h = (now - t0) / 3600
         if h > worst_h:
             worst, worst_h = nid, h
@@ -149,6 +152,29 @@ def device_listening(body, now):
     return bool(d) and d.get("online") is not False and now - body.device_rx < DEVICE_FRESH_S
 
 # ---------- 장부 관찰 ----------
+# ---------- "일부러 꺼 뒀어" ----------
+# 2026-10-15: 사람이 "일부러 꺼졌으니까 신경 쓰지 말라"고 했는데, 반성은 이걸 기억으로 남겼지만 node_loss 는 계속 1.0 이었다.
+# 말에 의도(일부러, 꺼 뒀어/놨어)와 꺼짐이 함께 있으면 노드를 '일부러 꺼 둠'으로 표시한다. 노드 이름이 있으면 그 노드, 없으면 지금 꺼진 노드 전부.
+INTENT = re.compile(r"일부러|꺼\s?(뒀|둔|놨|놓|둘|두)|꺼\s?놓")
+OFF = re.compile(r"꺼|끈|껐|전원")
+
+def excuse_from_text(text, now=None):
+    """말에서 '일부러 꺼 둠'을 읽어 node_state 에 표시한다. 표시한 노드 집합을 돌려준다.
+    "이따 레드 꺼 둘게"처럼 아직 켜진 노드도 표시되는데, 켜진 동안은 node_excused 가 세지 않고(online=0 만) 다시 켜지면
+    node_state_set 이 지우므로, 말한 대로 꺼졌을 때만 효력이 난다."""
+    if not (INTENT.search(text) and OFF.search(text)) or re.search(r"안 ?꺼|끄지 ?마|켜 ?(줘|놔|둬)", text):
+        return set()
+    named = mentioned(text)
+    if not named and re.search(r"다이진|daijin|너를|널 ", text, re.I):
+        return set()                               # 노드가 아니라 다이진 자신을 꺼 뒀다는 말: 노드들은 그대로 걱정한다
+    off_now = {nid for nid, (online, _) in selfdb.node_state_all().items() if not online}
+    targets = named or off_now
+    for nid in targets:
+        selfdb.node_excuse(nid, now)
+    if targets:
+        print(f"[{time.strftime('%H:%M:%S')}] 일부러 꺼 둠: {', '.join(spoken(n) for n in sorted(targets))} ← {text[:40]!r}")
+    return targets
+
 class Ledger:
     """버스에서 먼저 말한 것을 보고 asks 를 열고, 다음 말로 닫는다. 자기 발행분은 drive 이름을 붙인다."""
     def __init__(self):
@@ -173,6 +199,7 @@ class Ledger:
             if text.startswith("[ask]"):
                 return
             self.settle(text, now)
+            excuse_from_text(text, now)
 
     def _open(self, channel, text, now, source=None, drive=None):
         label = self.pending_label.pop(text, None)

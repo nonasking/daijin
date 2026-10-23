@@ -2,7 +2,7 @@
 """The self layer: selfdb (episodes, asks, drives, policy, memories, persona) and the brain's state block.
 
 Every test uses a throwaway SQLite file. No broker, no model, no audio."""
-import json, os, sys, tempfile, time, types, unittest
+import json, os, pathlib, sys, tempfile, time, types, unittest
 
 VOICE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 sys.path.insert(0, VOICE_DIR)
@@ -540,7 +540,7 @@ class TestPersonaCli(DbCase):
                 rc = persona.main(list(argv))
             return rc, buf.getvalue()
         rc, out = run("show"); self.assertIn("없음", out)
-        f = os.path.join(self.dir, "p.md"); open(f, "w").write("나는 다이진이야.\n")
+        f = os.path.join(self.dir, "p.md"); pathlib.Path(f).write_text("나는 다이진이야.\n")
         self.assertEqual(run("import", f)[0], 0)
         self.assertEqual(selfdb.persona_current()["text"], "나는 다이진이야.")
         self.assertIn("같다", run("import", f)[1])
@@ -551,7 +551,7 @@ class TestPersonaCli(DbCase):
         self.assertEqual(run("approve", str(vid))[0], 1)                # already current
         g = os.path.join(self.dir, "out.md")
         self.assertEqual(run("export", g)[0], 0)
-        self.assertEqual(open(g).read(), "나는 다이진이야. 밤엔 조용해.\n")
+        self.assertEqual(pathlib.Path(g).read_text(), "나는 다이진이야. 밤엔 조용해.\n")
 
 
 import selfdb_merge          # noqa: E402
@@ -636,3 +636,54 @@ class TestOfflineMerge(unittest.TestCase):
         selfdb_merge.mark(self.mac, "pushed", ts=self.t0 + 20)
         self.assertEqual(selfdb_merge.unpushed(self.mac), 0)
         self.assertEqual(selfdb_merge.last_sync(self.server), None)    # the marks stay on the Mac
+
+
+class TestIntentionallyOff(DbCase):
+    """"일부러 꺼 뒀어": the node stops counting toward node_loss until it comes back on."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = 1_800_000_000
+        selfdb.node_state_set("dev1", False, self.now - 30 * 3600)
+        selfdb.node_state_set("dev2", False, self.now - 10 * 3600)
+
+    def loss(self):
+        body = initiative.Body()
+        return initiative.compute_drives(body, self.now, self.now)["node_loss"]
+
+    def test_the_words_from_the_real_conversation_excuse_every_node_that_is_off(self):
+        self.assertAlmostEqual(self.loss()[0], 1.0)
+        got = initiative.excuse_from_text("일부러 꺼졌으니까 신경 쓰지 말라고 하고 싶었어요.", self.now)
+        self.assertEqual(got, {"dev1", "dev2"})
+        value, inputs, _ = self.loss()
+        self.assertEqual((value, inputs["node"]), (0.0, None))
+
+    def test_a_named_node_is_excused_alone(self):
+        self.assertEqual(initiative.excuse_from_text("레드는 일부러 꺼 놨어", self.now), {"dev1"})
+        value, inputs, _ = self.loss()
+        self.assertEqual(inputs["node"], "dev2")                       # blue still counts
+        self.assertAlmostEqual(value, 10 / 24, places=2)
+
+    def test_coming_back_on_clears_the_excuse(self):
+        initiative.excuse_from_text("1번 일부러 꺼 뒀어", self.now)
+        selfdb.node_state_set("dev1", True, self.now + 10)
+        selfdb.node_state_set("dev1", False, self.now + 20)
+        self.assertNotIn("dev1", selfdb.node_excused())
+
+    def test_switching_the_daijin_itself_off_excuses_no_node(self):
+        for text in ("다이진 어제 일부러 꺼 뒀어", "널 일부러 꺼 둔 거야"):
+            with self.subTest(text=text):
+                self.assertEqual(initiative.excuse_from_text(text, self.now), set())
+        self.assertEqual(initiative.excuse_from_text("다이진이랑 레드 일부러 꺼 뒀어", self.now), {"dev1"})   # a named node still counts
+
+    def test_other_talk_about_switching_is_not_an_excuse(self):
+        for text in ("레드 꺼 줘", "블루 켜 놔", "일부러 그런 거 아니야", "불 좀 꺼", "끄지 마"):
+            with self.subTest(text=text):
+                self.assertEqual(initiative.excuse_from_text(text, self.now), set())
+        self.assertEqual(selfdb.node_excused(), set())
+
+    def test_the_brain_is_told_too(self):
+        initiative.excuse_from_text("블루 일부러 꺼 둔 거야", self.now)
+        dm._body["nodes"]["dev2"] = ({"online": False}, self.now)
+        self.addCleanup(dm._body["nodes"].pop, "dev2", None)
+        self.assertIn("블루 꺼짐 (사람이 일부러 꺼 둠", dm.state_block(self.now))

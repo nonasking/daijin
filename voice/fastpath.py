@@ -5,7 +5,7 @@
 #
 # 입력은 normalize_nodes 를 거친 글 (레드/블루 → "1번"/"2번").
 import re
-from nodes import NODES, by_number, spoken
+from nodes import NODES, by_number, spoken, mentioned
 
 MAX_LEN = 30
 QUESTION = re.compile(r"[?？]|어때|뭐|왜|언제|어디|할까|해도 돼|돼\?|있어\?|켜져 있|꺼져 있|했어\?|줄래\?")
@@ -23,12 +23,8 @@ BUZZ = re.compile(r"부저|삐|소리 ?내|알람")
 
 def _node(text):
     """말에 나온 노드. 번호("1번")와 이름(레드, red: "레드랑"처럼 조사가 붙어 번호로 안 바뀐 것)을 함께 센다."""
-    found = {by_number(int(n)) for n in NODE_NUM.findall(text)}
-    low = text.lower()
-    for nid, d in NODES.items():
-        if any(w.lower() in low for w in [d["name"]] + d.get("aliases", [])):
-            found.add(nid)
-    found.discard(None)
+    found = {by_number(int(n)) for n in NODE_NUM.findall(text)} | mentioned(text, numbers=False)
+    found.discard(None)                                   # 표에 없는 번호: 아래에서 애매함으로 친다
     if len(found) > 1 or (NODE_NUM.search(text) and not found):
         return "ambiguous"
     if found:
@@ -94,6 +90,12 @@ ASK_TIME = re.compile(r"(지금|현재)?\s*몇 ?시")
 ASK_WEEKDAY = re.compile(r"무슨 ?요일|몇 ?요일|요일이")
 ASK_DATE = re.compile(r"(오늘|지금).{0,4}(며칠|몇 ?일|날짜)|며칠이야|날짜가")
 OTHER_DAY = re.compile(r"내일|모레|어제|그저께|다음 ?주|지난 ?주|생일|약속|몇 ?시에|몇 ?시까지|몇 ?시간")
+
+def now_line(now=None):
+    """로컬 모델에게 줄 지금: "2026년 10월 20일 화요일 14:05". 모델이 요일을 스스로 셈하지 않게 시계가 적어 준다."""
+    import time
+    lt = time.localtime(time.time() if now is None else now)
+    return time.strftime("%Y년 %m월 %d일 ", lt) + WEEKDAY[lt.tm_wday] + "요일 " + time.strftime("%H:%M", lt)
 
 def answer_clock(text, now=None):
     """시각·날짜·요일 물음이면 답 문장, 아니면 None. 다른 날이나 일정이 섞인 물음은 모델에 맡긴다."""

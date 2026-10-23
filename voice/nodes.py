@@ -5,7 +5,7 @@
 # 이름을 색으로 지은 이유: "일 번/이 번"은 받침 하나 차이라 소음 속에서 뒤집혔고(4/16), 레드/블루는 0/16 (2026-09-22 실측).
 #
 # 명령줄:  python3 nodes.py flash dev1   → 그 노드의 펌웨어 빌드 플래그 (flash-node.sh 가 쓴다)
-import json, os, sys
+import json, os, re, sys
 
 _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nodes.json")
 
@@ -33,6 +33,24 @@ def resolve(word):
         if w in (str(d["n"]), f'{d["n"]}번'):
             return nid
     return w
+
+def spellings(nid):
+    """이 노드를 부르는 말들: 이름과 별칭 (레드, red)."""
+    d = NODES[nid]
+    return [d["name"]] + d.get("aliases", [])
+
+def mentioned(text, numbers=True):
+    """글에 나온 노드 id 들. 이름·별칭은 대소문자 없이, 앞은 단어 시작이어야 하고 뒤는 조사가 붙어도 된다("레드랑").
+    영문 별칭은 뒤도 끊겨야 한다(bored, blueberry 는 아니다). 번호는 "1번" 꼴로 (numbers=False 면 이름만)."""
+    text = text or ""
+    found = {nid for nid in NODES if any(re.search(_word(w), text, re.I) for w in spellings(nid))}
+    if numbers:
+        found |= {nid for nid, d in NODES.items() if re.search(rf"(?<![0-9]){d['n']}\s?번(?!째)", text)}
+    return found
+
+def _word(w):
+    """이름 하나의 정규식: 앞은 한글·영문이 아니어야 하고, 영문 이름은 뒤에 영문이 더 오면 안 된다."""
+    return r"(?<![가-힣A-Za-z])" + re.escape(w) + (r"(?![A-Za-z])" if w.isascii() else "")
 
 def spoken(nid):
     """노드 id → 말로 부르는 이름. 표에 없는 id 는 그대로."""

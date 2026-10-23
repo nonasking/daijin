@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS persona_versions (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL, diff_summary TEXT,
   proposed_by TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notes (ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS node_state (node TEXT PRIMARY KEY, online INTEGER NOT NULL, since INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS node_state (node TEXT PRIMARY KEY, online INTEGER NOT NULL, since INTEGER NOT NULL, excused_at INTEGER);
 """
 
 RESPONSE_CLASSES = ("engaged", "acknowledged", "refused_context", "negative", "unanswered")
@@ -47,17 +47,29 @@ def use(path):
     """테스트·도구용: 이 프로세스가 쓸 DB 파일을 바꾼다 (secrets 보다 우선)."""
     global _path_override
     _path_override = path
+    _close()
+
+def _close():
+    c = getattr(_local, "conn", None)
+    if c is not None:
+        c.close()
     _local.__dict__.clear()
 
 def db():
     """스레드마다 연결 하나. 처음 열 때 스키마를 만든다(멱등)."""
     c = getattr(_local, "conn", None)
     if c is None or getattr(_local, "path", None) != db_path():
+        if c is not None:
+            _close()                           # 다른 파일로 바뀌었다: 옛 연결을 닫는다
         c = sqlite3.connect(db_path(), timeout=5, isolation_level=None)   # autocommit; 여러 프로세스가 같이 쓴다
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA busy_timeout=5000")
         c.executescript(SCHEMA)
+        try:                                   # 예전 DB: node_state 에 excused_at 이 없다
+            c.execute("ALTER TABLE node_state ADD COLUMN excused_at INTEGER")
+        except sqlite3.OperationalError:
+            pass
         _local.conn, _local.path = c, db_path()
     return c
 
@@ -253,9 +265,24 @@ def persona_set_current(text, by="human", diff_summary=None):
 # 노드가 지금 상태가 된 시각. 브로커의 retained 오프라인 표시에는 시각이 없어서, 재시작 뒤에도 "언제부터 꺼져 있었나"를 알려면 여기 남겨야 한다.
 @_safe
 def node_state_set(node, online, since):
-    db().execute("INSERT INTO node_state(node, online, since) VALUES(?,?,?) ON CONFLICT(node) DO UPDATE SET online=excluded.online, since=excluded.since",
+    """켜지면 '일부러 꺼 둠' 표시도 지운다 (다음에 꺼지면 다시 물어도 된다)."""
+    db().execute("INSERT INTO node_state(node, online, since) VALUES(?,?,?) ON CONFLICT(node) DO UPDATE SET online=excluded.online, since=excluded.since,"
+                 " excused_at = CASE WHEN excluded.online = 1 THEN NULL ELSE node_state.excused_at END",
                  (node, 1 if online else 0, int(since)))
     return True
+
+@_safe
+def node_excuse(node, ts=None):
+    """사람이 이 노드는 일부러 꺼 뒀다고 했다: 다시 켜질 때까지 node_loss 가 이 노드를 세지 않는다."""
+    db().execute("INSERT INTO node_state(node, online, since, excused_at) VALUES(?,0,?,?) ON CONFLICT(node) DO UPDATE SET excused_at=excluded.excused_at",
+                 (node, int(ts or time.time()), int(ts or time.time())))
+    return True
+
+def node_excused():
+    try:
+        return {r["node"] for r in db().execute("SELECT node FROM node_state WHERE excused_at IS NOT NULL AND online = 0")}
+    except sqlite3.Error:
+        return set()
 
 def node_state_all():
     return {r["node"]: (bool(r["online"]), r["since"]) for r in db().execute("SELECT * FROM node_state")}

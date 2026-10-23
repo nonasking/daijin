@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The local thinking engine, the engine fallback chain and the rule-based command fast path.
 No model, no broker: the model endpoint and the tools are stand-ins."""
-import json, os, sys, tempfile, types, unittest
+import json, os, sys, tempfile, unittest
 
 VOICE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 sys.path.insert(0, VOICE_DIR)
@@ -203,6 +203,10 @@ class TestClockAnswers(unittest.TestCase):
         self.assertEqual(fastpath.answer_clock("오늘 무슨 요일이야?", now), "오늘은 일요일이야.")
         noon = time.mktime((2026, 10, 12, 12, 0, 0, 0, 0, -1))
         self.assertEqual(fastpath.answer_clock("몇 시야", noon), "지금 오후 12시야.")
+
+    def test_now_line_for_the_local_model(self):
+        import time
+        self.assertEqual(fastpath.now_line(time.mktime((2026, 10, 11, 19, 5, 0, 0, 0, -1))), "2026년 10월 11일 일요일 19:05")
 
     def test_other_days_and_schedules_go_to_the_model(self):
         for q in ("내일 무슨 요일이야?", "어제 몇 시에 잤지?", "회의 몇 시에 시작해?", "몇 시간 남았어?", "오늘 기분 어때?"):
