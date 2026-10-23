@@ -18,6 +18,7 @@ Run:  python3 -m unittest discover -s voice/tests   (from the repo root)
 import json
 import math
 import os
+import pathlib
 import sys
 import types
 import unittest
@@ -589,7 +590,8 @@ class TestBrainStream(unittest.TestCase):
 
     def _saved(self, suffix=""):
         try:
-            return open(self.session + suffix).read()
+            with open(self.session + suffix) as f:
+                return f.read()
         except FileNotFoundError:
             return None
 
@@ -775,6 +777,20 @@ class TestNodeTable(unittest.TestCase):
         self.assertEqual(nodes_mod.resolve("all"), "all")
         self.assertEqual(nodes_mod.resolve("dev9"), "dev9")             # unknown names pass through
 
+    def test_mentioned_finds_names_aliases_and_numbers_but_not_other_numbers(self):
+        self.assertEqual(nodes_mod.mentioned("레드랑 BLUE 둘 다"), {"dev1", "dev2"})
+        self.assertEqual(nodes_mod.mentioned("1번 꺼 줘"), {"dev1"})
+        self.assertEqual(nodes_mod.mentioned("11번 버스"), set())
+        self.assertEqual(nodes_mod.mentioned("1번 레드", numbers=False), {"dev1"})
+        self.assertEqual(nodes_mod.mentioned("2번", numbers=False), set())
+
+    def test_mentioned_wants_a_word_not_a_substring(self):
+        for text in ("bored 라는 말", "blueberry 먹었어", "1번째 줄", "hatred"):
+            with self.subTest(text=text):
+                self.assertEqual(nodes_mod.mentioned(text), set())
+        self.assertEqual(nodes_mod.mentioned("Red 불"), {"dev1"})                    # a real word, any case
+        self.assertEqual(nodes_mod.mentioned("레드말고 블루만"), {"dev1", "dev2"})     # Korean takes particles
+
     def test_fleet_lines_use_spoken_names_and_judge_by_heartbeat_age(self):
         now = 1_800_000_000
         lines = fleet_status.render([
@@ -955,10 +971,43 @@ class TestBrainStatusAndAlerts(unittest.TestCase):
         with open(fake, "w") as f:
             f.write('#!/usr/bin/env python3\nimport sys\nprint("Error: authentication_error: OAuth token has expired. Please run /login", file=sys.stderr)\nsys.exit(1)\n')
         os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
-        session = os.path.join(d, "session"); open(session, "w").write("old-session")
+        session = os.path.join(d, "session")
+        with open(session, "w") as f:
+            f.write("old-session")
         for name, val in (("CLAUDE", fake), ("SESSION_FILE", session)):
             orig = getattr(dm, name); setattr(dm, name, val); self.addCleanup(setattr, dm, name, orig)
         c = self.Client(); dm._client = c
         self.assertEqual(list(dm.brain_stream("안녕")), [dm.AUTH_FAIL_SENTENCE])
-        self.assertEqual(open(session).read(), "old-session")
+        self.assertEqual(pathlib.Path(session).read_text(), "old-session")
         self.assertEqual(json.loads(c.sent[-1][1])["kind"], "auth")
+
+
+class TestClipReassembly(unittest.TestCase):
+    """daijin/audio/in chunks → one clip on the worker queue; a missing middle chunk is said out loud, not hidden."""
+
+    class Msg:
+        def __init__(self, clip, seq, last, payload=b"\x01\x02"):
+            self.topic = dm.T_AUDIO_IN
+            self.payload = bytes([clip, (seq >> 8) & 0xFF, seq & 0xFF, 1 if last else 0]) + payload
+
+    def setUp(self):
+        for name, val in (("_rx", {"clip": None, "parts": {}}), ("_clipq", dm.queue.Queue())):
+            orig = getattr(dm, name); setattr(dm, name, val); self.addCleanup(setattr, dm, name, orig)
+
+    def _feed(self, *msgs):
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            for m in msgs:
+                dm.on_message(None, None, m)
+        return buf.getvalue()
+
+    def test_whole_clip_is_queued_without_a_gap_warning(self):
+        out = self._feed(self.Msg(7, 0, False, b"aa"), self.Msg(7, 1, False, b"bb"), self.Msg(7, 2, True, b"cc"))
+        self.assertEqual(dm._clipq.get_nowait(), ("pcm", b"aabbcc"))
+        self.assertNotIn("유실", out)
+
+    def test_missing_middle_chunk_is_logged_and_the_rest_still_goes_on(self):
+        out = self._feed(self.Msg(9, 0, False, b"aa"), self.Msg(9, 2, False, b"cc"), self.Msg(9, 3, True, b"dd"))
+        self.assertEqual(dm._clipq.get_nowait(), ("pcm", b"aaccdd"))
+        self.assertIn("클립 9: 청크 1개 유실 (seq 1)", out)

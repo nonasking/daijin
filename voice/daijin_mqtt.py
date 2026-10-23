@@ -14,7 +14,7 @@
 #   같은 디렉토리의 다른 claude 세션과 절대 섞이지 않음 (--continue 사용 금지).
 # - 서비스 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속 (daijin_common).
 
-import subprocess, re, os, sys, time, json, wave, threading, queue, shutil, socket, uuid, types
+import subprocess, re, os, sys, time, json, threading, queue, shutil, socket, uuid, types, pathlib
 import array, asyncio, math, tempfile
 import urllib.request, urllib.parse
 try:
@@ -25,8 +25,8 @@ try:
     import supertonic                  # pip install supertonic. 온디바이스 한국어 TTS (ONNX, CPU). 없으면 그 엔진만 빠진다
 except ImportError:
     supertonic = None
-from daijin_common import VOICE, REPO, sec, load_hooks, cloud_client, connect_with_retry, broker
-from nodes import NODES, spoken
+from daijin_common import VOICE, REPO, T_AUDIO_IN, sec, load_hooks, cloud_client, connect_with_retry, broker
+from nodes import NODES, spoken, spellings
 import selfdb
 import local_mind, fastpath
 
@@ -51,7 +51,6 @@ TTS_VOICE = "Yuna"                     # 최종 폴백 (오프라인 보장)
 ELEVEN_VOICE = "TFUX5RKA9yUMr26dSJqF"  # daijin 보이스 (Voice Design으로 생성, 크레딧제)
 EDGE_VOICE = "de-DE-SeraphinaMultilingualNeural"  # 무료·무제한 기본 보이스 (사용자 선택 2026-07-05)
 
-T_AUDIO_IN  = "daijin/audio/in"
 T_AUDIO_OUT = "daijin/audio/out"
 T_TXT_IN    = "daijin/text/in"
 T_TXT_OUT   = "daijin/text/out"
@@ -83,7 +82,7 @@ def _props():
     voice/props.local.txt(저장소에 넣지 않는 이 설치본의 것)가 있으면 그것을, 없으면 voice/props.txt(예시)를 읽는다."""
     for name in ("props.local.txt", "props.txt"):
         try:
-            t = open(f"{VOICE}/{name}", encoding="utf-8").read().strip()
+            t = pathlib.Path(VOICE, name).read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             continue
         return (" 지금 홈 노드들에 붙어 있는 실제 소품과 할 수 있는 장난: " + t.replace("\n", " ") + " ") if t else ""
@@ -214,7 +213,8 @@ def with_proactive_context(text, now=None):
 
 def load_session():
     try:
-        s = open(SESSION_FILE).read().strip()
+        with open(SESSION_FILE) as f:
+            s = f.read().strip()
         return s or None
     except FileNotFoundError:
         return None
@@ -226,8 +226,10 @@ def save_session(sid):
     if old and old != sid:
         # 갈아타기 직전의 세션 id를 남겨 둔다. 잘못 새 세션으로 넘어갔을 때
         # .daijin_session.prev 의 내용을 .daijin_session 에 되돌려 쓰면 기억이 돌아온다.
-        open(SESSION_FILE + ".prev", "w").write(old)
-    open(SESSION_FILE, "w").write(sid)
+        with open(SESSION_FILE + ".prev", "w") as f:
+            f.write(old)
+    with open(SESSION_FILE, "w") as f:
+        f.write(sid)
 
 # ---------- 로컬 확장 (선택): voice/local_hooks.py, 인터페이스는 daijin_common.load_hooks 참고 ----------
 HOOKS = load_hooks(announce=True)
@@ -273,7 +275,7 @@ def _alias_sub(m):
 # 노드 호칭은 "레드/블루" (red/blue). 2026-09-22 실측: "일 번/이 번"은 받침 하나 차이라 소음 10dB부터 원본 PCM에서도
 # 뒤집혔고(4/16), 레드/블루는 같은 조건에서 0/16. 내부 ID는 그대로 1번/2번(dev1/dev2)이고 음성 입출력에서만 색 이름을 쓴다.
 # 한국어 색 이름(빨강/파랑)은 LED 색 명령("빨간 불 켜 줘")과 겹쳐서 노드 이름으로 받지 않는다.
-_NAME2N = {w.lower(): d["n"] for d in NODES.values() for w in [d["name"]] + d.get("aliases", [])}
+_NAME2N = {w.lower(): d["n"] for nid, d in NODES.items() for w in spellings(nid)}
 _NODE_NAME = re.compile(r"(?<![가-힣A-Za-z])(" + "|".join(re.escape(w) for w in _NAME2N) + r")(?![가-힣A-Za-z])", re.I)
 def _name_sub(m):
     return f"{_NAME2N[m.group(1).lower()]}번"
@@ -480,6 +482,9 @@ def _claude_stream(text, resume_id, st):
         p.wait()
     finally:
         killer.cancel()
+        if p.poll() is None:                # 읽던 쪽이 도중에 그만뒀다: claude 를 남겨 두지 않는다
+            p.kill(); p.wait()
+        p.stdout.close()
     rest = EMOJI.sub("", buf).strip()
     if rest and not st["timeout"]:
         st["yielded"] = True
@@ -569,8 +574,7 @@ def local_think(text, out):
         return
     try:
         history, day_note = local_history(text)
-        now_note = " [지금: " + time.strftime("%Y년 %m월 %d일 ", time.localtime()) + "월화수목금토일"[time.localtime().tm_wday] + "요일 " + time.strftime("%H:%M", time.localtime()) + "]"
-        reply = local_mind.think(text, system_extra=now_note + state_block() + day_note, history=history)
+        reply = local_mind.think(text, system_extra=f" [지금: {fastpath.now_line()}]" + state_block() + day_note, history=history)
     except Exception as e:
         print(f"  ⚠️ 로컬 모델 실패: {e!r}")
         out["failed"] = "error"
@@ -776,86 +780,8 @@ def tts_stream(text):
 CHUNK_OUT = 2048      # ADPCM 청크 (=4096샘플=256ms). 디바이스가 올려 보내는 청크도 같은 크기다
 _rx = {"clip": None, "parts": {}}   # 수신 중인 클립 재조립 버퍼
 
-# ---------- IMA ADPCM 인코더 (16bit PCM → 4bit) ----------
-_STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,
-         73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,
-         408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,
-         1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,
-         7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,
-         22385,24623,27086,29794,32767]
-_IDX = [-1,-1,-1,-1,2,4,6,8]
-
-class AdpcmEnc:
-    """스트리밍 인코더 — 조각조각 넣어도 상태(pred/idx/니블·홀수바이트) 유지.
-    vol: 디지털 음량(0~1) — 작은 앰프/스피커의 풀스케일 왜곡(쇳소리) 방지"""
-    def __init__(self, vol=1.0):
-        self.pred, self.idx, self.lo, self.rem = 0, 0, None, b""
-        self.vol = vol
-
-    def encode(self, pcm):
-        data = self.rem + pcm
-        odd = len(data) % 2
-        if odd: data, self.rem = data[:-1], data[-1:]
-        else:   self.rem = b""
-        smp = array.array("h"); smp.frombytes(data)
-        if self.vol < 0.999:
-            for i in range(len(smp)):
-                smp[i] = int(smp[i] * self.vol)
-        out = bytearray()
-        for s in smp:
-            diff = s - self.pred
-            code = 8 if diff < 0 else 0
-            if code: diff = -diff
-            step = _STEP[self.idx]
-            if diff >= step:      code |= 4; diff -= step
-            if diff >= step >> 1: code |= 2; diff -= step >> 1
-            if diff >= step >> 2: code |= 1
-            vp = step >> 3
-            if code & 4: vp += step
-            if code & 2: vp += step >> 1
-            if code & 1: vp += step >> 2
-            self.pred += -vp if code & 8 else vp
-            self.pred = max(-32768, min(32767, self.pred))
-            self.idx = max(0, min(88, self.idx + _IDX[code & 7]))
-            if self.lo is None: self.lo = code
-            else: out.append(self.lo | (code << 4)); self.lo = None
-        return bytes(out)
-
-    def flush(self):
-        if self.lo is not None:
-            b = bytes([self.lo]); self.lo = None
-            return b
-        return b""
-
-class AdpcmDec:
-    """업스트림(디바이스 녹음) 디코더 — 펌웨어 adpcmEncode의 거울.
-    업로드도 다운로드와 같은 대역 한계(~19KB/s)라 디바이스가 4:1 압축해 보낸다 (2026-08-17)."""
-    def __init__(self):
-        self.pred, self.idx = 0, 0
-
-    def decode(self, data):
-        out = array.array("h")
-        for b in data:
-            for c in (b & 0x0F, b >> 4):
-                step = _STEP[self.idx]
-                vp = step >> 3
-                if c & 4: vp += step
-                if c & 2: vp += step >> 1
-                if c & 1: vp += step >> 2
-                self.pred += -vp if c & 8 else vp
-                self.pred = max(-32768, min(32767, self.pred))
-                self.idx = max(0, min(88, self.idx + _IDX[c & 7]))
-                out.append(self.pred)
-        return out.tobytes()
-
-def pcm_to_wav(pcm, path):
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-        w.writeframes(pcm)
-
-def wav_to_pcm(path):
-    with wave.open(path, "rb") as w:
-        return w.readframes(w.getnframes())
+# ---------- IMA ADPCM 코덱과 WAV: audio_codec.py (테스트와 도구가 dm.AdpcmEnc 처럼 부를 수 있게 이름을 그대로 둔다) ----------
+from audio_codec import _STEP, _IDX, AdpcmEnc, AdpcmDec, pcm_to_wav, wav_to_pcm  # noqa: E402,F401
 
 def publish_pcm_stream(client, pcm_iter):
     """PCM 조각 이터레이터를 받는 즉시 ADPCM 청크로 발행 (TTS 생성과 전송을 겹침)"""
@@ -1122,6 +1048,9 @@ def on_message(client, userdata, msg):
         _rx["adpcm"] = bool(p[3] & 2)         # bit1 = ADPCM 압축 클립
     _rx["parts"][seq] = p[4:]
     if last:
+        gap = sorted(set(range(seq + 1)) - _rx["parts"].keys())
+        if gap:                               # QoS 0 라 중간 청크가 빠질 수 있다. ADPCM 은 상태 기반이라 그 뒤 소리가 일그러진다
+            print(f"  ⚠️ 클립 {clip}: 청크 {len(gap)}개 유실 (seq {', '.join(map(str, gap[:5]))}{' …' if len(gap) > 5 else ''})")
         data = b"".join(_rx["parts"][k] for k in sorted(_rx["parts"]))
         if _rx.get("adpcm"):
             data = AdpcmDec().decode(data)    # 4:1 해제 → 원본 PCM

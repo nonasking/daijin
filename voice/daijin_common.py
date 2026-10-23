@@ -5,6 +5,7 @@ import os, ssl, time
 
 VOICE = os.path.dirname(os.path.abspath(__file__))
 REPO  = os.path.dirname(VOICE)
+T_AUDIO_IN = "daijin/audio/in"       # 기기 → 브레인 녹음 청크 (docs/chunking-protocol.md). 브레인과 vad_lab 이 같이 본다
 SEC   = os.path.join(REPO, "secrets.local.txt")     # 저장소 루트 (클론 위치 무관, gitignore)
 
 def sec(key):
@@ -15,9 +16,10 @@ def sec(key):
         return v.strip()
     if not os.path.exists(SEC):
         return ""
-    for line in open(SEC):
-        if line.startswith(key + "="):
-            return line.split("=", 1)[1].strip()
+    with open(SEC) as f:                      # 한 턴에도 여러 번 불린다: 매번 닫는다
+        for line in f:
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip()
     return ""
 
 def load_hooks(announce=False):

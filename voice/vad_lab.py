@@ -7,7 +7,7 @@
 #
 # 펌웨어와 같은 단위로 본다: 16kHz, 512 샘플(32ms) 블록의 RMS, x2 게인이 들어간 16비트 값 (클립이 바로 그 샘플이다, ADPCM 오차만 있다).
 # 녹음은 사람 목소리이므로 저장소 밖(기본 voice/.vadlab/, gitignore)에 둔다.
-import argparse, array, json, math, os, sys, time, wave
+import argparse, array, math, os, sys, time, wave
 
 SR = 16000
 BLOCK = 512                       # 펌웨어 captureTask 의 한 번 읽기 (32ms)
@@ -89,8 +89,8 @@ def summarize(name, rms, variant=DEFAULT, **override):
 # ---------- record ----------
 def record(out_dir):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from daijin_common import cloud_client, connect_with_retry
-    from daijin_mqtt import AdpcmDec, T_AUDIO_IN
+    from daijin_common import cloud_client, connect_with_retry, T_AUDIO_IN
+    from audio_codec import AdpcmDec
     os.makedirs(out_dir, exist_ok=True)
     rx = {"clip": None, "parts": {}, "adpcm": False}
 
