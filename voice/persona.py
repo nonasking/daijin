@@ -42,10 +42,13 @@ def main(argv):
         if not cur:
             print("현재 글이 없다 (seed 먼저)"); return 1
         path = argv[1] if len(argv) > 1 else DEFAULT_FILE
-        open(path, "w", encoding="utf-8").write(cur["text"].rstrip("\n") + "\n"); print(f"내보냄: {path}"); return 0
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(cur["text"].rstrip("\n") + "\n")
+        print(f"내보냄: {path}"); return 0
     if cmd == "import":
         path = argv[1] if len(argv) > 1 else DEFAULT_FILE
-        text = open(path, encoding="utf-8").read().strip()
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
         cur = selfdb.persona_current()
         if cur and cur["text"].strip() == text:
             print("현재 글과 같다"); return 0

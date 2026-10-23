@@ -53,7 +53,8 @@ class TestEndOfSpeech(unittest.TestCase):
 
 class TestMatchesFirmware(unittest.TestCase):
     def test_default_variant_is_what_the_firmware_does(self):
-        src = open(FIRMWARE, encoding="utf-8").read()
+        with open(FIRMWARE, encoding="utf-8") as f:
+            src = f.read()
         num = lambda pat: float(re.search(pat, src).group(1))
         v = V.VARIANTS[V.DEFAULT]
         self.assertEqual(num(r"#define VAD_SILENCE_MS (\d+)"), v["silence_ms"])

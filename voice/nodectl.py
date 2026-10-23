@@ -11,7 +11,7 @@
 #
 # ACK 방식: state 토픽은 retained 라 그냥 읽으면 "직전" 명령의 ACK 가 먼저 튀어나온다(pong 오답의 원인).
 # 그래서 구독을 먼저 열고, retain 표시가 없는(=지금 막 발행된) 메시지만 이번 명령의 ACK 로 친다.
-import json, os, queue, socket, sys, threading, time
+import json, queue, socket, sys, threading, time
 import paho.mqtt.client as mqtt
 from daijin_common import sec, cloud_client, broker_address, broker
 from nodes import resolve

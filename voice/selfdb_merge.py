@@ -10,7 +10,7 @@
 #   - node_state 는 옮기지 않는다 (지금의 상태는 서버가 직접 본다).
 #
 # 사용: python3 selfdb_merge.py <맥에서 가져온 DB> <서버 DB> <since epoch>
-import json, sqlite3, sys
+import contextlib, json, sqlite3, sys, time
 
 SYNC_NOTE = "sync"          # notes.kind: offline-mode.sh 가 sync/push 한 때를 남기는 표시. 서버로는 옮기지 않는다
 
@@ -86,36 +86,31 @@ def merge(src_path, dst_path, since):
         src.close(); dst.close()
     return done
 
+def _open(path):
+    """닫히는 연결 (sqlite3 의 with 는 커밋만 하고 닫지 않는다)."""
+    return contextlib.closing(sqlite3.connect(path))
+
 def last_sync(path):
     """offline-mode.sh 가 남긴 마지막 sync/push 시각 (없으면 None)."""
-    c = sqlite3.connect(path)
-    try:
-        r = c.execute("SELECT MAX(ts) FROM notes WHERE kind=?", (SYNC_NOTE,)).fetchone()
+    with _open(path) as c:
+        try:
+            r = c.execute("SELECT MAX(ts) FROM notes WHERE kind=?", (SYNC_NOTE,)).fetchone()
+        except sqlite3.Error:
+            return None
         return r[0] if r else None
-    except sqlite3.Error:
-        return None
-    finally:
-        c.close()
 
 def unpushed(path):
     """마지막 sync/push 뒤에 이 DB 에 생긴 대화·장부·기억 수 (sync 로 덮어쓰기 전에 확인한다)."""
     since = last_sync(path)
     if since is None:
         return 0
-    c = sqlite3.connect(path)
-    try:
+    with _open(path) as c:
         return sum(c.execute(f"SELECT COUNT(*) FROM {t} WHERE ts > ?", (since,)).fetchone()[0] for t in ("episodes", "asks", "memories"))
-    finally:
-        c.close()
 
 def mark(path, what, ts=None):
-    import time
-    c = sqlite3.connect(path)
-    try:
+    with _open(path) as c:
         c.execute("INSERT INTO notes(ts, kind, text) VALUES(?,?,?)", (int(ts or time.time()), SYNC_NOTE, what))
         c.commit()
-    finally:
-        c.close()
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] in ("since", "unpushed"):

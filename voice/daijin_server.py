@@ -8,7 +8,7 @@
 # 실행:  python3 voice/daijin_server.py   (포트 8848)
 # 테스트: curl -X POST --data-binary @sample.wav http://localhost:8848/talk -o reply.wav
 
-import http.server, subprocess, re, os, time, sys
+import http.server, subprocess, re, os, time
 
 HOME    = os.path.expanduser("~")
 HERE    = os.path.dirname(os.path.abspath(__file__))
