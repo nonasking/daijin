@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daijin.backup</string>
+
+    <!-- 매일 04:30 에 서버의 비밀·세션·DB·클로드 기록을 끌어와 암호화해 둔다 (voice/backup.sh 머리말).
+         설치: bash voice/backup.sh install   (이 파일의 __REPO__/__HOME__/__DEST__ 를 채워 ~/Library/LaunchAgents 에 넣는다)
+         그 시각에 잠들어 있었으면 launchd 가 깨어난 뒤 한 번 돌린다. 상주 프로세스가 아니라 KeepAlive 는 없다. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/voice/backup.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__DEST__/backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__DEST__/backup.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>
