@@ -59,80 +59,78 @@ inline void led(uint8_t r,uint8_t g,uint8_t b){ neopixelWrite(RGB_PIN,r,g,b); }
 #define LED_IDLE led(0,5,0)                     // 은은한 초록 = 대기(살아있음)
 
 // ---------- 얼굴: SSD1306 128x64 I2C OLED (SDA=8, SCL=9, 주소 0x3C) ----------
-// 파이프라인 단계를 표정으로 보여준다. OLED가 안 꽂혀 있으면 자동으로 건너뛴다(hasFace=false).
-// 그리기는 상태 전환 때와 애니메이션 틱(150~400ms)에서만: I2C 1KB 전송 ≈ 25ms라 오디오에 영향 없음.
+// 눈 두 개가 전부다(FluxGarage RoboEyes: 깜빡임·시선 이동·표정을 프레임마다 보간해 그린다). 파이프라인 단계는 눈으로 말한다.
+// OLED가 안 꽂혀 있으면 자동으로 건너뛴다(hasFace=false).
+// 프레임마다 I2C로 1KB(≈25ms)가 나가므로 프레임 수를 상태별로 묶는다: 평소 12fps, 말하거나 올리는 동안 6fps(예전 입 애니메이션과 같은 간격,
+// 언더런 0회 실측). 그 사이 loop() 는 막히지 않는다(update 는 간격이 안 됐으면 바로 돌아온다).
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <FluxGarage_RoboEyes.h>
 #define OLED_SDA 8
 #define OLED_SCL 9
-Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+// RoboEyes 는 프레임마다 display() 로 화면을 내보낸다. 그 위에 눈동자를 얹으려면 두 번 내보내야 하니(I2C 두 배),
+// display() 를 빈 함수로 가린 캔버스를 넘긴다: 라이브러리는 버퍼에만 그리고, 눈동자를 얹은 뒤 flush() 로 한 번만 내보낸다.
+struct FaceCanvas : public Adafruit_SSD1306 {
+  using Adafruit_SSD1306::Adafruit_SSD1306;
+  void display() {}
+  void flush() { Adafruit_SSD1306::display(); }
+};
+FaceCanvas oled(128, 64, &Wire, -1);
+RoboEyes<FaceCanvas> eyes(oled);
 bool hasFace = false;
 Face faceState = F_IDLE;
 uint32_t faceSince = 0, faceTickAt = 0;
 bool faceFrame = false;
 
-void drawEye(int cx, int cy, int w, int h, int px, int py) {   // 눈(흰 타원) + 눈동자(검정)
-  oled.fillRoundRect(cx - w/2, cy - h/2, w, h, h/3, SSD1306_WHITE);
-  if (h > 6) oled.fillCircle(cx + px, cy + py, h/6 + 2, SSD1306_BLACK);
-}
-void drawFace() {
-  if (!hasFace) return;
-  oled.clearDisplay();
-  int lx = 38, rx = 90, ey = 26;
-  switch (faceState) {
-    case F_IDLE:                                              // 평소: 가끔 깜빡
-      if (faceFrame) { oled.fillRect(lx-14, ey-1, 28, 3, SSD1306_WHITE); oled.fillRect(rx-14, ey-1, 28, 3, SSD1306_WHITE); }
-      else { drawEye(lx, ey, 28, 22, 0, 0); drawEye(rx, ey, 28, 22, 0, 0); }
-      oled.fillRoundRect(54, 48, 20, 4, 2, SSD1306_WHITE);   // 다문 입
-      break;
-    case F_LISTEN:                                            // 듣는 중: 눈 크게, 입 살짝 벌림
-      drawEye(lx, ey, 34, 30, 0, 0); drawEye(rx, ey, 34, 30, 0, 0);
-      oled.drawRoundRect(52, 46, 24, 10, 4, SSD1306_WHITE);
-      break;
-    case F_UPLOAD:                                            // 보내는 중: 위를 봄
-      drawEye(lx, ey, 28, 22, 0, -4); drawEye(rx, ey, 28, 22, 0, -4);
-      oled.fillRoundRect(54, 48, 20, 4, 2, SSD1306_WHITE);
-      break;
-    case F_THINK: {                                           // 생각 중: 눈동자 좌우로
-      int px = faceFrame ? 6 : -6;
-      drawEye(lx, ey, 28, 22, px, -2); drawEye(rx, ey, 28, 22, px, -2);
-      oled.fillRoundRect(50, 48, 28, 3, 1, SSD1306_WHITE);
-      for (int i = 0; i < 3; i++) oled.fillCircle(104 + i*7, 58, 2, (i == ((millis()/300)%3)) ? SSD1306_WHITE : SSD1306_BLACK);
-      break; }
-    case F_SPEAK:                                             // 말하는 중: 입이 열렸다 닫혔다
-      drawEye(lx, ey, 28, 22, 0, 0); drawEye(rx, ey, 28, 22, 0, 0);
-      if (faceFrame) oled.fillRoundRect(50, 44, 28, 14, 6, SSD1306_WHITE);
-      else           oled.fillRoundRect(52, 48, 24, 5, 2, SSD1306_WHITE);
-      break;
-    case F_ERROR:                                             // 오류: X 눈
-      for (int x : {lx, rx}) { oled.drawLine(x-10, ey-10, x+10, ey+10, SSD1306_WHITE); oled.drawLine(x-10, ey+10, x+10, ey-10, SSD1306_WHITE); }
-      oled.drawRoundRect(52, 48, 24, 8, 3, SSD1306_WHITE);
-      break;
+void face(Face f) {
+  if (!hasFace || faceState == f) return;
+  faceState = f; faceSince = millis(); faceFrame = false; faceTickAt = 0;
+  // 상태마다 한 번만 정한다. 이후 프레임은 RoboEyes 가 여기서 정한 목표로 눈을 움직인다.
+  eyes.setIdleMode(OFF); eyes.setCuriosity(OFF); eyes.setSweat(OFF); eyes.setMood(DEFAULT);
+  eyes.setWidth(36, 36); eyes.setHeight(36, 36); eyes.setPosition(DEFAULT); eyes.setAutoblinker(ON, 2, 3);
+  eyes.setFramerate(12);
+  switch (f) {
+    case F_IDLE:   eyes.setIdleMode(ON, 2, 3); eyes.setCuriosity(ON); break;             // 가끔 깜빡, 가끔 둘러봄
+    case F_LISTEN: eyes.setWidth(40, 40); eyes.setHeight(44, 44); break;                 // 듣는 중: 눈 크게, 정면
+    case F_UPLOAD: eyes.setPosition(N); eyes.setFramerate(6); break;                     // 보내는 중: 위를 봄
+    case F_THINK:  eyes.setPosition(NW); break;                                          // 생각 중: 좌우 위를 번갈아 (faceTick)
+    case F_SPEAK:  eyes.setMood(HAPPY); eyes.setFramerate(6); break;                     // 말하는 중: 웃는 눈
+    case F_ERROR:  eyes.setMood(TIRED); eyes.setSweat(ON); eyes.setAutoblinker(OFF); break;  // 오류: 지친 눈에 땀
   }
-  oled.display();
 }
-void face(Face f) { if (faceState != f) { faceState = f; faceSince = millis(); faceFrame = false; faceTickAt = 0; drawFace(); } }
-void faceTick() {                                             // loop()에서 호출: 상태별 애니메이션
+void faceTick() {                                             // loop() 와 녹음 루프에서 호출: 프레임 그리기 + 상태별 변화
   if (!hasFace) return;
-  uint32_t now = millis(), period;
-  switch (faceState) {
-    case F_IDLE:  period = faceFrame ? 120 : 2600 + (now % 1500); break;   // 깜빡: 짧게 감고 오래 뜸
-    case F_THINK: period = 400; break;
-    case F_SPEAK: period = 160; break;
-    default:      period = 1000; break;
+  uint32_t now = millis();
+  if (faceState == F_THINK && now - faceTickAt >= 700) {       // 생각: 왼쪽 위, 오른쪽 위를 번갈아 본다
+    faceTickAt = now; faceFrame = !faceFrame; eyes.setPosition(faceFrame ? NE : NW);
   }
-  if (now - faceTickAt < period) return;
-  faceTickAt = now; faceFrame = !faceFrame;
-  if (faceState == F_IDLE || faceState == F_THINK || faceState == F_SPEAK) drawFace();
+  unsigned long before = eyes.fpsTimer;
+  eyes.update();                                              // 프레임 간격이 됐을 때만 그린다 (fpsTimer 가 바뀜)
+  if (eyes.fpsTimer != before) { drawPupils(); oled.flush(); }
   if (faceState == F_THINK && now - faceSince > 90000) face(F_IDLE);      // 답이 영영 안 오면 원래 얼굴로
+}
+void drawPupil(int x, int y, int w, int h, int dx, int dy) {    // 눈 하나에 검은 눈동자. 시선 방향으로 살짝 치우친다
+  if (h < 12) return;                                         // 감는 중이면 생략
+  int r = min(w, h) / 6 + 1;
+  dx = constrain(dx / 3, -(w/2 - r - 1), w/2 - r - 1);        // 눈 안에 머물게
+  dy = constrain(dy / 3, -(h/2 - r - 1), h/2 - r - 1);
+  oled.fillCircle(x + w/2 + dx, y + h/2 + dy, r, SSD1306_BLACK);
+}
+void drawPupils() {
+  int dx = eyes.eyeLx - eyes.eyeLxDefault, dy = eyes.eyeLy - eyes.eyeLyDefault;   // 눈이 기본 자리에서 얼마나 움직였나 = 시선
+  drawPupil(eyes.eyeLx, eyes.eyeLy, eyes.eyeLwidthCurrent, eyes.eyeLheightCurrent, dx, dy);
+  drawPupil(eyes.eyeRx, eyes.eyeRy, eyes.eyeRwidthCurrent, eyes.eyeRheightCurrent, dx, dy);
 }
 void faceInit() {
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.beginTransmission(0x3C);
   if (Wire.endTransmission() != 0) { logf("OLED 없음 (얼굴 생략)\n"); return; }
   if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { logf("OLED 초기화 실패\n"); return; }
-  hasFace = true; oled.setRotation(0); face(F_IDLE); logf("OLED 얼굴 OK\n");
+  hasFace = true; oled.setRotation(0);
+  eyes.begin(128, 64, 12);
+  faceState = F_ERROR;                                        // face() 가 "같은 상태"로 보고 건너뛰지 않게
+  face(F_IDLE); eyes.open(); logf("OLED 얼굴 OK (RoboEyes)\n");
 }
 
 // ---------- 알림음 ----------
@@ -381,6 +379,7 @@ void recordAndPublish() {
     if (!capturing && !shown) {                                // 캡처가 끝났다(탭 또는 자동컷): 바로 표시해서 탭이 먹혔음을 알린다
       shown = true; led(40,40,0); face(F_UPLOAD);              // 노랑 = 남은 청크 전송 중
     }
+    faceTick();                                                // 녹음은 길어야 20초: 그동안도 눈은 깜빡인다
     if (capAvail() < 2 && capturing) { delay(5); continue; }   // 캡처 대기
     while (capAvail() >= 2 && fill < CHUNK_UP) {               // PCM 2바이트 → ADPCM 니블
       size_t off = capR % CAP_SZ;
@@ -413,14 +412,14 @@ void recordAndPublish() {
     // 자동컷과 같은 방식으로 버튼이 1.5초 떼어져 있을 때까지 새 녹음을 받지 않는다.
     softChirp(660.f, 100);
     uint32_t quiet = millis();
-    while (millis() - quiet < 1500) { if (digitalRead(BTN) == LOW) quiet = millis(); delay(10); }
+    while (millis() - quiet < 1500) { if (digitalRead(BTN) == LOW) quiet = millis(); faceTick(); delay(10); }
   } else if (autoCut) {
     // 자동컷: 사용자는 아직 말하는 중이라 곧 "종료" 탭을 누른다. 그 탭이 새 녹음 시작으로 읽히면
     // 스피커 소리까지 10초 더 녹음돼 헛명령이 된다(2026-09-15 실측: 클립 3·4, 5·6, 8·9 쌍).
     // → 알림음 내고, 버튼이 1.5초 동안 계속 떼어져 있을 때까지 새 녹음을 받지 않는다.
     cutChirp();
     uint32_t quiet = millis();
-    while (millis() - quiet < 1500) { if (digitalRead(BTN) == LOW) quiet = millis(); delay(10); }
+    while (millis() - quiet < 1500) { if (digitalRead(BTN) == LOW) quiet = millis(); faceTick(); delay(10); }
     logf("자동컷 → 1.5초 쿨다운 통과\n");
   } else {
     while (digitalRead(BTN) == LOW) delay(10);                 // 종료 탭 손 뗄 때까지
@@ -573,7 +572,7 @@ void loop() {
   if (!playing && gotLast && ringAvail() == 0) {
     gotLast = false;
     softChirp(320.f, 150);
-    LED_IDLE; face(F_IDLE);
+    LED_IDLE; face(F_IDLE); if (hasFace) eyes.anim_confused();   // 갸웃
     WiFi.setSleep(true);
     logf("답할 것 없음 신호 → 대기\n");
   }

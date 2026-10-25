@@ -188,7 +188,7 @@ Fill in the broker credentials and your WiFi networks. `ca_cert.h` (Let's Encryp
 **Firmware**
 
 ```
-arduino-cli lib install "PubSubClient" "WiFiManager" "ESP32Servo" "Adafruit SSD1306" "Stepper" "DHT sensor library"
+arduino-cli lib install "PubSubClient" "WiFiManager" "ESP32Servo" "Adafruit SSD1306" "Stepper" "DHT sensor library" "FluxGarage RoboEyes"
 cd sketches
 arduino-cli compile --fqbn esp32:esp32:esp32s3 --board-options CDCOnBoot=cdc 14-daijin && \
 arduino-cli upload  --fqbn esp32:esp32:esp32s3 --board-options CDCOnBoot=cdc -p /dev/cu.usbmodemXXXX 14-daijin
