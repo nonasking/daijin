@@ -101,6 +101,7 @@ The local model is clearly weaker than Claude: it misplaces dates, cannot search
 - **Voice**: **Supertonic** (`TTS_ENGINE=supertonic`) speaks Korean on the CPU with no network, about 0.2× real time even on a 2-vCPU VPS; **Edge TTS** (free neural voice) and a custom **ElevenLabs** voice remain, and the engines fall through to one another.
 - **Recording** ends by itself 1.5 s after the speaker goes quiet (energy VAD on the device, tuned on real conversations: thinking pauses up to 1.4 s no longer cut a sentence), or with a second tap.
 - **Self layer** running: drives, the rebuff ledger, nightly reflection; see above.
+- **Face**: RoboEyes on the OLED with pupils that follow the gaze: blinks and looks around when idle, grows when listening, glances up-left/up-right while thinking, smiles while speaking. **Ops**: the brain warns 30 days before its subscription token expires, and a nightly job pulls its secrets, session, database and Claude transcripts to the Mac, encrypted.
 - **Local thinking and offline mode** working end to end; the firmware falls back to a home broker (checked on the device and both nodes with a test build that treats the cloud as down).
 - **Device UX**: ready chirp through the speaker, dim-green idle LED, status colors for record/upload/play (LTE connects can take 30+ seconds — sound beats a blinking LED).
 - Earlier milestones: HTTP LAN control → MQTT LAN → HiveMQ Cloud portable control (verified from a phone on LTE) → cloud voice round-trip with a fake device.
