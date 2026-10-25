@@ -162,6 +162,8 @@ def state_block(now=None):
             nodes.append(f"{name} 꺼짐" + (" (사람이 일부러 꺼 둠, 걱정하지 마)" if nid in excused else ""))
     if nodes:
         parts.append("노드: " + ", ".join(nodes))
+    if token_line(now):
+        parts.append(token_line(now))
     try:
         asks = selfdb.recent_asks(3)
         if asks:
@@ -908,10 +910,10 @@ _turns = 0
 _alerts = {}              # kind -> 마지막으로 알린 시각 (같은 문제를 매 턴 떠들지 않게)
 ALERT_COOLDOWN_S = 600
 
-def _alert(kind, text):
+def _alert(kind, text, cooldown=None):
     """사람이 봐야 할 문제. retained 로 남겨 두어 나중에 붙는 대시보드도 본다. 해결되면 clear_alert()."""
     now = time.time()
-    if now - _alerts.get(kind, 0) < ALERT_COOLDOWN_S:
+    if now - _alerts.get(kind, 0) < (ALERT_COOLDOWN_S if cooldown is None else cooldown):
         return
     _alerts[kind] = now
     print(f"  🚨 alert[{kind}]: {text}")
@@ -921,6 +923,40 @@ def _alert(kind, text):
 def clear_alert():
     if _client is not None:
         _client.publish(T_BRAIN_ALERT, b"", qos=1, retain=True)
+
+# ---------- 인증 토큰 만료 ----------
+# `claude setup-token` 의 1년 토큰은 스스로 갱신되지 않고, 만료 경고도 /login 로그인에만 뜬다(환경 변수 토큰에는 안 뜬다).
+# 만료일은 발급할 때 사람이 secrets 에 적어 둔다(CLAUDE_TOKEN_EXPIRES=YYYY-MM-DD). 30일 전부터 하루 한 번 알리고, 상태 블록에도 적어
+# 다음 대화에서 다이진이 직접 말하게 한다. 조용히 죽는 길(2026-10 리서치 §인프라 5)을 막는 가장 싼 방법이다.
+TOKEN_WARN_DAYS = 30
+
+def token_days_left(now=None):
+    """만료까지 남은 날 수(실수, 지났으면 음수). CLAUDE_TOKEN_EXPIRES 가 없거나 날짜가 아니면 None."""
+    s = sec("CLAUDE_TOKEN_EXPIRES")
+    if not s:
+        return None
+    try:
+        exp = time.mktime(time.strptime(s[:10], "%Y-%m-%d"))
+    except ValueError:
+        return None
+    return (exp - (time.time() if now is None else now)) / 86400
+
+def token_line(now=None):
+    """상태 블록에 넣을 한 줄. 30일 안이 아니면 ""."""
+    d = token_days_left(now)
+    if d is None or d > TOKEN_WARN_DAYS:
+        return ""
+    when = f"{int(d)}일 뒤" if d >= 1 else ("오늘" if d >= 0 else f"{int(-d)}일 전에")
+    return (f"내 인증(클로드 토큰)이 {when} 만료{'돼' if d >= 0 else '됐어'}: 사람에게 `claude setup-token` 으로 새 토큰을 만들어 "
+            "secrets 의 CLAUDE_CODE_OAUTH_TOKEN 과 CLAUDE_TOKEN_EXPIRES 를 바꿔 달라고 할 것 (오늘 이미 말했으면 다시 말하지 않는다)")
+
+def token_watch(now=None):
+    """heartbeat 가 부른다: 30일 안이면 하루 한 번 alert(retained)."""
+    d = token_days_left(now)
+    if d is None or d > TOKEN_WARN_DAYS:
+        return
+    text = f"클로드 토큰 만료 {int(d)}일 전" if d >= 0 else f"클로드 토큰 만료됨 ({int(-d)}일 전)"
+    _alert("token", text + ": claude setup-token 으로 갱신하고 secrets 의 CLAUDE_TOKEN_EXPIRES 도 바꿀 것", cooldown=86400)
 
 def brain_status(online=True):
     return json.dumps({"online": online, "ts": int(time.time()), "up_s": int(time.time() - _started),
@@ -939,6 +975,7 @@ def heartbeat(client):
         time.sleep(60)
         try:
             publish_status(client)
+            token_watch()
             url = sec("HEARTBEAT_URL")
             if url:
                 urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "daijin-brain/1.0"}), timeout=10).read()
@@ -1069,6 +1106,8 @@ def main():
     threading.Thread(target=worker, args=(c,), daemon=True).start()
     threading.Thread(target=heartbeat, args=(c,), daemon=True).start()
     print(f"🤖 daijin 브레인 시작 — 우체국 {broker()}, 생각 {','.join(engines())} — 연결 중...")
+    if sec("CLAUDE_CODE_OAUTH_TOKEN") and token_days_left() is None:
+        print("  (secrets 에 CLAUDE_TOKEN_EXPIRES=YYYY-MM-DD 를 적어 두면 토큰 만료 30일 전부터 미리 알린다)")
     connect_with_retry(c)
     c.loop_forever()
 

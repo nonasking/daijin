@@ -20,6 +20,7 @@ import math
 import os
 import pathlib
 import sys
+import time
 import types
 import unittest
 
@@ -980,6 +981,54 @@ class TestBrainStatusAndAlerts(unittest.TestCase):
         self.assertEqual(list(dm.brain_stream("안녕")), [dm.AUTH_FAIL_SENTENCE])
         self.assertEqual(pathlib.Path(session).read_text(), "old-session")
         self.assertEqual(json.loads(c.sent[-1][1])["kind"], "auth")
+
+
+class TestTokenExpiry(unittest.TestCase):
+    """The subscription token dies silently after a year; from 30 days before, the brain says so once a day."""
+
+    def setUp(self):
+        self.secrets = {}
+        for name, val in (("_client", None), ("_alerts", {}), ("sec", lambda k: self.secrets.get(k, ""))):
+            orig = getattr(dm, name); setattr(dm, name, val); self.addCleanup(setattr, dm, name, orig)
+        self.now = time.mktime((2027, 8, 1, 12, 0, 0, 0, 0, -1))
+
+    def test_no_date_means_no_opinion(self):
+        self.assertIsNone(dm.token_days_left(self.now))
+        self.secrets["CLAUDE_TOKEN_EXPIRES"] = "next september"
+        self.assertIsNone(dm.token_days_left(self.now))
+        self.assertEqual(dm.token_line(self.now), "")
+
+    def test_far_away_is_quiet_and_near_is_said(self):
+        self.secrets["CLAUDE_TOKEN_EXPIRES"] = "2027-09-15"
+        self.assertEqual(dm.token_line(self.now), "")                          # 45 days: nothing
+        late = self.now + 20 * 86400                                           # 25 days left
+        self.assertAlmostEqual(dm.token_days_left(late), 24.5, places=1)
+        self.assertIn("24일 뒤 만료돼", dm.token_line(late))
+        self.assertIn("setup-token", dm.token_line(late))
+        self.assertIn("3일 전에 만료됐어", dm.token_line(self.now + 48 * 86400))
+
+    def test_state_block_carries_the_line_only_when_near(self):
+        self.secrets["CLAUDE_TOKEN_EXPIRES"] = "2027-09-15"
+        self.assertNotIn("토큰", dm.state_block(self.now))
+        self.assertIn("클로드 토큰", dm.state_block(self.now + 20 * 86400))
+
+    def test_alert_once_a_day(self):
+        sent = []
+        class C:
+            def publish(self, topic, payload=None, qos=0, retain=False, **kw): sent.append((topic, json.loads(payload)))
+        dm._client = C()
+        self.secrets["CLAUDE_TOKEN_EXPIRES"] = "2027-09-15"
+        orig = dm.time.time; self.addCleanup(setattr, dm.time, "time", orig)
+        t = self.now + 20 * 86400
+        dm.time.time = lambda: t
+        dm.token_watch(); dm.token_watch()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], dm.T_BRAIN_ALERT)
+        self.assertEqual(sent[0][1]["kind"], "token")
+        self.assertIn("24일 전", sent[0][1]["text"])
+        dm.time.time = lambda: t + 86400 + 1
+        dm.token_watch()
+        self.assertEqual(len(sent), 2)
 
 
 class TestClipReassembly(unittest.TestCase):
