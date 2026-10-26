@@ -1,0 +1,14 @@
+# 옮기는 동안만: 아직 옛 클라우드 브로커에 붙어 있는 보드와 새 우체국의 브레인이 서로 보이게 하는 다리.
+# /etc/mosquitto/conf.d/bridge.conf 로 두고, 모든 보드를 새 호스트로 플래시한 뒤 지운다 (다리가 있는 동안은 홉이 하나 더다).
+connection hivemq
+address xxxxxxxx.s1.eu.hivemq.cloud:8883
+remote_username BRAIN_USER_ON_HIVEMQ
+remote_password BRAIN_PASS_ON_HIVEMQ
+bridge_cafile /etc/ssl/certs/ca-certificates.crt
+bridge_insecure false
+cleansession true
+try_private false
+# MQTT 5 로 붙으면 mosquitto 가 다리 구독에 no_local 을 건다: 내가 보낸 것이 클라우드에서 되돌아와 다시 보내지는 고리가 없다.
+# (HiveMQ 는 mosquitto 전용 try_private 을 모른다. 3.1.1 로 붙으면 daijin/# both 가 끝없이 돈다)
+bridge_protocol_version mqttv50
+topic daijin/# both 0

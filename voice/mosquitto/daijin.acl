@@ -1,0 +1,15 @@
+# 누가 어느 토픽을 쓰나 (docs/broker-credentials.md). 사용자 이름은 install.sh 가 만든 것과 같아야 한다.
+# 패턴에 %u 를 쓰지 않는다: 노드가 몇 개 늘어도 'nodes' 하나로 충분하고, 디바이스가 둘이 되면 그때 토픽에 id 를 넣는다.
+
+user brain
+topic readwrite daijin/#
+
+# 디바이스는 마이크다: 에이전트에게 말을 거는 길(audio/in)은 남고, ask/say/dev 에는 닿지 못한다
+user device
+topic read  daijin/audio/out
+topic write daijin/audio/in
+topic write daijin/status
+
+# 홈 노드는 자기들 토픽만. 비밀번호가 새도 에이전트에는 닿지 못한다
+user nodes
+topic readwrite daijin/dev/#

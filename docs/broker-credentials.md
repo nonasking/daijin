@@ -20,7 +20,19 @@
 디바이스는 마이크라서 원래 에이전트에게 말을 거는 물건이다. 권한을 좁혀도 `daijin/audio/in` 발행은 남는다.
 그래도 `daijin/ask`·`daijin/dev/#` 를 막아 두면 디바이스 비밀번호가 새도 할 수 있는 일이 줄어든다.
 
-## HiveMQ Cloud 에서
+## 자체 우체국 (2026-10-25부터)
+
+브레인과 같은 VPS 에 Mosquitto 가 있다 (`daijin.inanna.day:8883`, TLS, Let's Encrypt). 설정은 `voice/mosquitto/`, 설치는
+`sudo MQTT_DOMAIN=daijin.inanna.day bash voice/mosquitto/install.sh`. 위 표가 그대로 `voice/mosquitto/daijin.acl` 이고 사용자는
+`brain`·`device`·`nodes` 셋이다. 비밀번호는 맥 키체인 `daijin-mqtt-<사용자>` 에 있다.
+
+- 브레인·워처·initiative 는 같은 기계라 `127.0.0.1:1883` 평문으로 붙는다 (secrets 의 `MQTT_CLOUD_HOST=127.0.0.1`, `PORT=1883`)
+- 2026-10-26 디바이스·레드·블루 모두 옮겼고 HiveMQ 다리는 걷었다. 맥의 헬퍼 스크립트도 같은 우체국을 본다 (맥 secrets 의 `MQTT_CLOUD_*`)
+- 보드 옮기기: `sketches/<스케치>/secrets.h` 에서 `MQTT_HOST "daijin.inanna.day"`, `MQTT_USER`/`MQTT_PASS` 를 그 보드의 사용자로 (디바이스=`device`, 노드=`nodes`)
+  바꾸고 플래시. `ca_cert.h` 는 그대로 (같은 ISRG Root X1)
+- 되돌리기: `secrets.local.txt.bak-hivemq-*` (VPS·맥) 와 `sketches/*/secrets.h.bak-hivemq` 에 옛 값이 있다. HiveMQ 클러스터는 아직 지우지 않았다
+
+## HiveMQ Cloud 에서 (예전 방식)
 
 1. 클러스터의 **Access Management** 에서 권한(permission)을 만든다. 무료 플랜은 권한 하나에 토픽 필터 하나다
    - `nodes`: 필터 `daijin/dev/#`, publish + subscribe

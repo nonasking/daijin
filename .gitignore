@@ -41,3 +41,7 @@ voice/__pycache__/
 voice/fleetwatch.log
 voice/archive/
 voice/.vadlab/
+
+# 브로커 이전 때 남긴 옛 비밀 사본 (비밀번호 들어 있음)
+secrets.local.txt.bak-*
+**/secrets.h.bak-*

@@ -64,7 +64,8 @@ def cloud_client(client_id):
         c.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
     else:
         c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
-        c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+        if broker_address()[1] != 1883:          # 1883 = 같은 기계의 우체국에 평문으로 (voice/mosquitto). 그 밖은 늘 TLS
+            c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
     c.reconnect_delay_set(min_delay=1, max_delay=60)
     return c
 
