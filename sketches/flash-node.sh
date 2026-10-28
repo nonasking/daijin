@@ -9,7 +9,8 @@ NODE="${1:?노드 이름 (dev1|dev2 ... voice/nodes.json)}"; PORT="${2:?포트 (
 case "$NET" in home) NETF="-DWIFI_ONLY=1";; hot1) NETF="-DWIFI_ONLY=2";; hot2) NETF="-DWIFI_ONLY=3";; "") NETF="";; *) echo "망은 home|hot1|hot2"; exit 1;; esac
 # 노드별 기능·대기 각도·색은 voice/nodes.json 에서 온다 (표에 없는 이름이면 펌웨어 기본값: 전부 켬)
 FLAGS="$(python3 "$(dirname "$0")/../voice/nodes.py" flash "$NODE" 2>/dev/null)"
+FWV="$(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/null || echo nogit)-$(date +%y%m%d%H%M)"   # status 의 fw 로 보인다
 cd "$(dirname "$0")" || exit 1
 arduino-cli compile --fqbn esp32:esp32:esp32s3 \
-  --build-property "compiler.cpp.extra_flags=-DNODE_NAME=\"$NODE\" $FLAGS $NETF ${EXTRA_FLAGS:-}" 15-home-node || exit 1
+  --build-property "compiler.cpp.extra_flags=-DNODE_NAME=\"$NODE\" -DFW_VERSION=\"$FWV\" $FLAGS $NETF ${EXTRA_FLAGS:-}" 15-home-node || exit 1
 arduino-cli upload --fqbn esp32:esp32:esp32s3 -p "$PORT" 15-home-node

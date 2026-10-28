@@ -19,6 +19,7 @@
 #include "ca_cert.h"     // ISRG Root X1 (Let's Encrypt)
 #include "tls_time.h"    // 시계 맞추기: NTP, 막히면 HTTP Date (인증서 검증을 끄지 않기 위해)
 #include "broker_choice.h" // 클라우드에 못 붙으면 집 우체국으로 (secrets.h 에 MQTT_LOCAL_HOST 가 있을 때만)
+#include "ota.h"           // ota:<url>:<sha256> 명령 (daijin/cmd): HTTPS 로 받아 검증하고 갈아 끼움 (USB 없이 갱신)
 
 // 시각을 끝내 못 맞췄을 때 인증서 검증 없이라도 붙을지. 0(기본) = 붙지 않고 시각이 잡힐 때까지 계속 시도한다.
 // 1 로 빌드하면 예전처럼 검증 없이 붙는다: 같은 망의 누구든 브로커 행세로 MQTT 비밀번호를 가로챌 수 있으니 급할 때만.
@@ -41,6 +42,9 @@
 #define T_AUDIO_IN  "daijin/audio/in"
 #define T_AUDIO_OUT "daijin/audio/out"
 #define T_STATUS    "daijin/status"
+#define T_STATE_OTA "daijin/ota"          // 기기 → 브레인/맥: OTA 결과 (retained). 성공은 재부팅 뒤 status 의 fw 로 보인다
+#define T_CMD       "daijin/cmd"          // 브레인/맥 → 기기: 지금은 ota 만. ACL 에서 device 가 읽을 수 있는 토픽
+String pendingCmd;                      // 콜백은 받아만 두고 loop() 가 실행한다 (OTA 는 길다)
 
 const int   SR        = 16000;
 const size_t CHUNK    = 4096;                  // 수신 페이로드 상한이자 I2S 로 한 번에 쓰는 PCM 크기 (0.128초)
@@ -240,6 +244,7 @@ void ringPush16(int16_t s) {
 }
 
 void onMqtt(char* topic, byte* payload, unsigned int len) {
+  if (strcmp(topic, T_CMD) == 0) { pendingCmd = ""; for (unsigned i = 0; i < len; i++) pendingCmd += (char)payload[i]; return; }
   if (strcmp(topic, T_AUDIO_OUT) != 0 || len < HDR) return;      // len == HDR: 페이로드 없는 청크 ("답할 것 없음" 신호)
   size_t n = len - HDR;
   if (payload[1] == 0 && payload[2] == 0) {     // seq 0 = 새 클립
@@ -453,8 +458,10 @@ bool mqttTry() {
   ok = broker.result(ok);
   if (ok) {
     mqtt.subscribe(T_AUDIO_OUT, 0);     // QoS0: ACK 게이팅 없이 TCP 스트리밍
+    mqtt.subscribe(T_CMD, 1);
     logf("MQTT 연결 OK (%s)\n", broker.name());
     statusDue = true;                   // 접속 즉시 online 상태를 올려 LWT 의 offline 을 덮는다
+    if (otaResult.length()) { logf("%s\n", otaResult.c_str()); mqtt.publish(T_STATE_OTA, otaResult.c_str(), true); otaResult = ""; }
     led(0,30,0); delay(200); LED_IDLE;
     return true;
   }
@@ -532,9 +539,9 @@ void publishStatus() {
   last = millis();
   char js[256];
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"ts\":%ld,\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u,\"broker\":\"%s\"}",
+    "{\"online\":true,\"ts\":%ld,\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u,\"broker\":\"%s\",\"fw\":\"%s\"}",
     (long)time(nullptr), temperatureRead(), WiFi.SSID().c_str(), WiFi.RSSI(),
-    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap(), broker.name());
+    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap(), broker.name(), FW_VERSION);
   mqtt.publish(T_STATUS, (const uint8_t*)js, strlen(js), true);   // retained
 }
 
@@ -549,6 +556,17 @@ void loop() {
   mqtt.loop();
   publishStatus();
   faceTick();
+  if (pendingCmd.length() && !playing) {                         // 지금은 ota 만: 재생 중이 아닐 때, loop 에서
+    String c = pendingCmd; pendingCmd = "";
+    if (c.startsWith("ota:")) {
+      logf("OTA 시작: %s\n", c.c_str());
+      mqtt.publish(T_STATE_OTA, "ota:start", true); mqtt.loop(); delay(100);
+      face(F_UPLOAD); led(40,40,0);
+      mqtt.disconnect(); tls.stop(); WiFi.setSleep(false);       // MQTT 의 TLS 를 비워야 두 번째 TLS 가 들어간다 (힙 30KB 대)
+      otaCommand(c, ISRG_ROOT_X1);                               // 성공하면 여기서 재부팅
+      logf("%s\n", otaResult.c_str()); led(40,0,0); face(F_ERROR); delay(1500); face(F_IDLE); LED_IDLE;
+    }
+  }
 
   // 재생 상태 머신: 프리버퍼 차거나 마지막 청크 오면 시작, 다 비우면 종료
   if (!playing && (ringAvail() >= PREBUF || (gotLast && ringAvail() > 0))) {

@@ -32,6 +32,14 @@
   바꾸고 플래시. `ca_cert.h` 는 그대로 (같은 ISRG Root X1)
 - 되돌리기: `secrets.local.txt.bak-hivemq-*` (VPS·맥) 와 `sketches/*/secrets.h.bak-hivemq` 에 옛 값이 있다. HiveMQ 클러스터는 아직 지우지 않았다
 
+## 펌웨어 갱신 (OTA, 2026-10-27)
+
+보드마다 USB 를 꽂지 않는다. `bash sketches/ota.sh dev2` 한 줄이 빌드 → 서버(`https://daijin.inanna.day/fw/<토큰>/`, nginx) 업로드 →
+MQTT 로 `ota:<url>:<sha256>` → 보드가 받아 해시를 맞춰 보고 다른 슬롯에 써서 재부팅 → status 의 `fw` 가 새 값이 될 때까지 기다린다.
+서버 쪽은 `voice/ota/install-server.sh`(root), 보드 쪽은 `sketches/*/ota.h`. 해시는 인증된 MQTT 로 오고 내려받기는 HTTPS 라
+바이너리를 바꿔치기할 길이 없다. 토큰은 맥 secrets 의 `FW_TOKEN` 과 서버 `/var/www/daijin/fw/.token`.
+전제: 그 보드에 ota.h 가 든 펌웨어가 한 번은 USB 로 올라가 있어야 한다 (2026-10-27 이전 펌웨어에는 없다).
+
 ## HiveMQ Cloud 에서 (예전 방식)
 
 1. 클러스터의 **Access Management** 에서 권한(permission)을 만든다. 무료 플랜은 권한 하나에 토픽 필터 하나다

@@ -45,6 +45,7 @@
 #include "ca_cert.h"              // ISRG_ROOT_X1
 #include "tls_time.h"             // 시계 맞추기: NTP, 막히면 HTTP Date (인증서 검증을 끄지 않기 위해)
 #include "broker_choice.h"        // 클라우드에 못 붙으면 집 우체국으로 (secrets.h 에 MQTT_LOCAL_HOST 가 있을 때만)
+#include "ota.h"                   // ota:<url>:<sha256> 명령: HTTPS 로 받아 검증하고 갈아 끼움 (USB 없이 갱신)
 
 // 시각을 끝내 못 맞췄을 때 인증서 검증 없이라도 붙을지. 0(기본) = 붙지 않고 재부팅해서 다시 시도한다.
 // 1 로 빌드하면 예전처럼 검증 없이 붙는다: 같은 망의 누구든 브로커 행세로 MQTT 비밀번호를 가로챌 수 있으니 급할 때만.
@@ -184,6 +185,8 @@ String caps() {
   return s;
 }
 
+bool cmdFromAll = false;              // 지금 실행 중인 명령이 all/cmd 로 왔나 (runQueued 가 정한다; ota 는 거절)
+
 // "verb:arg[:arg2]" 명령 실행. 모르는 명령은 state에 "err:..."로 남겨 브레인이 알 수 있게.
 void runCmd(const String& cmd) {
   int c = cmd.indexOf(':');
@@ -242,6 +245,13 @@ void runCmd(const String& cmd) {
     ack(cmd);
   }
 #endif
+  else if (verb == "ota") {                                       // ota:<url>:<sha256> — 자기 토픽으로 온 것만 (all/cmd 는 보드마다 다른 바이너리라 거절)
+    if (cmdFromAll) { ack("err:ota-via-all"); return; }
+    ack("ota:start");                                              // 이 뒤로는 MQTT 를 끊는다: 결과는 재부팅 뒤 status 의 fw, 실패는 다시 붙은 뒤 state
+    mqtt.loop(); delay(100); mqtt.disconnect(); net.stop();
+    otaCommand(cmd, ISRG_ROOT_X1);                                 // 성공하면 여기서 재부팅한다
+    Serial.println(otaResult);
+  }
   else                      { ack("err:unknown:" + cmd); }
 }
 
@@ -250,18 +260,19 @@ void runCmd(const String& cmd) {
 // 그 사이 도착한 명령이 콜백 안의 콜백으로 겹쳐 실행됐다 (모터가 도는 중에 다른 모터 명령이 끼어듦).
 // 이제 동작 중에 온 명령은 줄을 서고, 줄이 꽉 차면 err:busy 로 알린다.
 const int QLEN = 4;
-String cmdQ[QLEN]; int qHead = 0, qCount = 0;
+String cmdQ[QLEN]; bool cmdQAll[QLEN]; int qHead = 0, qCount = 0;
 
 void onMessage(char* t, byte* p, unsigned int n) {
   String m; m.reserve(n); for (unsigned int i = 0; i < n; i++) m += (char)p[i];
   Serial.printf("[MQTT] %s <- %s\n", t, m.c_str());
   if (qCount == QLEN) { ack("err:busy:" + m); return; }
-  cmdQ[(qHead + qCount++) % QLEN] = m;
+  int slot = (qHead + qCount++) % QLEN;
+  cmdQ[slot] = m; cmdQAll[slot] = (strcmp(t, T_ALL) == 0);
 }
 
 void runQueued() {                    // loop() 에서 호출: 줄 선 명령을 하나씩, 온 순서대로
   while (qCount > 0) {
-    String m = cmdQ[qHead]; cmdQ[qHead] = "";
+    String m = cmdQ[qHead]; cmdQ[qHead] = ""; cmdFromAll = cmdQAll[qHead];
     qHead = (qHead + 1) % QLEN; qCount--;
     runCmd(m);
   }
@@ -278,13 +289,13 @@ void heartbeat() {
 #if FEAT_DHT
   float rt = dht.readTemperature(), rh = dht.readHumidity();
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"room_c\":%.1f,\"room_rh\":%.0f,\"heap\":%u,\"broker\":\"%s\"}",
+    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"room_c\":%.1f,\"room_rh\":%.0f,\"heap\":%u,\"broker\":\"%s\",\"fw\":\"%s\"}",
     NODE_NAME, (long)time(nullptr), millis()/1000UL, WiFi.RSSI(), temp, WiFi.SSID().c_str(),
-    isnan(rt) ? -1 : rt, isnan(rh) ? -1 : rh, ESP.getFreeHeap(), broker.name());
+    isnan(rt) ? -1 : rt, isnan(rh) ? -1 : rh, ESP.getFreeHeap(), broker.name(), FW_VERSION);
 #else
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"heap\":%u,\"broker\":\"%s\"}",
-    NODE_NAME, (long)time(nullptr), millis()/1000UL, WiFi.RSSI(), temp, WiFi.SSID().c_str(), ESP.getFreeHeap(), broker.name());
+    "{\"online\":true,\"node\":\"%s\",\"ts\":%ld,\"up_s\":%lu,\"rssi\":%d,\"chip_c\":%.1f,\"ssid\":\"%s\",\"heap\":%u,\"broker\":\"%s\",\"fw\":\"%s\"}",
+    NODE_NAME, (long)time(nullptr), millis()/1000UL, WiFi.RSSI(), temp, WiFi.SSID().c_str(), ESP.getFreeHeap(), broker.name(), FW_VERSION);
 #endif
   mqtt.publish(T_STATUS, (const uint8_t*)js, strlen(js), true);
 }
@@ -388,6 +399,7 @@ void loop() {
       mqtt.subscribe(T_ALL);
       setColor(NODE_COLOR);                        // 온라인 = 노드 이름 색
       lastBeat = 0; heartbeat();                   // 접속 즉시 online 하트비트
+      if (otaResult.length()) { ack(otaResult); otaResult = ""; }   // 실패한 OTA 가 있었으면 이제야 알린다
 #if FEAT_BUZZER
       buzzPreset("ok");                            // 촬영 시 "붙었다" 신호
 #endif

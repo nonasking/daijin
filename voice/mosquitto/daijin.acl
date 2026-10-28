@@ -9,6 +9,8 @@ user device
 topic read  daijin/audio/out
 topic write daijin/audio/in
 topic write daijin/status
+topic read  daijin/cmd
+topic write daijin/ota
 
 # 홈 노드는 자기들 토픽만. 비밀번호가 새도 에이전트에는 닿지 못한다
 user nodes

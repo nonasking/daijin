@@ -3,7 +3,7 @@
 import filecmp, os, unittest
 
 SKETCHES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sketches")
-SHARED = ("broker_choice.h", "tls_time.h", "ca_cert.h")
+SHARED = ("broker_choice.h", "tls_time.h", "ca_cert.h", "ota.h")
 PAIRS = (("14-daijin", "15-home-node"),)      # 12·13 은 옛 스케치: ca_cert.h 가 있어도 더 손대지 않으니 보지 않는다
 
 
