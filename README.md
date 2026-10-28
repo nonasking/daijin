@@ -6,7 +6,7 @@
 Tap a button, talk to the device → audio travels through the cloud → an AI agent (**Claude**) thinks → the device answers back in speech, in a voice I designed.
 It doesn't just reply — it **actually controls my home and my computer.**
 
-Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a brain (a Mac at home, or any small Linux box/VPS) + cloud MQTT.
+Built from a single cable up, on an ESP32-S3 (Freenove FNK0082) + a brain (a Mac at home, or any small Linux box/VPS) + an MQTT broker on the internet (today: Mosquitto on the same VPS as the brain).
 
 ## Demo
 
@@ -33,9 +33,9 @@ flowchart LR
         SPK["Speaker + I2S amp<br/>(jitter ring buffer)"]
     end
 
-    BROKER{{"HiveMQ Cloud<br/>MQTT / TLS<br/>(both sides rendezvous outbound)"}}
+    BROKER{{"Mosquitto<br/>MQTT / TLS, one login per device<br/>(the device connects outbound)"}}
 
-    subgraph brain["Brain: Mac or Linux server (outbound only)"]
+    subgraph brain["Brain: Linux server (or a Mac)"]
         STT["whisper.cpp server / Groq Whisper API<br/>(STT, Korean)"]
         AGENT["Claude<br/>(claude -p, streaming)"]
         TTS["Supertonic (on-device) / Edge / ElevenLabs<br/>(sentence by sentence)"]
@@ -52,14 +52,14 @@ flowchart LR
     AGENT -. "controls" .-> HOME["Home LEDs / devices"]
 ```
 
-- **They meet at a cloud broker** → works on any network: home WiFi or a phone hotspot on LTE. The brain only goes outbound (no inbound exposure needed), so it can be a Mac at home **or a headless Linux server** — the device does not care which. See [Run the brain on a Linux server](#run-the-brain-on-a-linux-server-no-mac-needed).
+- **They meet at a broker on the internet** → the device works on any network: home WiFi or a phone hotspot on LTE, always connecting outbound. The broker is Mosquitto with TLS on the same small VPS as the brain (`voice/mosquitto/`); any TLS broker works, and the repo was first built against the free HiveMQ Cloud tier. The brain can also be a Mac at home that only goes outbound. See [Run the brain on a Linux server](#run-the-brain-on-a-linux-server-no-mac-needed).
 - **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers: a full round trip (record → STT → agent → TTS → playback) typically takes **6–22 s** depending on how much the agent thinks and does — streaming hides part of that, but this is a conversation, not real-time.
 - **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. **Both directions are IMA ADPCM-compressed 4:1** — the ~19KB/s bandwidth ceiling applies to the ESP32's send buffer too, so raw 32KB/s PCM can't keep up in either direction. Downstream plays through a jitter ring buffer; upstream is drained by a dedicated capture task so a blocking TLS publish never drops samples.
-- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker with certificate verification on every side (the firmware keeps verifying even when NTP is blocked), credentials kept only in gitignored files, the brain makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one). Give the device and the nodes their own broker logins limited to their topics, so a node left outside cannot reach the agent: [docs/broker-credentials.md](docs/broker-credentials.md).
+- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker with certificate verification on every side (the firmware keeps verifying even when NTP is blocked), credentials kept only in gitignored files, the brain makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one). The broker enforces the rest: the brain, the device and the nodes each have their own login, and the ACL (`voice/mosquitto/daijin.acl`) keeps a node's login on `daijin/dev/#`, so a node left in a park cannot publish to `daijin/ask` or the audio topic: [docs/broker-credentials.md](docs/broker-credentials.md).
 
 ### Why ADPCM? (a physics lesson)
 
-The free broker lives in the EU: ~300 ms RTT from Korea. The ESP32's lwIP TCP receive window is ~5.7 KB and fixed. Max throughput = window ÷ RTT ≈ **19 KB/s** — physically below the 32 KB/s that raw PCM playback needs. No amount of code fixes that; compressing to 8 KB/s does.
+The broker lives in the EU (first HiveMQ's free tier, now a VPS in Germany): ~300 ms RTT from Korea. The ESP32's lwIP TCP receive window is ~5.7 KB and fixed. Max throughput = window ÷ RTT ≈ **19 KB/s** — physically below the 32 KB/s that raw PCM playback needs. No amount of code fixes that; compressing to 8 KB/s does. (Measured downstream: 10–11 KB/s through HiveMQ, about 14 KB/s once the broker moved onto the brain's own server.)
 
 ## Extensibility — bolting on other agents (open by design)
 
@@ -102,9 +102,10 @@ The local model is clearly weaker than Claude: it misplaces dates, cannot search
 - **Recording** ends by itself 1.5 s after the speaker goes quiet (energy VAD on the device, tuned on real conversations: thinking pauses up to 1.4 s no longer cut a sentence), or with a second tap.
 - **Self layer** running: drives, the rebuff ledger, nightly reflection; see above.
 - **Face**: RoboEyes on the OLED with pupils that follow the gaze: blinks and looks around when idle, grows when listening, glances up-left/up-right while thinking, smiles while speaking. **Ops**: the brain warns 30 days before its subscription token expires, and a nightly job pulls its secrets, session, database and Claude transcripts to the Mac, encrypted.
+- **Own broker and over-the-air updates**: Mosquitto on the brain's VPS with a Let's Encrypt certificate and a login per device. Every board updates without a cable: `bash sketches/ota.sh dev2` builds, uploads the image to the server, tells the board, and waits until it reports the new version (about 70 s). The board checks the SHA-256 before switching, so a broken download leaves the old firmware running.
 - **Local thinking and offline mode** working end to end; the firmware falls back to a home broker (checked on the device and both nodes with a test build that treats the cloud as down).
 - **Device UX**: ready chirp through the speaker, dim-green idle LED, status colors for record/upload/play (LTE connects can take 30+ seconds — sound beats a blinking LED).
-- Earlier milestones: HTTP LAN control → MQTT LAN → HiveMQ Cloud portable control (verified from a phone on LTE) → cloud voice round-trip with a fake device.
+- Earlier milestones: HTTP LAN control → MQTT LAN → HiveMQ Cloud portable control (verified from a phone on LTE) → cloud voice round-trip with a fake device → brain on a VPS → the broker on that VPS.
 
 ## Hardware
 
@@ -122,14 +123,17 @@ sketches/   ESP32 firmware (arduino-cli)
   11-mqtt-led         LAN MQTT
   12*-funnel          Tailscale Funnel attempt (unstable for portable use — kept as a record)
   13-cloud-led        HiveMQ Cloud (portable ✅)
-  14-daijin           the daijin device: mic → cloud → speaker ✅
-  15-home-node        home fleet node: one firmware per NODE_NAME — retained heartbeat, MQTT LWT, servo/relay/DHT/PIR switches
-                      (both: broker_choice.h falls back to a home broker when the cloud is out of reach)
+  14-daijin           the daijin device: mic → broker → speaker, RoboEyes face ✅
+  15-home-node        home fleet node: one firmware per NODE_NAME — retained heartbeat, MQTT LWT, servo/relay/stepper/DHT/PIR switches
+                      (both: broker_choice.h falls back to a home broker when the internet is out of reach; ota.h takes ota:<url>:<sha256>)
+  flash-node.sh       build and USB-flash a node with its flags from voice/nodes.json
+  ota.sh              update any board over the air: build → upload to the server → command → wait for the new fw
   test-mic            mic verification (record → HTTP → whisper)
   test-speaker        speaker verification (I2S tone melody)
   mic-diag            auto-sweeps every pin/slot combo to find I2S wiring empirically
 voice/      daijin
   daijin_mqtt.py      brain: MQTT client (STT → thinking engine → streaming TTS → ADPCM chunks) — runs on macOS or Linux
+  audio_codec.py      IMA ADPCM encoder/decoder (the pair of the firmware's) and WAV helpers
   local_mind.py       the local thinking engine: any OpenAI-compatible endpoint, three tools, guards against claimed actions
   fastpath.py         rules for clear commands and clock questions, no model
   ollama/             Modelfile for the local model with a context large enough for daijin
@@ -150,20 +154,23 @@ voice/      daijin
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
   install-agents.sh   macOS: register brain + fleet watcher as LaunchAgents
   install-services.sh Linux: register them as systemd user services (systemd/*.service)
+  mosquitto/          the broker: config, per-login ACL, install.sh (Mosquitto + Let's Encrypt + three logins)
+  ota/                install-server.sh: nginx on the broker's certificate serving firmware images for ota.sh
+  backup.sh           nightly from a Mac: pull the server's secrets, session, database and Claude transcripts, encrypted
   offline-mode.sh     run everything on this machine with no outside services (home broker, local model, whisper.cpp, Supertonic); sync/push the self layer with the server
   selfdb_merge.py     merge what was said offline back into the server's self-layer database
   vad_lab.py          record what the device sends and replay its end-of-speech rule over the clips (how the thresholds were set)
   mac-helper.sh       keep whisper.cpp running on a Mac and expose it and Ollama to the server over Tailscale only
   test_device.py      device stand-in: sends a question as ADPCM chunks, decodes the reply (`--say "..."` needs no recording)
   mic_test_server.py  HTTP endpoint for mic verification
-  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer, the local engine) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
-docs/       roadmap · research · audio protocol · broker credentials
+  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer, the local engine, token expiry, firmware headers shared between sketches) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
+docs/       start at docs/README.md: current documents (audio protocol, self layer, broker and OTA) and kept plans
 ```
 
 ## Stack
 
-ESP32-S3 · Arduino (arduino-cli) · MQTT (HiveMQ Cloud, TLS/Let's Encrypt) · Groq Whisper API or whisper.cpp (STT, Korean) ·
-Claude CLI (agent brain, stream-json) · Edge TTS (default) / ElevenLabs / macOS TTS · IMA ADPCM · launchd / systemd
+ESP32-S3 · Arduino (arduino-cli) · MQTT (Mosquitto, TLS/Let's Encrypt, per-login ACL) · Groq Whisper API or whisper.cpp (STT, Korean) ·
+Claude CLI (agent brain, stream-json) · Supertonic / Edge TTS / ElevenLabs / macOS TTS · IMA ADPCM · HTTPS OTA · launchd / systemd
 
 ## Run it yourself
 
@@ -175,7 +182,7 @@ Everything here runs on a brain machine (a Mac, or a Linux server — see the ne
 - `brew install whisper-cpp mosquitto arduino-cli` — whisper for STT, mosquitto for the `mosquitto_pub`/`mosquitto_sub` helpers, arduino-cli for flashing
 - `pip3 install paho-mqtt edge-tts`
 - whisper model: download `ggml-large-v3-turbo-q5_0.bin` into `voice/models/`
-- A cloud MQTT broker with TLS. The free HiveMQ Cloud tier is what this repo was built against.
+- An MQTT broker with TLS that the device can reach from anywhere. Either your own: `sudo MQTT_DOMAIN=<name> bash voice/mosquitto/install.sh` on the server (needs a DNS name pointing at it and ports 80/8883 open), or a hosted one — the free HiveMQ Cloud tier is what this repo was first built against.
 
 **Secrets (gitignored)**
 
@@ -198,6 +205,12 @@ bash flash-node.sh dev2 /dev/cu.usbserial-XXXX   # home node: stepper + buzzer
 ```
 Wiring for the device (mic, amp, OLED) is in [Hardware](#hardware); node pins are at the top of `15-home-node.ino`.
 
+After that first cable flash, boards update over the air. Once on the server: `sudo MQTT_DOMAIN=<name> bash voice/ota/install-server.sh` (serves firmware images on 443 under a random path, so 443 must be open; put the token it prints into `FW_TOKEN` in `secrets.local.txt`). Then from the Mac:
+
+```
+bash sketches/ota.sh daijin      # or dev1 / dev2: build, upload, command, wait for the new fw (~70 s)
+```
+
 **Brain**
 
 ```
@@ -206,7 +219,7 @@ bash voice/install-agents.sh           # or: register brain + fleet watcher as L
 ```
 Then tap BOOT on the device and talk. `bash voice/console.sh` shows every transcript, reply, and node command live; `bash voice/fleet.sh` lists node status; `bash voice/dev.sh red motor` drives a node by hand (nodes are called red and blue; they light up in their colour).
 
-**Optional: local broker bridge.** Running mosquitto on the brain machine and bridging it to the cloud broker cuts each node command from ~3 s to well under a second. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
+**Optional: local broker bridge.** Running mosquitto on a Mac and bridging it to the broker gives the helper scripts a nearby endpoint. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
 
 ### Run the brain on a Linux server (no Mac needed)
 
@@ -239,7 +252,7 @@ python3 voice/test_device.py --say "지금 몇 시야?"   # no device at hand: a
 
 Run only one brain at a time against a broker: two subscribers on `daijin/audio/in` would both answer. Stop the Mac's LaunchAgent (`bash voice/install-agents.sh remove`) once the server is up.
 
-A server in the EU sits next to the HiveMQ broker, so node command acks drop from ~3 s to well under a second even without the local bridge. Moving later to a home server is the same install; the local mosquitto bridge simply becomes available again.
+Put the broker on the same server (`voice/mosquitto/install.sh`) and the brain talks to it on `127.0.0.1:1883`: one hop fewer on every turn. Moving later to a home server is the same two installs.
 
 ## License
 
@@ -258,7 +271,9 @@ Apache 2.0. See `LICENSE` and `NOTICE`.
 - For latency, **stream sentences, not essays**: the user hears the first sentence while the rest is still being thought.
 - **Name nodes by sound, not by number.** Measured with whisper large-v3-turbo on the same 144 synthetic utterances (pink noise at ∞/20/10/5 dB): IMA ADPCM 4:1 costs about 1 CER point over raw PCM, mostly smeared consonants; with a vocabulary prompt about half that. The node names mattered more than the codec: 일 번 / 이 번 ("one"/"two") differ by one final consonant and were confused 4/16 times even from raw PCM, while red / blue were 0/16. Nodes are now called by colour and light up in it.
 - ESP32-S3 TLS needs **the right time** to verify certificates, and LTE carriers often block NTP. Falling back to *no verification* hands the broker password to anyone on the same network; fall back to the `Date` header of a plain HTTP response instead (`tls_time.h`).
-- For a portable backend, a **cloud broker** beats a **home Mac + tunnel (unstable)**.
+- For a portable backend, a **broker on the internet** (hosted, or your own on a VPS) beats a **home Mac + tunnel (unstable)**.
+- **Over-the-air updates should be boring to fail.** Write the new image to the other slot, hash it while it streams, and switch only if the hash matches the one that came over the authenticated channel. The first real failure (a download cut off at 737 KB of 1.2 MB) left the old firmware running and the board said why once it was back.
+- **An install script that makes a password must print it the moment it makes it.** Ours held three until the end, a later step failed, and only the hashes were left.
 
 ---
 *Built with [Claude Code](https://claude.com/claude-code).*
