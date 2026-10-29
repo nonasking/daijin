@@ -6,7 +6,8 @@
 #       첫 실행이 열쇠를 만들어 한 번만 보여 준다: 비밀번호 관리자에 적어 둘 것. 맥을 잃으면 그 열쇠로만 백업을 연다.
 #
 # 사용:  bash voice/backup.sh                 지금 한 번 → ~/.daijin-backup/daijin-YYYY-MM-DD.tar.gz.gpg (최근 14개 보관)
-#        bash voice/backup.sh install         매일 04:30 launchd(com.daijin.backup). 그 시각에 잠들어 있었으면 깨어난 뒤 돈다
+#        bash voice/backup.sh daily           오늘 것이 없을 때만 한 번 (launchd 가 한 시간마다 부른다)
+#        bash voice/backup.sh install         launchd(com.daijin.backup) 등록: 한 시간마다 daily
 #        bash voice/backup.sh remove          launchd 해제
 #        bash voice/backup.sh list            보관 중인 백업과 크기
 #        bash voice/backup.sh restore <파일> [폴더]    폴더(기본 ./restored)에 풀어만 둔다. 서버에 올리는 건 사람이 한다:
@@ -61,6 +62,7 @@ run() {
 
 case "${1:-run}" in
   run) run ;;
+  daily) [ -e "$DEST/daijin-$(date +%F).tar.gz.gpg" ] || run ;;     # 오늘 것이 있으면 조용히 끝 (로그도 안 남긴다)
   list) ls -lh "$DEST"/daijin-*.tar.gz.gpg 2>/dev/null || echo "백업 없음 ($DEST)" ;;
   restore)
     [ -n "$2" ] || { echo "사용: backup.sh restore <파일> [폴더]"; exit 1; }
@@ -72,7 +74,7 @@ case "${1:-run}" in
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     sed "s|__REPO__|$REPO|g; s|__HOME__|$HOME|g; s|__DEST__|$DEST|g" "$VOICE/$LABEL.plist" > "$PLIST"
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    echo "등록: $LABEL (매일 04:30) → $PLIST, 로그 $DEST/backup.log" ;;
+    echo "등록: $LABEL (한 시간마다, 하루 한 번만 백업) → $PLIST, 로그 $DEST/backup.log" ;;
   remove)
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true; rm -f "$PLIST"; echo "해제: $LABEL" ;;
   *) echo "사용: backup.sh [run|list|restore <파일> [폴더]|install|remove]"; exit 1 ;;

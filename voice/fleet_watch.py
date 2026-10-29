@@ -9,7 +9,7 @@
 # 실행: python3 -u fleet_watch.py  (상시 구동은 LaunchAgent com.daijin.fleetwatch)
 
 import json, time
-from daijin_common import sec, load_hooks, cloud_client, connect_with_retry, broker
+from daijin_common import broker_address, sec, load_hooks, cloud_client, connect_with_retry, broker
 from nodes import subject
 
 T_STATUS = "daijin/dev/+/status"
@@ -182,8 +182,10 @@ def main():
     c.on_connect = on_connect
     c.on_message = on_message
     print("👁️ fleet_watch 시작")
-    if broker() == "cloud":
-        start_local_mirror()          # 이미 집 우체국에 붙어 있으면 미러가 자기 자신을 되먹여 무한히 돈다
+    if broker() == "cloud" and broker_address()[0] not in ("127.0.0.1", "localhost"):
+        start_local_mirror()          # 이미 집 우체국에 붙어 있으면 미러가 자기 자신을 되먹여 무한히 돈다.
+                                      # 우체국이 같은 기계(VPS 의 mosquitto)면 미러할 곳이 바로 그곳이라 띄우지 않는다
+                                      # (2026-10-29: 서버에서 'iot' 자격증명으로 사흘간 2,373번 거절당하고 있었다)
     connect_with_retry(c)
     c.loop_start()
     try:
