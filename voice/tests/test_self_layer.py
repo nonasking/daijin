@@ -143,7 +143,8 @@ class TestStateBlock(DbCase):
             self.assertIn(piece, s)
         self.assertNotIn("값)", s)                                 # fresh reading: no staleness note
         self.assertLessEqual(len(s), dm.STATE_MAX_CHARS)
-        self.assertIn("[지금 상태", dm.sys_prompt())             # appended to the system prompt on every turn
+        self.assertNotIn("[지금 상태", dm.sys_prompt())          # the system prompt is fixed now
+        self.assertTrue(dm.with_state("안녕").startswith("안녕\n\n[지금 상태"))   # the state rides in the user turn
 
     def test_old_readings_and_dead_device_are_marked(self):
         now = 1_800_000_000

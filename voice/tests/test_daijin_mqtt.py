@@ -547,6 +547,7 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 import json, os, sys, time
 mode = os.environ.get("FAKE_MODE", "ok")
 resumed = "--resume" in sys.argv
+resumed_id = sys.argv[sys.argv.index("--resume") + 1] if resumed else None   # like the real CLI, a resumed session keeps its id
 def ev(o): print(json.dumps(o), flush=True)
 def say(text, sid):
     ev({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}}})
@@ -558,8 +559,13 @@ elif mode == "gone" and resumed:
     print("No conversation found with session ID: old-session", file=sys.stderr); sys.exit(1)
 elif mode == "transient" and resumed:
     ev({"type": "result", "is_error": True, "result": "API Error: 529 overloaded"}); sys.exit(1)
+elif "--input-format" in sys.argv:              # resident: one turn per user message on stdin, same session throughout
+    sid = resumed_id or "new-session"
+    for line in sys.stdin:
+        if not line.strip(): continue
+        say("응, 알았어. 다 됐어.", sid)
 else:
-    say("응, 알았어. 다 됐어.", "new-session" if not resumed else "old-session")
+    say("응, 알았어. 다 됐어.", resumed_id or "new-session")
 '''
 
 
@@ -581,6 +587,9 @@ class TestBrainStream(unittest.TestCase):
             setattr(dm, name, val)
             self.addCleanup(setattr, dm, name, orig)
         self.addCleanup(os.environ.pop, "FAKE_MODE", None)
+        self.addCleanup(dm._resident.stop, "test")
+        self.secrets = {}
+        dm.sec = lambda k: self.secrets.get(k, "")
 
     def _run(self, mode, session=None):
         os.environ["FAKE_MODE"] = mode
@@ -624,6 +633,27 @@ class TestBrainStream(unittest.TestCase):
         t = time.monotonic()
         self.assertEqual(self._run("hang"), ["미안, 너무 오래 걸려서 멈췄어."])
         self.assertLess(time.monotonic() - t, 10)
+        self.assertFalse(dm._resident.alive())                   # killed, not left hanging around
+
+    def test_the_resident_process_serves_turn_after_turn(self):
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
+        pid = dm._resident.p.pid
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
+        self.assertEqual(dm._resident.p.pid, pid)                 # same process
+        self.assertEqual(dm._resident.turns, 2)
+        self.assertEqual(dm._resident.sid, "new-session")
+
+    def test_a_dead_resident_is_restarted_on_the_saved_session(self):
+        self._run("ok")
+        dm._resident.p.kill(); dm._resident.p.wait()
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
+        self.assertTrue(dm._resident.alive())
+        self.assertEqual(dm._resident.sid, "new-session")
+
+    def test_resident_off_means_a_process_per_turn(self):
+        self.secrets["BRAIN_RESIDENT"] = "0"
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
+        self.assertIsNone(dm._resident.p)
 
 
 class TestTtsFallback(unittest.TestCase):

@@ -185,7 +185,14 @@ def state_block(now=None):
     return text[:STATE_MAX_CHARS]
 
 def sys_prompt():
-    return SYS + state_block()
+    """시스템 프롬프트는 이제 고정이다. 턴마다 바뀌는 상태 블록은 with_state() 로 사람의 말 뒤에 붙는다:
+    상주 프로세스는 시스템 프롬프트를 시작할 때 한 번만 받으므로, 매 턴 바뀌는 것은 턴 안에 있어야 한다."""
+    return SYS
+
+def with_state(text, now=None):
+    """사람의 말 + 지금 상태 블록. 상태가 비어 있으면 말만."""
+    s = state_block(now).strip()
+    return f"{text}\n\n{s}" if s else text
 
 # ---------- 그 사이 내가 먼저 한 말 ----------
 # daijin/say 로 나간 말은 에이전트를 거치지 않아 고정 세션의 대화 이력에 없다. 그러면 모델은 상태 블록에 기록이 있어도
@@ -425,9 +432,57 @@ _resume_failures = 0
 _AUTH_FAIL = re.compile(r"401|unauthori[sz]ed|authentication|invalid.{0,20}(api key|token)|token.{0,20}(expired|revoked|invalid)|not logged in|please run /login", re.I)
 AUTH_FAIL_SENTENCE = "브레인 인증에 문제가 생겼어. 서버에서 토큰을 확인해 줘."
 
+def _read_turn(lines, st):
+    """claude 의 stream-json 출력을 한 턴(result 이벤트까지) 읽어 문장을 yield. 결과는 st 에 남긴다:
+    ok(정상 종료) · yielded(한 문장이라도 나옴) · noise(JSON 이 아닌 출력과 오류 문구, 진단용).
+    lines 는 줄 이터레이터: 한 번 쓰고 버리는 프로세스의 stdout 이든, 상주 프로세스의 stdout 이든 같다.
+    result 를 보면 멈춘다(상주 프로세스는 다음 턴에 이어 읽는다). 스트림이 그 전에 끝나면 남은 글을 마지막 문장으로 낸다."""
+    buf = ""
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            if line.strip():
+                st["noise"].append(line.strip()[:300])
+            continue
+        if not isinstance(obj, dict):
+            continue
+        t = obj.get("type")
+        if t == "stream_event":
+            ev = obj.get("event", {})
+            if ev.get("type") == "content_block_delta" and \
+               ev.get("delta", {}).get("type") == "text_delta":
+                buf += ev["delta"]["text"]
+                while True:
+                    m = _SENT_END.search(buf)
+                    if not m:
+                        break
+                    sent = EMOJI.sub("", buf[:m.end()]).strip()
+                    buf = buf[m.end():]
+                    if sent:
+                        st["yielded"] = True
+                        yield sent
+            elif ev.get("type") == "content_block_stop":
+                # 텍스트 블록이 끝나면(다음은 도구 호출) 마침표 뒤 공백이 없어도 바로 내보낸다.
+                # 안 그러면 "응, 알았어."가 도구 실행이 끝난 뒤 다음 문장과 붙어서 나온다(실측).
+                sent = EMOJI.sub("", buf).strip(); buf = ""
+                if sent:
+                    st["yielded"] = True
+                    yield sent
+        elif t == "result":
+            st["ok"] = not obj.get("is_error")
+            if st["ok"]:
+                save_session(obj.get("session_id"))
+            else:
+                st["noise"].append(str(obj.get("result") or obj.get("subtype") or "is_error")[:300])
+            break
+    rest = EMOJI.sub("", buf).strip()
+    if rest and not st["timeout"]:
+        st["yielded"] = True
+        yield rest
+
 def _claude_stream(text, resume_id, st):
-    """claude -p 를 스트리밍으로 돌려 문장을 yield. 결과는 st 에 남긴다:
-    ok(정상 종료) · yielded(한 문장이라도 나옴) · timeout · noise(JSON 이 아닌 출력과 오류 문구, 진단용)."""
+    """claude -p 를 한 턴만 돌려(한 번 쓰고 버리는 프로세스) 문장을 yield. 결과는 st 에 (_read_turn 참고, timeout 도 여기서)."""
     cmd = [CLAUDE, "-p", text, "--output-format", "stream-json",
            "--include-partial-messages", "--verbose",
            "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", sys_prompt()] + _speed_opts()
@@ -442,55 +497,103 @@ def _claude_stream(text, resume_id, st):
     killer = threading.Timer(BRAIN_TIMEOUT_S, _kill)
     killer.daemon = True
     killer.start()
-    buf = ""
     try:
-        for line in p.stdout:
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                if line.strip():
-                    st["noise"].append(line.strip()[:300])
-                continue
-            if not isinstance(obj, dict):
-                continue
-            t = obj.get("type")
-            if t == "stream_event":
-                ev = obj.get("event", {})
-                if ev.get("type") == "content_block_delta" and \
-                   ev.get("delta", {}).get("type") == "text_delta":
-                    buf += ev["delta"]["text"]
-                    while True:
-                        m = _SENT_END.search(buf)
-                        if not m:
-                            break
-                        sent = EMOJI.sub("", buf[:m.end()]).strip()
-                        buf = buf[m.end():]
-                        if sent:
-                            st["yielded"] = True
-                            yield sent
-                elif ev.get("type") == "content_block_stop":
-                    # 텍스트 블록이 끝나면(다음은 도구 호출) 마침표 뒤 공백이 없어도 바로 내보낸다.
-                    # 안 그러면 "응, 알았어."가 도구 실행이 끝난 뒤 다음 문장과 붙어서 나온다(실측).
-                    sent = EMOJI.sub("", buf).strip(); buf = ""
-                    if sent:
-                        st["yielded"] = True
-                        yield sent
-            elif t == "result":
-                st["ok"] = not obj.get("is_error")
-                if st["ok"]:
-                    save_session(obj.get("session_id"))
-                else:
-                    st["noise"].append(str(obj.get("result") or obj.get("subtype") or "is_error")[:300])
+        yield from _read_turn(p.stdout, st)
         p.wait()
     finally:
         killer.cancel()
         if p.poll() is None:                # 읽던 쪽이 도중에 그만뒀다: claude 를 남겨 두지 않는다
             p.kill(); p.wait()
         p.stdout.close()
-    rest = EMOJI.sub("", buf).strip()
-    if rest and not st["timeout"]:
-        st["yielded"] = True
-        yield rest
+
+# ---------- 상주 claude ----------
+# 턴마다 claude 를 새로 띄우면 기동에만 3초 넘게 든다 (2026-10-31 맥 실측, 같은 한 줄 질문: 새 프로세스 5.0초, 상주 프로세스의
+# 두 번째 턴 0.7초). 그래서 프로세스 하나를 띄워 두고 --input-format stream-json 으로 턴을 흘려 넣는다. 세션은 그 프로세스가
+# 쥐고 있고(result 의 session_id 를 예전처럼 .daijin_session 에 저장), 죽거나 시간을 넘기면 다음 턴에 --resume 로 다시 띄운다.
+# secrets BRAIN_RESIDENT=0 이면 예전처럼 턴마다 새 프로세스 (되돌리기).
+def resident_on():
+    return sec("BRAIN_RESIDENT") != "0"
+
+class Resident:
+    def __init__(self):
+        self.p, self.sid, self.turns = None, None, 0
+
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+    def start(self, resume_id):
+        cmd = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+               "--include-partial-messages", "--verbose",
+               "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", sys_prompt()] + _speed_opts()
+        if resume_id:
+            cmd += ["--resume", resume_id]
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, encoding="utf-8", cwd=VOICE, env=_claude_env())
+        self.sid, self.turns = resume_id, 0
+        print(f"  🧠 claude 상주 시작 (pid {self.p.pid}, 세션 {resume_id or '새로'})")
+
+    def stop(self, why=""):
+        p, self.p = self.p, None
+        if p is None:
+            return
+        for f in (p.stdin,):
+            try: f.close()
+            except Exception: pass
+        if p.poll() is None:
+            try: p.wait(timeout=3)
+            except subprocess.TimeoutExpired: p.kill(); p.wait()
+        try: p.stdout.close()
+        except Exception: pass
+        print(f"  🧠 claude 상주 종료 ({why or '정리'}, {self.turns}턴)")
+
+    def _drain(self, st):
+        """죽은 프로세스가 남긴 출력(오류 문구)을 noise 로 거둔다."""
+        try:
+            for line in self.p.stdout:
+                if line.strip():
+                    st["noise"].append(line.strip()[:300])
+        except Exception:
+            pass
+
+    def turn(self, text, resume_id, st):
+        """한 턴. 문장을 yield. 세션이 바뀌었거나 프로세스가 없으면 (다시) 띄운다."""
+        if self.alive() and self.sid != resume_id:
+            self.stop("세션 바뀜")
+        if not self.alive():
+            self.start(resume_id)
+        p = self.p
+        try:
+            p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=False) + "\n")
+            p.stdin.flush()
+        except (BrokenPipeError, OSError) as e:          # 뜨자마자 죽었다 (--resume 한 세션이 없을 때 등): 이유는 stdout 에 있다
+            self._drain(st); self.stop(f"쓰기 실패 {e.__class__.__name__}")
+            return
+        def _kill():
+            st["timeout"] = True
+            p.kill()
+        killer = threading.Timer(BRAIN_TIMEOUT_S, _kill)
+        killer.daemon = True
+        killer.start()
+        try:
+            yield from _read_turn(p.stdout, st)
+        finally:
+            killer.cancel()
+        self.turns += 1
+        if st["ok"]:
+            self.sid = load_session()                    # result 의 session_id 가 저장됐다: 다음 턴의 비교 기준
+        if st["timeout"] or p.poll() is not None:
+            self._drain(st)
+            self.stop("시간 초과" if st["timeout"] else f"종료 코드 {p.returncode}")
+
+_resident = Resident()
+import atexit
+atexit.register(lambda: _resident.stop("브레인 종료"))
+
+def _think_turn(text, resume_id, st):
+    if resident_on():
+        yield from _resident.turn(text, resume_id, st)
+    else:
+        yield from _claude_stream(text, resume_id, st)
 
 def _new_state():
     return {"ok": False, "yielded": False, "timeout": False, "noise": []}
@@ -501,7 +604,8 @@ def claude_think(text, out):
     global _resume_failures
     sid = load_session()
     st = _new_state()
-    yield from _claude_stream(text, sid, st)
+    text = with_state(text)
+    yield from _think_turn(text, sid, st)
     if st["timeout"]:
         print(f"  ⚠️ 에이전트 {BRAIN_TIMEOUT_S}초 초과 → 중단")
         out["failed"] = "timeout"
@@ -521,7 +625,7 @@ def claude_think(text, out):
         print("  (세션을 찾을 수 없음 → 새 세션으로)" if gone else
               f"  (세션 재개가 {_resume_failures}번 연속 실패 → 새 세션으로. 이전 id 는 .daijin_session.prev)")
         st = _new_state()
-        yield from _claude_stream(text, None, st)
+        yield from _think_turn(text, None, st)
         if st["ok"] or st["yielded"]:
             _resume_failures = 0
             return
