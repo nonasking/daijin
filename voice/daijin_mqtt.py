@@ -780,7 +780,17 @@ def tts_stream(text):
 # 다운스트림(audio/out)은 IMA ADPCM 4:1 압축 — EU 브로커 RTT 300ms × ESP32 TCP창 5.7KB
 # = 최대 ~19KB/s라 PCM(32KB/s)은 물리적으로 불가. ADPCM은 8KB/s로 여유.
 CHUNK_OUT = 2048      # ADPCM 청크 (=4096샘플=256ms). 디바이스가 올려 보내는 청크도 같은 크기다
-_rx = {"clip": None, "parts": {}}   # 수신 중인 클립 재조립 버퍼
+_rx = {"clip": None, "parts": {}, "at": 0}   # 수신 중인 클립 재조립 버퍼 (at = 마지막 청크 시각)
+
+def rx_abandon(reason):
+    """받다 만 클립을 버리고 로그에 남긴다. TCP 위라 중간 청크가 빠지는 일은 드물고, 실제로는 기기 연결이 끊겨 꼬리가 안 오는 쪽이다
+    (2026-10-31 실측: 밖에서 건 세 번째 말은 기기 쪽 발행 실패로 아예 안 왔고, 그 전 둘은 온전했다)."""
+    if _rx["clip"] is None:
+        return
+    print(f"  ⚠️ 클립 {_rx['clip']} 미완성: {len(_rx['parts'])}청크 받고 {reason}")
+    _rx["clip"], _rx["parts"] = None, {}
+
+RX_STALE_S = 10                      # 마지막 청크 뒤 이만큼 조용하면 꼬리를 잃은 것으로 본다 (클립은 길어야 20초, 청크 간격은 0.3초쯤)
 
 # ---------- IMA ADPCM 코덱과 WAV: audio_codec.py (테스트와 도구가 dm.AdpcmEnc 처럼 부를 수 있게 이름을 그대로 둔다) ----------
 from audio_codec import _STEP, _IDX, AdpcmEnc, AdpcmDec, pcm_to_wav, wav_to_pcm  # noqa: E402,F401
@@ -974,6 +984,8 @@ def heartbeat(client):
     while True:
         time.sleep(60)
         try:
+            if _rx["clip"] is not None and time.time() - _rx["at"] > RX_STALE_S:
+                rx_abandon(f"{int(time.time() - _rx['at'])}초 조용함 (기기 연결이 끊긴 듯)")
             publish_status(client)
             token_watch()
             url = sec("HEARTBEAT_URL")
@@ -1081,8 +1093,10 @@ def on_message(client, userdata, msg):
         return
     clip, seq, last = p[0], (p[1] << 8) | p[2], p[3] & 1
     if _rx["clip"] != clip or seq == 0:       # 새 클립 시작 (seq 0 도 기준: 디바이스가 재부팅하면 clipId 가 다시 0부터다)
+        rx_abandon("다음 클립이 왔다")
         _rx["clip"], _rx["parts"] = clip, {}
         _rx["adpcm"] = bool(p[3] & 2)         # bit1 = ADPCM 압축 클립
+    _rx["at"] = time.time()
     _rx["parts"][seq] = p[4:]
     if last:
         gap = sorted(set(range(seq + 1)) - _rx["parts"].keys())

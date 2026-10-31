@@ -1040,7 +1040,7 @@ class TestClipReassembly(unittest.TestCase):
             self.payload = bytes([clip, (seq >> 8) & 0xFF, seq & 0xFF, 1 if last else 0]) + payload
 
     def setUp(self):
-        for name, val in (("_rx", {"clip": None, "parts": {}}), ("_clipq", dm.queue.Queue())):
+        for name, val in (("_rx", {"clip": None, "parts": {}, "at": 0}), ("_clipq", dm.queue.Queue())):
             orig = getattr(dm, name); setattr(dm, name, val); self.addCleanup(setattr, dm, name, orig)
 
     def _feed(self, *msgs):
@@ -1055,6 +1055,19 @@ class TestClipReassembly(unittest.TestCase):
         out = self._feed(self.Msg(7, 0, False, b"aa"), self.Msg(7, 1, False, b"bb"), self.Msg(7, 2, True, b"cc"))
         self.assertEqual(dm._clipq.get_nowait(), ("pcm", b"aabbcc"))
         self.assertNotIn("유실", out)
+
+    def test_a_clip_that_never_ends_is_said_so_when_the_next_one_starts_or_time_passes(self):
+        out = self._feed(self.Msg(3, 0, False, b"aa"), self.Msg(3, 1, False, b"bb"))     # no last chunk: the device fell off
+        self.assertNotIn("미완성", out); self.assertTrue(dm._clipq.empty())
+        out = self._feed(self.Msg(4, 0, False, b"cc"))
+        self.assertIn("클립 3 미완성: 2청크 받고 다음 클립이 왔다", out)
+        dm._rx["at"] = dm.time.time() - 11
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dm.rx_abandon("11초 조용함")
+        self.assertIn("클립 4 미완성: 1청크 받고 11초 조용함", buf.getvalue())
+        self.assertIsNone(dm._rx["clip"])
 
     def test_missing_middle_chunk_is_logged_and_the_rest_still_goes_on(self):
         out = self._feed(self.Msg(9, 0, False, b"aa"), self.Msg(9, 2, False, b"cc"), self.Msg(9, 3, True, b"dd"))
