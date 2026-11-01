@@ -514,9 +514,15 @@ def _claude_stream(text, resume_id, st):
 def resident_on():
     return sec("BRAIN_RESIDENT") != "0"
 
+RESIDENT_MAX_TURNS = 200          # 이만큼 받았거나
+RESIDENT_MAX_AGE_S = 24 * 3600    # 이만큼 오래 살았으면, 조용할 때(10분 넘게 턴이 없을 때) heartbeat 가 새로 띄운다:
+RESIDENT_QUIET_S = 600            # 다음 말이 왔을 때 기동 3초를 치르지 않게 미리 갈아 둔다 (2026-11-01 실측: 턴당 RSS 1MB 쯤 는다)
+
 class Resident:
     def __init__(self):
         self.p, self.sid, self.turns = None, None, 0
+        self.started, self.last_turn = 0.0, 0.0
+        self.lock = threading.Lock()      # 워커(턴)와 heartbeat(갈아 끼우기)가 같은 프로세스를 만진다
 
     def alive(self):
         return self.p is not None and self.p.poll() is None
@@ -530,6 +536,7 @@ class Resident:
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, encoding="utf-8", cwd=VOICE, env=_claude_env())
         self.sid, self.turns = resume_id, 0
+        self.started = self.last_turn = time.time()
         print(f"  🧠 claude 상주 시작 (pid {self.p.pid}, 세션 {resume_id or '새로'})")
 
     def stop(self, why=""):
@@ -555,8 +562,26 @@ class Resident:
         except Exception:
             pass
 
+    def recycle_if_due(self, now=None):
+        """heartbeat 가 부른다: 오래 살았거나 턴을 많이 받은 프로세스를, 조용한 틈에 같은 세션으로 새로 띄운다."""
+        now = time.time() if now is None else now
+        with self.lock:
+            if not self.alive() or now - self.last_turn < RESIDENT_QUIET_S:
+                return False
+            if self.turns < RESIDENT_MAX_TURNS and now - self.started < RESIDENT_MAX_AGE_S:
+                return False
+            why = f"{self.turns}턴" if self.turns >= RESIDENT_MAX_TURNS else f"{int((now - self.started) // 3600)}시간"
+            self.stop(f"갈아 끼움: {why}")
+            self.start(load_session())
+            return True
+
     def turn(self, text, resume_id, st):
         """한 턴. 문장을 yield. 세션이 바뀌었거나 프로세스가 없으면 (다시) 띄운다."""
+        with self.lock:
+            yield from self._turn(text, resume_id, st)
+
+    def _turn(self, text, resume_id, st):
+        self.last_turn = time.time()
         if self.alive() and self.sid != resume_id:
             self.stop("세션 바뀜")
         if not self.alive():
@@ -579,6 +604,7 @@ class Resident:
         finally:
             killer.cancel()
         self.turns += 1
+        self.last_turn = time.time()
         if st["ok"]:
             self.sid = load_session()                    # result 의 session_id 가 저장됐다: 다음 턴의 비교 기준
         if st["timeout"] or p.poll() is not None:
@@ -1092,6 +1118,7 @@ def heartbeat(client):
                 rx_abandon(f"{int(time.time() - _rx['at'])}초 조용함 (기기 연결이 끊긴 듯)")
             publish_status(client)
             token_watch()
+            _resident.recycle_if_due()
             url = sec("HEARTBEAT_URL")
             if url:
                 urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "daijin-brain/1.0"}), timeout=10).read()

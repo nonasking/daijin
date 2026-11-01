@@ -650,6 +650,21 @@ class TestBrainStream(unittest.TestCase):
         self.assertTrue(dm._resident.alive())
         self.assertEqual(dm._resident.sid, "new-session")
 
+    def test_an_old_or_busy_resident_is_replaced_in_a_quiet_moment(self):
+        self._run("ok")
+        pid = dm._resident.p.pid
+        now = dm.time.time()
+        self.assertFalse(dm._resident.recycle_if_due(now))                          # young, and just used
+        dm._resident.started = now - dm.RESIDENT_MAX_AGE_S - 1
+        self.assertFalse(dm._resident.recycle_if_due(now))                          # old, but used a moment ago
+        dm._resident.last_turn = now - dm.RESIDENT_QUIET_S - 1
+        self.assertTrue(dm._resident.recycle_if_due(now))                           # old and quiet: replaced
+        self.assertTrue(dm._resident.alive()); self.assertNotEqual(dm._resident.p.pid, pid)
+        self.assertEqual(dm._resident.sid, "new-session")                            # on the same session
+        dm._resident.turns = dm.RESIDENT_MAX_TURNS; dm._resident.last_turn = now - dm.RESIDENT_QUIET_S - 1
+        self.assertTrue(dm._resident.recycle_if_due(now))                           # many turns: replaced too
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
+
     def test_resident_off_means_a_process_per_turn(self):
         self.secrets["BRAIN_RESIDENT"] = "0"
         self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
