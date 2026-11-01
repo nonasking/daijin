@@ -665,6 +665,31 @@ class TestBrainStream(unittest.TestCase):
         self.assertTrue(dm._resident.recycle_if_due(now))                           # many turns: replaced too
         self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
 
+    def test_a_turn_abandoned_midway_does_not_leave_the_next_turn_one_behind(self):
+        os.environ["FAKE_MODE"] = "ok"
+        g = dm.brain_stream("안녕")
+        self.assertEqual(next(g), "응, 알았어.")
+        g.close()                                                    # the speaker side failed after one sentence
+        self.assertFalse(dm._resident.alive())                       # that process is dropped
+        self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])    # and the next turn hears its own answer
+
+    def test_recycle_does_not_wait_for_a_turn_in_progress(self):
+        self._run("ok")
+        import time as _t
+        dm._resident.lock.acquire()
+        try:
+            t0 = _t.monotonic()
+            self.assertFalse(dm._resident.recycle_if_due(_t.time() + 10 ** 6))
+            self.assertLess(_t.monotonic() - t0, 0.5)
+        finally:
+            dm._resident.lock.release()
+
+    def test_a_missing_cli_hands_over_to_the_next_engine(self):
+        dm.CLAUDE = "/nonexistent/claude"
+        out = {}
+        self.assertEqual(list(dm.claude_think("안녕", out)), [])
+        self.assertEqual(out.get("failed"), "error")
+
     def test_resident_off_means_a_process_per_turn(self):
         self.secrets["BRAIN_RESIDENT"] = "0"
         self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])

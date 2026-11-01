@@ -8,6 +8,7 @@ VOICE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(dirname "$VOICE")
 DEST="$HOME/Library/LaunchAgents"; mkdir -p "$DEST"
 for name in com.daijin.brain com.daijin.fleetwatch; do
   launchctl bootout "gui/$(id -u)/$name" 2>/dev/null || true
+  [ "$1" = "remove" ] || sleep 2                        # bootout 직후 bootstrap 은 EIO 로 실패할 때가 있다
   if [ "$1" = "remove" ]; then rm -f "$DEST/$name.plist"; echo "해제: $name"; continue; fi
   sed "s|__REPO__|$REPO|g; s|__HOME__|$HOME|g" "$VOICE/$name.plist" > "$DEST/$name.plist"
   launchctl bootstrap "gui/$(id -u)" "$DEST/$name.plist"

@@ -13,7 +13,7 @@
 # 실행: python3 -u initiative.py [--dry-run] [--once]   (상시 구동은 systemd daijin-initiative)
 import argparse, json, re, time
 from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
-from nodes import spoken, mentioned
+from nodes import NODES, spoken, mentioned
 import selfdb, ledger_rules as rules
 
 T_DEV_STATUS  = "daijin/status"
@@ -64,6 +64,8 @@ class Body:
             self.device, self.device_rx = d, now
         elif topic.startswith("daijin/dev/"):
             nid = topic.split("/")[2]
+            if nid not in NODES:                   # 표에 없는 이름은 버린다: 이 이름이 node_loss 의 ask 문장에 실린다
+                return
             self.nodes[nid] = (d, now)
             if d.get("online"):
                 if nid in self.offline_since or nid not in selfdb.node_state_all():

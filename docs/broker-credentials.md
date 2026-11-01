@@ -12,10 +12,12 @@
 |---|---|---|
 | 브레인 (플릿 워처, 헬퍼 스크립트 포함) | `daijin/#` | 발행 + 구독 |
 | 디바이스 (14-daijin) | `daijin/audio/out` 구독, `daijin/audio/in`·`daijin/status` 발행 | 아래 참고 |
-| 홈 노드 (15-home-node) | `daijin/dev/#` | 발행 + 구독 |
+| 홈 노드 (15-home-node) | 노드마다 `daijin/dev/<id>/status·state·event` 쓰기, `daijin/dev/<id>/cmd`·`daijin/dev/all/cmd` 읽기 | 이름을 하나하나 적는다 |
 
-핵심은 **노드 자격증명**이다. `daijin/dev/#` 만 쓸 수 있으면 노드끼리의 명령·상태는 그대로 되고,
-`daijin/ask`·`daijin/say`·`daijin/audio/in` 에는 닿지 못한다.
+핵심은 **노드 자격증명**이다. 노드는 자기 상태를 쓰고 명령을 읽기만 하므로 `daijin/ask`·`daijin/say`·`daijin/audio/in` 에 닿지 못하고,
+다른 노드에 명령(ota 포함)을 보내지도 못한다. 처음엔 `daijin/dev/#` 를 통째로 줬는데, 그러면 `daijin/dev/<아무 글>/status` 를
+retained 로 올려 그 토픽 이름이 브레인의 상태 블록과 initiative 의 ask 에 실렸다 (2026-11-01 리뷰). 지금은 ACL 이 이름을 적고,
+브레인·initiative·플릿 워처도 `nodes.json` 에 없는 id 는 버린다. 노드를 더하면 `daijin.acl` 에 네 줄을 더한다 (테스트가 잡는다).
 
 디바이스는 마이크라서 원래 에이전트에게 말을 거는 물건이다. 권한을 좁혀도 `daijin/audio/in` 발행은 남는다.
 그래도 `daijin/ask`·`daijin/dev/#` 를 막아 두면 디바이스 비밀번호가 새도 할 수 있는 일이 줄어든다.
@@ -37,7 +39,11 @@
 보드마다 USB 를 꽂지 않는다. `bash sketches/ota.sh dev2` 한 줄이 빌드 → 서버(`https://daijin.inanna.day/fw/<토큰>/`, nginx) 업로드 →
 MQTT 로 `ota:<url>:<sha256>` → 보드가 받아 해시를 맞춰 보고 다른 슬롯에 써서 재부팅 → status 의 `fw` 가 새 값이 될 때까지 기다린다.
 서버 쪽은 `voice/ota/install-server.sh`(root), 보드 쪽은 `sketches/*/ota.h`. 해시는 인증된 MQTT 로 오고 내려받기는 HTTPS 라
-바이너리를 바꿔치기할 길이 없다. 토큰은 맥 secrets 의 `FW_TOKEN` 과 서버 `/var/www/daijin/fw/.token`.
+내려받는 중에 바이트가 바뀌면 보드가 버린다. 다만 해시는 명령과 같은 메시지로 오니 **출처를 증명하지는 못한다**: `cmd` 에 쓸 수
+있는 쪽이면 자기 서버의 바이너리와 그 해시를 보낼 수 있다. 그래서 `cmd` 에 쓸 수 있는 건 brain 뿐이다(ACL). 펌웨어 쪽 URL 고정은
+다음 펌웨어에서 (2026-11-01 리뷰). 토큰은 맥 secrets 의 `FW_TOKEN` 과 서버 `/var/www/daijin/fw/.token`.
+
+맥의 집 우체국(brew mosquitto, `iot` 하나, ACL 없음)은 VPS 로 `daijin/ask`·`daijin/say` 를 넘기지 않는다 (2026-11-01 다리에서 뺌).
 전제: 그 보드에 ota.h 가 든 펌웨어가 한 번은 USB 로 올라가 있어야 한다 (2026-10-27 이전 펌웨어에는 없다).
 
 ## HiveMQ Cloud 에서 (예전 방식)

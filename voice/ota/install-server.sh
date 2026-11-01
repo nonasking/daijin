@@ -56,11 +56,14 @@ nginx -t
 systemctl enable --now nginx
 systemctl reload nginx
 
-# 갱신을 webroot 로: nginx 가 80 을 쓰므로 standalone 은 더 못 쓴다
-certbot certonly --webroot -w /var/www/certbot -d "$MQTT_DOMAIN" --non-interactive --keep-until-expiring >/dev/null
+# 갱신을 webroot 로: nginx 가 80 을 쓰므로 standalone 은 더 못 쓴다.
+# certonly --webroot 는 아직 만료가 멀면 아무것도 안 하고 갱신 설정(authenticator = standalone)도 그대로 둔다 (2026-11-01 실측:
+# 그래서 갱신 모의실행이 "Could not bind TCP port 80" 으로 실패하고 있었다). reconfigure 가 설정 자체를 바꾼다.
+certbot reconfigure --cert-name "$MQTT_DOMAIN" --webroot -w /var/www/certbot --non-interactive >/dev/null
 HOOK=/etc/letsencrypt/renewal-hooks/deploy/nginx-reload.sh
 printf '#!/bin/bash\nsystemctl reload nginx\n' > "$HOOK"; chmod +x "$HOOK"
-certbot renew --dry-run >/dev/null && echo "인증서 갱신(webroot) 확인"
+if certbot renew --dry-run --no-random-sleep-on-renew >/dev/null 2>&1; then echo "인증서 갱신(webroot) 확인"
+else echo "인증서 갱신 모의실행 실패: certbot renew --dry-run 으로 원인을 볼 것"; exit 1; fi
 
 command -v ufw >/dev/null && ufw status | grep -q "^Status: active" && ufw allow 443/tcp >/dev/null
 echo "펌웨어 자리 준비: https://$MQTT_DOMAIN/fw/<토큰>/<이름>.bin  (디렉토리 /var/www/daijin/fw/$TOKEN)"

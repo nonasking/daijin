@@ -18,5 +18,21 @@ class TestSharedHeaders(unittest.TestCase):
                                     f"{a}/{name} 와 {b}/{name} 가 다르다: 한쪽을 고쳤으면 다른 쪽에도 복사할 것")
 
 
+class TestBrokerAcl(unittest.TestCase):
+    def test_every_node_has_exactly_its_own_topics_and_nothing_wider(self):
+        import json
+        voice = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        nodes = json.load(open(os.path.join(voice, "nodes.json")))
+        acl = open(os.path.join(voice, "mosquitto", "daijin.acl")).read()
+        block = acl.split("user nodes", 1)[1].split("\nuser ", 1)[0]
+        for nid in nodes:
+            for want in (f"write daijin/dev/{nid}/status", f"write daijin/dev/{nid}/state",
+                         f"write daijin/dev/{nid}/event", f"read  daijin/dev/{nid}/cmd"):
+                with self.subTest(node=nid, line=want):
+                    self.assertIn(want, block)
+        self.assertNotIn("#", block.replace("# ", ""))          # no wildcard for the nodes login
+        self.assertNotIn("readwrite", block)
+
+
 if __name__ == "__main__":
     unittest.main()

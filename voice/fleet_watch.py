@@ -10,7 +10,7 @@
 
 import json, time
 from daijin_common import broker_address, sec, load_hooks, cloud_client, connect_with_retry, broker
-from nodes import subject
+from nodes import NODES, subject
 
 T_STATUS = "daijin/dev/+/status"
 T_MAIN   = "daijin/status"      # 메인 디바이스 상태 (status.sh용)
@@ -107,6 +107,8 @@ def on_message(client, userdata, msg):
     if not msg.topic.startswith("daijin/dev/"):
         return
     node = msg.topic.split("/")[2]
+    if node not in NODES:                     # 표에 없는 이름은 버린다 (FLEET_REPORT=ask 면 이 이름이 에이전트에 간다)
+        return
     try:
         d = json.loads(msg.payload)
     except ValueError:

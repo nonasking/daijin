@@ -134,7 +134,9 @@ def note_status(topic, payload):
     if topic == T_DEV_STATUS:
         _body["device"], _body["device_ts"] = d, time.time()
     elif topic.startswith("daijin/dev/"):
-        _body["nodes"][topic.split("/")[2]] = (d, time.time())
+        nid = topic.split("/")[2]
+        if nid in NODES:                      # 표에 없는 이름은 버린다: 토픽 이름이 그대로 상태 블록(에이전트가 읽는 글)에 실리기 때문
+            _body["nodes"][nid] = (d, time.time())
 
 def _age(sec_):
     return f"{int(sec_)}초 전" if sec_ < 120 else f"{int(sec_ // 60)}분 전" if sec_ < 7200 else f"{int(sec_ // 3600)}시간 전"
@@ -470,6 +472,7 @@ def _read_turn(lines, st):
                     st["yielded"] = True
                     yield sent
         elif t == "result":
+            st["result"] = True
             st["ok"] = not obj.get("is_error")
             if st["ok"]:
                 save_session(obj.get("session_id"))
@@ -565,7 +568,9 @@ class Resident:
     def recycle_if_due(self, now=None):
         """heartbeat 가 부른다: 오래 살았거나 턴을 많이 받은 프로세스를, 조용한 틈에 같은 세션으로 새로 띄운다."""
         now = time.time() if now is None else now
-        with self.lock:
+        if not self.lock.acquire(blocking=False):        # 턴이 도는 중: 기다리지 않는다 (heartbeat 의 상태 발행이 턴 내내 멈췄었다)
+            return False
+        try:
             if not self.alive() or now - self.last_turn < RESIDENT_QUIET_S:
                 return False
             if self.turns < RESIDENT_MAX_TURNS and now - self.started < RESIDENT_MAX_AGE_S:
@@ -574,11 +579,21 @@ class Resident:
             self.stop(f"갈아 끼움: {why}")
             self.start(load_session())
             return True
+        finally:
+            self.lock.release()
 
     def turn(self, text, resume_id, st):
         """한 턴. 문장을 yield. 세션이 바뀌었거나 프로세스가 없으면 (다시) 띄운다."""
         with self.lock:
-            yield from self._turn(text, resume_id, st)
+            done = False
+            try:
+                yield from self._turn(text, resume_id, st)
+                done = True
+            finally:
+                # 읽는 쪽이 도중에 그만뒀거나(TTS·발행 예외) result 전에 스트림이 끝났으면, 그 턴의 남은 출력이 파이프에 남아
+                # 다음 턴이 이전 답을 읽는다 (리뷰에서 재현: 갈아 끼울 때까지 한 턴씩 밀려 답했다). 그 프로세스는 버린다.
+                if self.alive() and not (done and st.get("result")):
+                    self.stop("턴이 끝까지 읽히지 않음")
 
     def _turn(self, text, resume_id, st):
         self.last_turn = time.time()
@@ -616,13 +631,16 @@ import atexit
 atexit.register(lambda: _resident.stop("브레인 종료"))
 
 def _think_turn(text, resume_id, st):
-    if resident_on():
-        yield from _resident.turn(text, resume_id, st)
-    else:
-        yield from _claude_stream(text, resume_id, st)
+    try:
+        if resident_on():
+            yield from _resident.turn(text, resume_id, st)
+        else:
+            yield from _claude_stream(text, resume_id, st)
+    except OSError as e:                               # claude 가 없다(업데이트 중 등): 엔진 실패로 보고 다음 엔진(local)에 넘긴다
+        st["noise"].append(f"claude 실행 실패: {e!r}"[:300])
 
 def _new_state():
-    return {"ok": False, "yielded": False, "timeout": False, "noise": []}
+    return {"ok": False, "yielded": False, "timeout": False, "result": False, "noise": []}
 
 def claude_think(text, out):
     """Claude 로 한 턴. 문장을 yield 한다. 끝까지 아무 말도 못 하고 실패하면 out["failed"] 에 이유를 남기고 사과 문장은 내지 않는다
@@ -738,9 +756,13 @@ def brain_stream(text):
     for i, name in enumerate(order):
         out = {}
         said = False
-        for sent in _THINKERS[name](text, out):
-            said = True
-            yield sent
+        g = _THINKERS[name](text, out)
+        try:
+            for sent in g:
+                said = True
+                yield sent
+        finally:
+            g.close()           # 바깥이 도중에 닫혀도 엔진의 정리(상주 프로세스의 잠금 해제·정리)가 지금 돈다. for 만으로는 GC 때로 미뤄진다
         if said:
             _last_engine["name"] = name
             return
@@ -1163,7 +1185,11 @@ def speak_stream(client, sentence_iter, t0, turn=None):
                 if turn: turn.mark("first_audio")
                 yield pcm
             yield b"\x00" * 3200              # 문장 사이 0.1초 숨고르기
-    n = publish_pcm_stream(client, gen())
+    try:
+        n = publish_pcm_stream(client, gen())
+    finally:
+        if hasattr(sentence_iter, "close"):
+            sentence_iter.close()             # TTS·발행이 도중에 실패해도 생각 엔진을 지금 닫는다 (상주 프로세스 정리, brain_stream 참고)
     client.publish(T_TXT_OUT, " ".join(sentences))
     if turn: turn.text_out = " ".join(sentences)
     print(f"  📤 답 발행 {n} 청크 · ⏱️ {time.monotonic()-t0:.1f}s")

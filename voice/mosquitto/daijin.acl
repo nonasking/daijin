@@ -12,6 +12,17 @@ topic write daijin/status
 topic read  daijin/cmd
 topic write daijin/ota
 
-# 홈 노드는 자기들 토픽만. 비밀번호가 새도 에이전트에는 닿지 못한다
+# 홈 노드는 자기들 토픽만, 그것도 이름을 하나하나 적는다 (2026-11-01). daijin/dev/# 를 통째로 주면 노드 비밀번호로
+# daijin/dev/<아무 글>/status 를 retained 로 올려 그 이름이 브레인의 상태 블록과 initiative 의 ask 에 실렸고,
+# 다른 노드의 cmd 에 ota 명령을 보낼 수도 있었다. 이제 노드는 상태·ACK·이벤트를 쓰고 명령은 읽기만 한다.
+# voice/nodes.json 에 노드를 더하면 여기에도 네 줄을 더한다 (tests/test_firmware_copies.py 가 빠진 노드를 잡는다).
 user nodes
-topic readwrite daijin/dev/#
+topic write daijin/dev/dev1/status
+topic write daijin/dev/dev1/state
+topic write daijin/dev/dev1/event
+topic read  daijin/dev/dev1/cmd
+topic write daijin/dev/dev2/status
+topic write daijin/dev/dev2/state
+topic write daijin/dev/dev2/event
+topic read  daijin/dev/dev2/cmd
+topic read  daijin/dev/all/cmd

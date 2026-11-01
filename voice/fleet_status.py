@@ -5,7 +5,7 @@
 #   그 외                                → ONLINE
 # nodectl.py fleet 이 쓴다. 파이프로도 된다: mosquitto_sub -v -t 'daijin/dev/+/status' | python3 fleet_status.py
 import sys, json, time
-from nodes import spoken
+from nodes import NODES, spoken
 
 STALE_S = 90     # 하트비트 주기는 30초
 
@@ -16,7 +16,7 @@ def describe(node, payload, now=None):
     try:
         d = json.loads(payload)
     except Exception:
-        return f"{name}: 파싱 불가: {payload}"
+        return f"{name}: 파싱 불가 ({len(payload or '')}바이트)"     # 내용은 옮기지 않는다: 이 줄을 에이전트가 읽는다
     if not d.get("online", False):
         return f"{name}: OFFLINE (브로커 LWT — 전원 또는 네트워크 끊김)"
     ts = d.get("ts", 0)
@@ -44,6 +44,8 @@ def render(messages, now=None):
     lines = []
     for topic in sorted(latest):
         node = topic.split("/")[2] if topic.count("/") >= 2 else topic
+        if node not in NODES:                 # 표에 없는 이름은 보이지 않는다 (fleet.sh 출력을 에이전트가 읽는다)
+            continue
         lines.append(describe(node, latest[topic][1], now))
     return lines
 
