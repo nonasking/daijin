@@ -18,6 +18,24 @@ class TestSharedHeaders(unittest.TestCase):
                                     f"{a}/{name} 와 {b}/{name} 가 다르다: 한쪽을 고쳤으면 다른 쪽에도 복사할 것")
 
 
+class TestOtaRollbackHook(unittest.TestCase):
+    def test_the_rollback_override_has_c_linkage(self):
+        # Without extern "C" the core's weak verifyRollbackLater (false) wins and no OTA image ever waits for confirmation.
+        src = open(os.path.join(SKETCHES, "15-home-node", "ota.h")).read()
+        self.assertIn('extern "C" bool verifyRollbackLater()', src)
+
+
+class TestHomeBrokerAcl(unittest.TestCase):
+    def test_the_home_broker_carries_the_vps_acl_unchanged_and_iot_cannot_reach_the_agent(self):
+        voice = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        vps = open(os.path.join(voice, "mosquitto", "daijin.acl")).read()
+        home = open(os.path.join(voice, "mosquitto", "home.acl")).read()
+        self.assertTrue(home.endswith(vps))
+        iot = home.split("user iot", 1)[1].split("\nuser ", 1)[0]
+        for agent_topic in ("daijin/ask", "daijin/say", "daijin/text", "daijin/#"):
+            self.assertNotIn(agent_topic, iot)
+
+
 class TestBrokerAcl(unittest.TestCase):
     def test_every_node_has_exactly_its_own_topics_and_nothing_wider(self):
         import json

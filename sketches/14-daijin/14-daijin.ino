@@ -243,9 +243,16 @@ void ringPush16(int16_t s) {
   rw += 2;
 }
 
+static volatile bool capturing = false;          // 마이크가 열려 있나 (captureTask). 녹음 루프와 아래 수신 콜백이 같이 본다
+static int droppingClip = -1;                    // 녹음 중에 시작해서 버리는 중인 재생 클립의 id (-1 = 없음)
+
 void onMqtt(char* topic, byte* payload, unsigned int len) {
   if (strcmp(topic, T_CMD) == 0) { pendingCmd = ""; for (unsigned i = 0; i < len; i++) pendingCmd += (char)payload[i]; return; }
   if (strcmp(topic, T_AUDIO_OUT) != 0 || len < HDR) return;      // len == HDR: 페이로드 없는 청크 ("답할 것 없음" 신호)
+  // 녹음 중에 온 말(능동 발화·say)은 클립 통째로 버린다. 받으면 링이 차는 순간 스피커로 나가 마이크에 다시 녹음됐다 (2026-11-01 리뷰).
+  // 클립 중간부터 받으면 ADPCM 상태가 어긋나니, 버리기 시작한 클립은 마지막 청크까지 버린다.
+  if (capturing && droppingClip != payload[0]) { droppingClip = payload[0]; logf("녹음 중 → 재생 클립 %u 버림\n", payload[0]); }
+  if (droppingClip == payload[0]) { if (payload[3] & 1) droppingClip = -1; return; }
   size_t n = len - HDR;
   if (payload[1] == 0 && payload[2] == 0) {     // seq 0 = 새 클립
     WiFi.setSleep(false);                       // 재생 세션 → 풀속도
@@ -282,7 +289,6 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
 #define CAP_SZ 24576                                 // 캡처 링 0.75초분 — 48KB는 TLS 재핸드셰이크 힙(~45KB)을 고갈시켜 재접속 불능(rc=-2)
 static uint8_t capRing[CAP_SZ];
 static volatile size_t capW = 0, capR = 0;           // 누적 쓰기/읽기 (SPSC)
-static volatile bool capturing = false;
 static volatile uint32_t capDrops = 0;
 inline size_t capAvail() { return capW - capR; }
 
@@ -376,7 +382,12 @@ void recordAndPublish() {
   static uint8_t msg[HDR + CHUNK];
   capW = capR = 0; capDrops = 0; stopTap = false; btnEdge = false; vadReset(); capturing = true;
   encPred = 0; encIdx = 0; encLo = -1;                         // 인코더 리셋 (브레인 디코더와 동기)
-  xTaskCreatePinnedToCore(captureTask, "cap", 4096, NULL, 10, NULL, 0);
+  if (xTaskCreatePinnedToCore(captureTask, "cap", 4096, NULL, 10, NULL, 0) != pdPASS) {   // 힙이 30KB 대라 4KB 스택이 안 잡힐 수 있다
+    capturing = false;                                          // 그대로 두면 아래 루프가 캡처를 영영 기다린다 (mqtt.loop 도 안 돈다)
+    logf("캡처 태스크 생성 실패 (힙 %u) → 이번 녹음 취소\n", (unsigned)ESP.getFreeHeap());
+    led(40,0,0); softChirp(220.f, 300); LED_IDLE; face(F_IDLE); WiFi.setSleep(true);
+    return;
+  }
   size_t fill = 0; uint16_t seq = 0;
   bool lastSent = false, shown = false;
   uint16_t sendFails = 0;
@@ -461,6 +472,7 @@ bool mqttTry() {
     mqtt.subscribe(T_CMD, 1);
     logf("MQTT 연결 OK (%s)\n", broker.name());
     statusDue = true;                   // 접속 즉시 online 상태를 올려 LWT 의 offline 을 덮는다
+    otaConfirm(!broker.onLocal);        // 새 펌웨어면 이제 "정상"으로 표시 (못 붙으면 otaWatch 가 되돌린다)
     if (otaResult.length()) { logf("%s\n", otaResult.c_str()); mqtt.publish(T_STATE_OTA, otaResult.c_str(), true); otaResult = ""; }
     led(0,30,0); delay(200); LED_IDLE;
     return true;
@@ -482,6 +494,7 @@ void setupTls() {
   while (!syncClock(4000)) {                                   // 빨강 깜빡 = 시각을 못 얻는 중 (인터넷이 안 되는 망)
     led(40,0,0); delay(300); led(0,0,0); delay(700);
     if (WiFi.status() != WL_CONNECTED) wifiMulti.run();
+    otaWatch();                                                // setup 에서 갇혀도 새 펌웨어는 되돌아갈 수 있게
   }
   tls.setCACert(ISRG_ROOT_X1); logf("TLS: CA 검증 모드 (시각: %s)\n", clockSource);
 #endif
@@ -502,7 +515,7 @@ void setup() {
 #if !defined(WIFI_ONLY) || WIFI_ONLY == 2
   wifiMulti.addAP(WIFI_SSID2, WIFI_PASS2);    // 아이폰 핫스팟 (집 밖)
 #endif
-  while (wifiMulti.run() != WL_CONNECTED) { led(0,0,20); delay(150); led(0,0,0); delay(150); }
+  while (wifiMulti.run() != WL_CONNECTED) { led(0,0,20); delay(150); led(0,0,0); delay(150); otaWatch(); }
   // 스마트 절전: 평소 ON(발열·배터리 절약), 녹음·재생 순간에만 OFF (절전시 수신 ~12KB/s로 제한됨)
   WiFi.setSleep(true);
   logf("WiFi OK %s (%s)\n", WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
@@ -524,7 +537,7 @@ void setup() {
     logf("스피커 I2S 실패\n"); led(40,0,0); face(F_ERROR); while(1) delay(1000);
   }
 
-  while (!mqttTry()) { delay(200); if (WiFi.status() != WL_CONNECTED) wifiMulti.run(); }
+  while (!mqttTry()) { delay(200); if (WiFi.status() != WL_CONNECTED) wifiMulti.run(); otaWatch(); }
   chirp();                                       // 준비 완료 알림음
   LED_IDLE;
   logf("daijin v3(QoS0+계측) 준비 완료 — BOOT 누르고 말하세요\n");
@@ -546,6 +559,7 @@ void publishStatus() {
 }
 
 void loop() {
+  otaWatch();                                   // 새 펌웨어가 우체국에 못 붙고 있으면 여기서 되돌린다 (연결 실패로 일찍 돌아가는 바퀴에서도)
   if (WiFi.status() != WL_CONNECTED) {        // 망 이동(집↔핫스팟) 시 재접속: 아는 망 중 잡히는 곳으로
     led(0,0,20);
     if (wifiMulti.run() != WL_CONNECTED) { faceTick(); delay(300); return; }
@@ -556,14 +570,22 @@ void loop() {
   mqtt.loop();
   publishStatus();
   faceTick();
+  if (broker.dueForCloud() && !playing && !gotLast && ringAvail() == 0) {   // 집 우체국에 5분 있었다: 한가할 때 끊고 다시 고른다
+    logf("집 우체국 5분 → 클라우드 다시 시도\n");
+    mqtt.disconnect();
+    return;
+  }
   if (pendingCmd.length() && !playing) {                         // 지금은 ota 만: 재생 중이 아닐 때, loop 에서
     String c = pendingCmd; pendingCmd = "";
-    if (c.startsWith("ota:")) {
+    String why;
+    if (c.startsWith("ota:") && !otaAccepts(c, !broker.onLocal, &why)) {
+      logf("OTA 거절: %s\n", why.c_str()); mqtt.publish(T_STATE_OTA, why.c_str(), true);   // MQTT 를 끊기 전에 거절
+    } else if (c.startsWith("ota:")) {
       logf("OTA 시작: %s\n", c.c_str());
       mqtt.publish(T_STATE_OTA, "ota:start", true); mqtt.loop(); delay(100);
       face(F_UPLOAD); led(40,40,0);
       mqtt.disconnect(); tls.stop(); WiFi.setSleep(false);       // MQTT 의 TLS 를 비워야 두 번째 TLS 가 들어간다 (힙 30KB 대)
-      otaCommand(c, ISRG_ROOT_X1);                               // 성공하면 여기서 재부팅
+      otaCommand(c, ISRG_ROOT_X1, !broker.onLocal);              // 성공하면 여기서 재부팅
       logf("%s\n", otaResult.c_str()); led(40,0,0); face(F_ERROR); delay(1500); face(F_IDLE); LED_IDLE;
     }
   }

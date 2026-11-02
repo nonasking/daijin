@@ -2,6 +2,8 @@
 # 보드를 USB 없이 갱신한다: 빌드 → 서버(nginx, HTTPS)에 올림 → MQTT 로 ota 명령 → 새 fw 가 status 에 보일 때까지 기다림.
 # 사용: bash sketches/ota.sh <dev1|dev2|daijin> [home|hot1|hot2]      (노드의 망 고정 인자는 flash-node.sh 와 같다)
 #       bash sketches/ota.sh dev2 --build-only                           빌드와 해시만 (서버·보드는 건드리지 않는다)
+#       EXTRA_FLAGS=-DBROKER_TEST_CLOUD_DOWN bash sketches/ota.sh daijin  시험 빌드 (flash-node.sh 와 같다). 클라우드에 못 붙는 이 빌드는
+#                                                                         5분 뒤 스스로 예전 펌웨어로 돌아가야 한다 (ota.h 의 되돌리기 확인용)
 # 전제: 보드에 OTA 가 든 펌웨어(ota.h)가 한 번은 USB 로 올라가 있어야 한다. 그 뒤로는 이 스크립트만.
 #       맥 secrets.local.txt 에 FW_TOKEN(voice/ota/install-server.sh 가 준 값), SELF_SYNC_FROM(user@host), MQTT_CLOUD_HOST(=도메인).
 # 보드 쪽: ota.h 가 HTTPS 로 받아 SHA-256 을 맞춰 보고 다른 슬롯에 써서 재부팅한다. 해시가 다르면 버리고 예전 펌웨어 그대로 돈다.
@@ -16,11 +18,11 @@ OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 case "$TARGET" in
   dev1|dev2)
     SKETCH=15-home-node; OPTS=()
-    FLAGS="-DNODE_NAME=\"$TARGET\" -DFW_VERSION=\"$FWV\" $(python3 "$VOICE/nodes.py" flash "$TARGET") $NETF"
+    FLAGS="-DNODE_NAME=\"$TARGET\" -DFW_VERSION=\"$FWV\" $(python3 "$VOICE/nodes.py" flash "$TARGET") $NETF ${EXTRA_FLAGS:-}"
     T_CMD="daijin/dev/$TARGET/cmd"; T_STATUS="daijin/dev/$TARGET/status"; T_RESULT="daijin/dev/$TARGET/state" ;;
   daijin)
     SKETCH=14-daijin; OPTS=(--board-options CDCOnBoot=cdc)
-    FLAGS="-DFW_VERSION=\"$FWV\""
+    FLAGS="-DFW_VERSION=\"$FWV\" ${EXTRA_FLAGS:-}"
     T_CMD="daijin/cmd"; T_STATUS="daijin/status"; T_RESULT="daijin/ota" ;;
   *) echo "대상은 dev1|dev2|daijin"; exit 1 ;;
 esac

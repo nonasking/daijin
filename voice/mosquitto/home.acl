@@ -1,0 +1,52 @@
+# 맥의 집 우체국(brew mosquitto) ACL. 인터넷이 끊겼을 때 보드가 오는 곳이다. 계정·권한은 VPS 우체국(daijin.acl)과 같고,
+# 아래 'iot' 만 더 있다. tests/test_firmware_copies.py 가 이 파일이 daijin.acl 을 그대로 담고 있는지 본다 (두 우체국이 갈라지지 않게).
+# 쓰는 법: /opt/homebrew/etc/mosquitto/mosquitto.conf 에  acl_file <이 저장소>/voice/mosquitto/home.acl
+#          password_file 에 brain/device/nodes 를 VPS 와 같은 비밀번호로 (맥 키체인 daijin-mqtt-*)
+#
+# iot: 예전에 보드들이 집 우체국에 쓰던 공용 계정. ACL 이 없어서 그 비밀번호 하나로 VPS 에이전트까지 닿았다 (2026-11-01 리뷰).
+# 보드 펌웨어가 아직 이 계정으로 폴백하므로, 새 비밀번호로 다시 올릴 때까지만 기기·노드 토픽만 남겨 둔다. ask/say 는 없다.
+user iot
+topic read  daijin/audio/out
+topic write daijin/audio/in
+topic write daijin/status
+topic read  daijin/cmd
+topic write daijin/ota
+topic write daijin/dev/dev1/status
+topic write daijin/dev/dev1/state
+topic write daijin/dev/dev1/event
+topic read  daijin/dev/dev1/cmd
+topic write daijin/dev/dev2/status
+topic write daijin/dev/dev2/state
+topic write daijin/dev/dev2/event
+topic read  daijin/dev/dev2/cmd
+topic read  daijin/dev/all/cmd
+
+# ---- 아래는 daijin.acl 그대로 ----
+# 누가 어느 토픽을 쓰나 (docs/broker-credentials.md). 사용자 이름은 install.sh 가 만든 것과 같아야 한다.
+# 패턴에 %u 를 쓰지 않는다: 노드가 몇 개 늘어도 'nodes' 하나로 충분하고, 디바이스가 둘이 되면 그때 토픽에 id 를 넣는다.
+
+user brain
+topic readwrite daijin/#
+
+# 디바이스는 마이크다: 에이전트에게 말을 거는 길(audio/in)은 남고, ask/say/dev 에는 닿지 못한다
+user device
+topic read  daijin/audio/out
+topic write daijin/audio/in
+topic write daijin/status
+topic read  daijin/cmd
+topic write daijin/ota
+
+# 홈 노드는 자기들 토픽만, 그것도 이름을 하나하나 적는다 (2026-11-01). daijin/dev/# 를 통째로 주면 노드 비밀번호로
+# daijin/dev/<아무 글>/status 를 retained 로 올려 그 이름이 브레인의 상태 블록과 initiative 의 ask 에 실렸고,
+# 다른 노드의 cmd 에 ota 명령을 보낼 수도 있었다. 이제 노드는 상태·ACK·이벤트를 쓰고 명령은 읽기만 한다.
+# voice/nodes.json 에 노드를 더하면 여기에도 네 줄을 더한다 (tests/test_firmware_copies.py 가 빠진 노드를 잡는다).
+user nodes
+topic write daijin/dev/dev1/status
+topic write daijin/dev/dev1/state
+topic write daijin/dev/dev1/event
+topic read  daijin/dev/dev1/cmd
+topic write daijin/dev/dev2/status
+topic write daijin/dev/dev2/state
+topic write daijin/dev/dev2/event
+topic read  daijin/dev/dev2/cmd
+topic read  daijin/dev/all/cmd

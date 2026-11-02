@@ -1,4 +1,4 @@
-// 우체국 고르기: 평소엔 클라우드(HiveMQ, TLS), 클라우드에 못 붙으면 집의 우체국(mosquitto, 같은 와이파이)으로.
+// 우체국 고르기: 평소엔 클라우드(daijin.inanna.day, TLS), 클라우드에 못 붙으면 집의 우체국(mosquitto, 같은 와이파이)으로.
 // 인터넷이 통째로 끊겨도 기기·노드·맥의 브레인이 집 안에서 계속 말을 주고받게 하려는 것.
 //
 // secrets.h 에 MQTT_LOCAL_HOST 를 넣었을 때만 켜진다 (넣지 않으면 지금까지와 똑같이 클라우드만 쓴다):
@@ -8,7 +8,9 @@
 //   #define MQTT_LOCAL_USER "iot"
 //   #define MQTT_LOCAL_PASS "..."
 // 동작: 시각을 못 얻어 인증서를 검증할 수 없거나 클라우드 접속이 3번 연달아 실패하면 집 우체국으로 간다.
-//       집 우체국에 있는 동안 5분마다 클라우드를 다시 시도하고, 붙으면 돌아간다.
+//       집 우체국에 있는 동안 5분마다 클라우드를 다시 시도하고, 붙으면 돌아간다. 집 우체국에 붙어 있는 중이면 dueForCloud() 가
+//       5분이 됐음을 알려 주고, 호출자가 한가할 때 연결을 끊어 다시 고르게 한다 (2026-11-01 리뷰: choose() 는 끊겨 있을 때만 불려서
+//       집 우체국에 한번 붙으면 브로커가 돌아와도 거기 머물렀다).
 // 집 우체국은 같은 와이파이 안이라 암호화 없이(평문) 붙는다. 그 망을 믿을 수 있을 때만 쓸 것.
 //
 // 14-daijin 과 15-home-node 에 같은 파일이 들어 있다 (tls_time.h 처럼 스케치마다 한 벌).
@@ -91,6 +93,8 @@ struct BrokerChoice {
     return out != IPAddress();
   }
 #endif
+  // 집 우체국에 붙어 있고 클라우드를 다시 볼 때가 됐나. 호출자는 재생·녹음 중이 아닐 때 mqtt->disconnect() 하고 다시 접속한다.
+  bool dueForCloud() const { return HAS_LOCAL_BROKER && onLocal && mqtt && mqtt->connected() && millis() - localSince >= RETRY_CLOUD_MS; }
   // 접속 시도 직전에 부른다: 어느 우체국으로 갈지 정한다. 바뀌었으면 true.
   bool choose() {
     if (!HAS_LOCAL_BROKER) return false;

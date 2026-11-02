@@ -247,9 +247,11 @@ void runCmd(const String& cmd) {
 #endif
   else if (verb == "ota") {                                       // ota:<url>:<sha256> — 자기 토픽으로 온 것만 (all/cmd 는 보드마다 다른 바이너리라 거절)
     if (cmdFromAll) { ack("err:ota-via-all"); return; }
+    String why;
+    if (!otaAccepts(cmd, !broker.onLocal, &why)) { ack(why); return; }   // 우리 서버의 /fw/ 가 아니거나 집 우체국: MQTT 를 끊기 전에 거절
     ack("ota:start");                                              // 이 뒤로는 MQTT 를 끊는다: 결과는 재부팅 뒤 status 의 fw, 실패는 다시 붙은 뒤 state
     mqtt.loop(); delay(100); mqtt.disconnect(); net.stop();
-    otaCommand(cmd, ISRG_ROOT_X1);                                 // 성공하면 여기서 재부팅한다
+    otaCommand(cmd, ISRG_ROOT_X1, !broker.onLocal);                // 성공하면 여기서 재부팅한다
     Serial.println(otaResult);
   }
   else                      { ack("err:unknown:" + cmd); }
@@ -381,6 +383,7 @@ void setup() {
 }
 
 void loop() {
+  otaWatch();                                      // 새 펌웨어가 우체국에 못 붙고 있으면 여기서 되돌린다 (연결 실패로 일찍 돌아가는 바퀴에서도)
   if (WiFi.status() != WL_CONNECTED) {             // 핫스팟이 잠들었다 깨는 경우 등: 재접속
     Serial.println("WiFi 끊김 → 재접속");
     if (!connectKnownWiFi(20000)) ESP.restart();
@@ -399,7 +402,8 @@ void loop() {
       mqtt.subscribe(T_ALL);
       setColor(NODE_COLOR);                        // 온라인 = 노드 이름 색
       lastBeat = 0; heartbeat();                   // 접속 즉시 online 하트비트
-      if (otaResult.length()) { ack(otaResult); otaResult = ""; }   // 실패한 OTA 가 있었으면 이제야 알린다
+      otaConfirm(!broker.onLocal);                 // 새 펌웨어면 이제 "정상"으로 표시 (못 붙으면 otaWatch 가 되돌린다)
+      if (otaResult.length()) { ack(otaResult); otaResult = ""; }   // OTA 결과(실패, 또는 새 펌웨어 확인)를 이제야 알린다
 #if FEAT_BUZZER
       buzzPreset("ok");                            // 촬영 시 "붙었다" 신호
 #endif
@@ -411,6 +415,10 @@ void loop() {
   mqtt.loop();
   runQueued();
   heartbeat();
+  if (broker.dueForCloud() && qCount == 0) {       // 집 우체국에 5분 있었다: 끊고 다시 고른다 (choose 가 클라우드를 한 번 시도)
+    Serial.println("집 우체국 5분 → 클라우드 다시 시도");
+    mqtt.disconnect();
+  }
 
 #if FEAT_PIR
   bool pir = digitalRead(PIR_PIN);
