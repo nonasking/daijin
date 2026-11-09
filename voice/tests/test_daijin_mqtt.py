@@ -779,8 +779,7 @@ class TestFleetWatch(unittest.TestCase):
 
     def setUp(self):
         self.c = self.Client()
-        for name, val in (("nodes", {}), ("started", 0.0), ("local", None), ("_last_payload", {}), ("HOOKS", None),
-                          ("sec", lambda k: "")):
+        for name, val in (("nodes", {}), ("started", 0.0), ("HOOKS", None), ("sec", lambda k: "")):
             orig = getattr(fw, name)
             setattr(fw, name, val)
             self.addCleanup(setattr, fw, name, orig)

@@ -1,17 +1,10 @@
-# 맥의 집 우체국(brew mosquitto) ACL. 인터넷이 끊겼을 때 보드가 오는 곳이다. 계정·권한은 VPS 우체국(daijin.acl)과 같고,
-# 아래 'iot' 만 더 있다. tests/test_firmware_copies.py 가 이 파일이 daijin.acl 을 그대로 담고 있는지 본다 (두 우체국이 갈라지지 않게).
+# 맥의 집 우체국(brew mosquitto) ACL. 인터넷이 끊겼을 때 보드가 오는 곳이다. 계정·권한은 VPS 우체국(daijin.acl)과 똑같다.
+# tests/test_firmware_copies.py 가 이 파일이 daijin.acl 을 그대로 담고 있고 그 밖의 계정이 없는지 본다 (두 우체국이 갈라지지 않게).
 # 쓰는 법: /opt/homebrew/etc/mosquitto/mosquitto.conf 에  acl_file <이 저장소>/voice/mosquitto/home.acl
 #          password_file 에 brain/device/nodes 를 VPS 와 같은 비밀번호로 (맥 키체인 daijin-mqtt-*)
 #
-# iot: 예전에 보드들이 집 우체국에 쓰던 공용 계정. ACL 이 없어서 그 비밀번호 하나로 VPS 에이전트까지 닿았다 (2026-11-01 리뷰).
-# 노드 둘은 2026-11-09 에 자기 계정(nodes)으로 붙는 펌웨어로 올라갔다. 다이진 기기만 아직 이 계정으로 폴백하므로
-# 기기 토픽만 남겨 둔다. 기기를 올리면 이 블록과 passwd 의 iot 를 지운다. ask/say 는 없다.
-user iot
-topic read  daijin/audio/out
-topic write daijin/audio/in
-topic write daijin/status
-topic read  daijin/cmd
-topic write daijin/ota
+# 예전의 공용 계정 'iot' 는 없다 (2026-11-09 삭제): 보드 셋 모두 집 우체국에서도 자기 계정으로 붙는다.
+# 그 계정은 ACL 없이 하나의 비밀번호로 무엇이든 할 수 있었고, 다리를 타고 VPS 의 에이전트까지 닿았다 (2026-11-01 리뷰).
 
 # ---- 아래는 daijin.acl 그대로 ----
 # 누가 어느 토픽을 쓰나 (docs/broker-credentials.md). 사용자 이름은 install.sh 가 만든 것과 같아야 한다.

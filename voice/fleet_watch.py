@@ -6,18 +6,16 @@
 #   secrets 의 FLEET_REPORT=ask 면 예전처럼 상황을 daijin/ask 로 넘겨 에이전트가 표현을 다듬는다 (6초쯤 느리다).
 # 시작 시의 retained 상태는 베이스라인으로만 삼고 알리지 않는다 (재시작 때마다 떠들지 않게).
 # 노드별 쿨다운 60초 — 전원 갈아끼우는 작업 중 스팸 방지.
-# 실행: python3 -u fleet_watch.py  (상시 구동은 LaunchAgent com.daijin.fleetwatch)
+# 실행: python3 -u fleet_watch.py  (상시 구동은 systemd daijin-fleetwatch, 맥이면 LaunchAgent com.daijin.fleetwatch)
+# 예전엔 받은 상태를 맥의 로컬 브로커에 retained 로 다시 써 주는 '미러'가 있었다 (헬퍼 스크립트가 localhost 에서 읽던 시절).
+# 헬퍼가 우체국에 직접 붙고 맥의 다리도 걷은 뒤로 읽는 곳이 없어 뺐다 (2026-11-09).
 
 import json, time
-from daijin_common import broker_address, sec, load_hooks, cloud_client, connect_with_retry, broker
+from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
 from nodes import NODES, subject
 
 T_STATUS = "daijin/dev/+/status"
 T_MAIN   = "daijin/status"      # 메인 디바이스 상태 (status.sh용)
-# 로컬 브로커 미러: 브리지는 라이브 메시지의 retain 플래그를 못 살려서(MQTT 규격) 로컬 retained가
-# 낡은 값으로 남는다. 그래서 클라우드에서 받은 상태를 로컬(1883)에 retained로 다시 써준다.
-# fleet.sh/status.sh/dev.sh가 로컬에서 즉시 최신 상태를 읽을 수 있는 근거.
-LOCAL_HOST, LOCAL_PORT = "localhost", 1883
 T_ASK    = "daijin/ask"
 T_SAY    = "daijin/say"
 STALE_S    = 90     # 하트비트(30초 주기)가 이 시간 이상 끊기면 STALE
@@ -82,28 +80,7 @@ def report(client, node, lines, kind):
     st[key] = time.time()
     speak(client, line, context)
 
-local = None   # 로컬 미러 클라이언트 (연결 실패 시 None → 미러 생략)
-
-_last_payload = {}   # topic -> 마지막 상태. 로컬 브로커가 늦게 붙거나 재시작해도 다시 써주기 위해 보관
-
-def mirror(topic, payload):
-    _last_payload[topic] = payload
-    if local is not None and local.is_connected():
-        try:
-            local.publish(topic, payload, qos=0, retain=True)
-        except Exception as e:
-            print(f"(로컬 미러 실패: {e})")
-
-def _replay_mirror(c, *a):
-    # 로컬 브로커 (재)접속 시: 그 사이 놓친 상태를 retained로 다시 쓴다.
-    # 2026-09-22 실측: 맥 재부팅 직후 클라우드 베이스라인이 로컬 접속보다 먼저 와서 미러가 비어 있었음.
-    print(f"🪞 로컬 브로커 미러 ON (localhost:1883) → 상태 {len(_last_payload)}건 재전송")
-    for t, pl in list(_last_payload.items()):
-        try: c.publish(t, pl, qos=0, retain=True)
-        except Exception as e: print(f"(재전송 실패 {t}: {e})")
-
 def on_message(client, userdata, msg):
-    mirror(msg.topic, msg.payload)
     if not msg.topic.startswith("daijin/dev/"):
         return
     node = msg.topic.split("/")[2]
@@ -162,21 +139,6 @@ def on_connect(client, userdata, flags, rc, properties):
     client.subscribe(T_STATUS, qos=1)
     client.subscribe(T_MAIN, qos=0)
 
-def start_local_mirror():
-    """로컬 미러 클라이언트. 부팅 직후엔 mosquitto 보다 먼저 뜰 수 있어서(2026-09-17 실측: Connection refused 후 미러 영구 생략)
-    connect_async + loop_start 로 붙을 때까지 paho 가 알아서 재시도한다. 끊겨도 자동 재접속.
-    로컬 브로커가 아예 없는 머신(클라우드 서버)에서는 조용히 재시도만 하고 아무 일도 없다."""
-    global local
-    import paho.mqtt.client as mqtt
-    l = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="daijin-mirror")
-    l.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
-    l.reconnect_delay_set(min_delay=1, max_delay=30)
-    l.on_connect = _replay_mirror
-    l.on_disconnect = lambda c, u, f, rc, p=None: print(f"🪞 로컬 브로커 끊김(rc={rc}) → 재시도")
-    l.connect_async(LOCAL_HOST, LOCAL_PORT, 60)
-    l.loop_start()
-    local = l
-
 def main():
     global started
     started = time.time()
@@ -184,10 +146,6 @@ def main():
     c.on_connect = on_connect
     c.on_message = on_message
     print("👁️ fleet_watch 시작")
-    if broker() == "cloud" and broker_address()[0] not in ("127.0.0.1", "localhost"):
-        start_local_mirror()          # 이미 집 우체국에 붙어 있으면 미러가 자기 자신을 되먹여 무한히 돈다.
-                                      # 우체국이 같은 기계(VPS 의 mosquitto)면 미러할 곳이 바로 그곳이라 띄우지 않는다
-                                      # (2026-10-29: 서버에서 'iot' 자격증명으로 사흘간 2,373번 거절당하고 있었다)
     connect_with_retry(c)
     c.loop_start()
     try:

@@ -37,8 +37,7 @@ class Broker:
     def __init__(self):
         self.local = local_up()
         if self.local:
-            c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            c.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
+            c = cloud_client("")                      # 계정은 어느 우체국이든 같다 (daijin_common.cloud_client)
             host, port = LOCAL
         else:
             c = cloud_client("")                      # 빈 id = 브로커가 임시 id 를 준다 (동시에 여러 번 불러도 충돌 없음)

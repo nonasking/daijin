@@ -26,14 +26,13 @@ class TestOtaRollbackHook(unittest.TestCase):
 
 
 class TestHomeBrokerAcl(unittest.TestCase):
-    def test_the_home_broker_carries_the_vps_acl_unchanged_and_iot_cannot_reach_the_agent(self):
+    def test_the_home_broker_carries_the_vps_acl_unchanged_and_no_other_login(self):
         voice = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         vps = open(os.path.join(voice, "mosquitto", "daijin.acl")).read()
         home = open(os.path.join(voice, "mosquitto", "home.acl")).read()
         self.assertTrue(home.endswith(vps))
-        iot = home.split("user iot", 1)[1].split("\nuser ", 1)[0]
-        for agent_topic in ("daijin/ask", "daijin/say", "daijin/text", "daijin/#"):
-            self.assertNotIn(agent_topic, iot)
+        users = lambda text: sorted(l.split()[1] for l in text.splitlines() if l.startswith("user "))
+        self.assertEqual(users(home), users(vps))                # no shared or extra login on the home broker
 
 
 class TestBrokerAcl(unittest.TestCase):

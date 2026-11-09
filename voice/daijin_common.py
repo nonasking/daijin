@@ -57,15 +57,13 @@ def broker_address():
 
 def cloud_client(client_id):
     """우체국용 paho 클라이언트 (이름은 예전 그대로). 끊기면 1~60초 간격 자동 재접속.
-    cloud: HiveMQ 자격증명 + TLS(시스템 CA로 검증). local: 집 mosquitto 자격증명(MQTT_USER/MQTT_PASS), 평문."""
+    계정은 어느 우체국이든 같다(MQTT_CLOUD_USER/PASS = brain): 집 우체국도 같은 계정·같은 ACL 이다 (voice/mosquitto/home.acl).
+    예전엔 집 우체국에 공용 계정(MQTT_USER=iot)으로 붙었다. cloud 는 TLS(시스템 CA 로 검증), local 과 같은 기계의 1883 은 평문."""
     import paho.mqtt.client as mqtt
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
-    if broker() == "local":
-        c.username_pw_set(sec("MQTT_USER"), sec("MQTT_PASS"))
-    else:
-        c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
-        if broker_address()[1] != 1883:          # 1883 = 같은 기계의 우체국에 평문으로 (voice/mosquitto). 그 밖은 늘 TLS
-            c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+    c.username_pw_set(sec("MQTT_CLOUD_USER"), sec("MQTT_CLOUD_PASS"))
+    if broker() != "local" and broker_address()[1] != 1883:   # 1883 = 같은 기계의 우체국에 평문으로 (voice/mosquitto). 그 밖은 늘 TLS
+        c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
     c.reconnect_delay_set(min_delay=1, max_delay=60)
     return c
 
