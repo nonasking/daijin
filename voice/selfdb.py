@@ -142,9 +142,10 @@ def close_ask(ask_id, response_class, response_text=None, response_ts=None, labe
         return None
     rts = int(response_ts or time.time())
     latency = None if response_class == "unanswered" else max(0, rts - row["ts"])
-    db().execute("UPDATE asks SET response_class=?, response_ts=?, latency_s=?, response_text=?, label_source=? WHERE id=?",
-                 (response_class, rts, latency, response_text, label_source, ask_id))
-    return True
+    cur = db().execute("UPDATE asks SET response_class=?, response_ts=?, latency_s=?, response_text=?, label_source=?"
+                       " WHERE id=? AND response_class IS NULL",
+                       (response_class, rts, latency, response_text, label_source, ask_id))
+    return cur.rowcount == 1          # 이미 닫힌 것이면 False: 사람의 말(settle)과 창 만료(expire)가 겹쳐도 정책은 한 번만 바뀐다
 
 @_safe
 def relabel_ask(ask_id, response_class=None, wanted_to_ask_less=None):

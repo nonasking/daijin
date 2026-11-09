@@ -690,6 +690,15 @@ class TestBrainStream(unittest.TestCase):
         self.assertEqual(list(dm.claude_think("안녕", out)), [])
         self.assertEqual(out.get("failed"), "error")
 
+    def test_the_session_file_is_written_once_and_never_left_half_written(self):
+        dm.save_session("s1")
+        first = os.stat(self.session).st_mtime_ns
+        dm.save_session("s1")
+        self.assertEqual(os.stat(self.session).st_mtime_ns, first)        # same id: not rewritten
+        dm.save_session("s2")
+        self.assertEqual((self._saved(), self._saved(".prev")), ("s2", "s1"))
+        self.assertFalse(os.path.exists(self.session + ".tmp"))
+
     def test_resident_off_means_a_process_per_turn(self):
         self.secrets["BRAIN_RESIDENT"] = "0"
         self.assertEqual(self._run("ok"), ["응, 알았어.", "다 됐어."])
@@ -1138,6 +1147,14 @@ class TestClipReassembly(unittest.TestCase):
             dm.rx_abandon("11초 조용함")
         self.assertIn("클립 4 미완성: 1청크 받고 11초 조용함", buf.getvalue())
         self.assertIsNone(dm._rx["clip"])
+
+    def test_a_chunk_of_a_clip_whose_head_never_came_is_dropped(self):
+        out = self._feed(self.Msg(5, 3, False, b"zz"), self.Msg(5, 4, True, b"yy"))      # the brain started mid-clip
+        self.assertTrue(dm._clipq.empty())
+        self.assertIsNone(dm._rx["clip"])
+        out = self._feed(self.Msg(6, 0, False, b"aa"), self.Msg(5, 9, False, b"late"), self.Msg(6, 1, True, b"bb"))
+        self.assertIn("클립 6 미완성: 1청크 받고 다른 클립의 청크가 왔다", out)       # a stray tail ends the open clip; it cannot be trusted
+        self.assertTrue(dm._clipq.empty())
 
     def test_missing_middle_chunk_is_logged_and_the_rest_still_goes_on(self):
         out = self._feed(self.Msg(9, 0, False, b"aa"), self.Msg(9, 2, False, b"cc"), self.Msg(9, 3, True, b"dd"))

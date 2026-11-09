@@ -52,6 +52,22 @@ class TestEpisodesAndAsks(DbCase):
         self.assertEqual((a["response_class"], a["latency_s"], a["label_source"], a["presence"]), ("engaged", 42, "rule", "unknown"))
         self.assertEqual(selfdb.open_asks(), [])
 
+    def test_an_ask_closes_once_and_keeps_its_first_answer(self):
+        aid = selfdb.open_ask("contact", "say", "오늘은 아직 얘기를 못 했네.", "initiative", ts=100)
+        self.assertTrue(selfdb.close_ask(aid, "engaged", response_text="응", response_ts=130))
+        self.assertFalse(selfdb.close_ask(aid, "unanswered", response_ts=700))     # the window expiring a moment later
+        self.assertEqual(selfdb.recent_asks(1)[0]["response_class"], "engaged")
+
+    def test_the_repair_strategy_lands_on_the_ask_its_line_opens(self):
+        earlier = selfdb.open_ask("contact", "say", "아까 한 말", "initiative", ts=1000)
+        ledger = initiative.Ledger()
+        ledger.expect("미안, 아까는 바빴지. 오늘은 아직 얘기를 못 했네.", "contact", 0.6, "9시간째", now=2000, repair="explain")
+        ledger.on_bus(initiative.T_SAY, "미안, 아까는 바빴지. 오늘은 아직 얘기를 못 했네.".encode(), now=2001)
+        asks = {a["id"]: a for a in selfdb.recent_asks(5)}
+        new = max(asks)
+        self.assertEqual(asks[new]["repair_strategy"], "explain")
+        self.assertIsNone(asks[earlier]["repair_strategy"])                          # not written onto the one before
+
     def test_unanswered_has_no_latency_and_reflect_can_relabel(self):
         aid = selfdb.open_ask("contact", "say", "오늘은 아직 얘기를 못 했네.", "initiative", ts=100)
         selfdb.close_ask(aid, "unanswered", response_ts=700)

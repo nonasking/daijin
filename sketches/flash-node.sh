@@ -7,8 +7,9 @@
 # 포트 찾기: arduino-cli board list   (어느 보드인지 헷갈리면 esptool flash_id: HG DevKitC=16MB, Freenove 메인=8MB)
 NODE="${1:?노드 이름 (dev1|dev2 ... voice/nodes.json)}"; PORT="${2:?포트 (/dev/cu.usb...)}"; NET="${3:-}"
 case "$NET" in home) NETF="-DWIFI_ONLY=1";; hot1) NETF="-DWIFI_ONLY=2";; hot2) NETF="-DWIFI_ONLY=3";; "") NETF="";; *) echo "망은 home|hot1|hot2"; exit 1;; esac
-# 노드별 기능·대기 각도·색은 voice/nodes.json 에서 온다 (표에 없는 이름이면 펌웨어 기본값: 전부 켬)
-FLAGS="$(python3 "$(dirname "$0")/../voice/nodes.py" flash "$NODE" 2>/dev/null)"
+# 노드별 기능·대기 각도·색은 voice/nodes.json 에서 온다. 표에 없는 이름(레드 같은 별칭 포함)은 여기서 멈춘다:
+# 예전엔 오류를 삼키고 펌웨어 기본값(전부 켬)으로 daijin/dev/<그 이름> 을 듣는 보드를 구웠는데, 그 토픽은 우체국 ACL 에 없다.
+FLAGS="$(python3 "$(dirname "$0")/../voice/nodes.py" flash "$NODE")" || { echo "voice/nodes.json 에 없는 노드: $NODE (id 로 적을 것: $(python3 "$(dirname "$0")/../voice/nodes.py" ids))"; exit 1; }
 FWV="$(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/null || echo nogit)-$(date +%y%m%d%H%M)"   # status 의 fw 로 보인다
 cd "$(dirname "$0")" || exit 1
 arduino-cli compile --fqbn esp32:esp32:esp32s3 \

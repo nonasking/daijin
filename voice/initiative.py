@@ -184,8 +184,9 @@ class Ledger:
         self.window = int(sec("INITIATIVE_RESPONSE_WINDOW_S") or rules.RESPONSE_WINDOW_S)
         self.awaiting_ask = None     # (채널 ask 로 나간 상황 텍스트, 시각): text/out 이 오면 그게 실제로 한 말
 
-    def expect(self, text, drive, value, trigger, now=None):
-        self.pending_label[text] = (drive, value, trigger, time.time() if now is None else now)
+    def expect(self, text, drive, value, trigger, now=None, repair=None):
+        """곧 버스에 나갈 내 말. 장부가 그 말을 열 때 추동 이름과 (있으면) 복구 방식을 같이 적는다."""
+        self.pending_label[text] = (drive, value, trigger, time.time() if now is None else now, repair)
 
     def on_bus(self, topic, payload, now=None):
         now = time.time() if now is None else now
@@ -205,8 +206,9 @@ class Ledger:
 
     def _open(self, channel, text, now, source=None, drive=None):
         label = self.pending_label.pop(text, None)
+        repair = None
         if label and now - label[3] < 10:
-            drive, value, trigger = label[0], label[1], label[2]
+            drive, value, trigger, repair = label[0], label[1], label[2], label[4]
             source = SOURCE
         else:
             value, trigger = None, None
@@ -214,6 +216,8 @@ class Ledger:
                 fleet = any(k in text for k in ("방금 꺼졌어", "다시 켜졌어", "소식이 없어"))
                 source, drive = ("fleet", "fleet") if fleet else ("manual", "unknown")
         aid = selfdb.open_ask(drive, channel, text, source, trigger=trigger, drive_value=value, ts=now)
+        if repair and aid:
+            selfdb.set_repair(aid, repair)             # 이 말에 붙은 복구 방식은 이 장부 줄에 적는다
         print(f"[{time.strftime('%H:%M:%S')}] 장부 열림 #{aid} {source}/{drive} ({channel}): {text[:50]!r}")
         if source == SOURCE:
             selfdb.policy_update(drive, last_ask_ts=int(now))
@@ -224,7 +228,8 @@ class Ledger:
         for i, a in enumerate(open_):
             last = i == len(open_) - 1
             cls = rules.classify(text) if last else "unanswered"
-            selfdb.close_ask(a["id"], cls, response_text=text if last else None, response_ts=now)
+            if not selfdb.close_ask(a["id"], cls, response_text=text if last else None, response_ts=now):
+                continue                               # 그새 다른 쪽이 닫았다
             print(f"[{time.strftime('%H:%M:%S')}] 장부 닫힘 #{a['id']} → {cls}" + (f" ({text[:30]!r})" if last else ""))
             if a["source"] == SOURCE and a["drive"] in DRIVES:
                 self._apply(a, cls, now)
@@ -233,7 +238,8 @@ class Ledger:
         now = time.time() if now is None else now
         for a in selfdb.open_asks():
             if now - a["ts"] > self.window:
-                selfdb.close_ask(a["id"], "unanswered", response_ts=a["ts"] + self.window)
+                if not selfdb.close_ask(a["id"], "unanswered", response_ts=a["ts"] + self.window):
+                    continue
                 print(f"[{time.strftime('%H:%M:%S')}] 장부 닫힘 #{a['id']} → unanswered (창 지남)")
                 if a["source"] == SOURCE and a["drive"] in DRIVES:
                     self._apply(a, "unanswered", now)
@@ -295,14 +301,11 @@ def tick(client, body, ledger, hooks, dry_run, now=None):
             selfdb.note("plan", json.dumps(plan, ensure_ascii=False), ts=now)
             selfdb.policy_update(name, last_ask_ts=int(now))      # dry-run 에서도 간격은 지킨다 (안 그러면 매 틱 떠든다)
             continue
-        ledger.expect(line, name, value, info["trigger"], now)
+        ledger.expect(line, name, value, info["trigger"], now, repair=repair)
         client.publish(T_SAY if channel == "say" else T_ASK, line, qos=1)
         print(f"[{time.strftime('%H:%M:%S')}] {name}={value:.2f} 말함 ({channel}): {line!r}")
-        if repair:
-            time.sleep(1)                   # 장부가 먼저 열리게
-            for a in selfdb.recent_asks(1, drive=name):
-                selfdb.set_repair(a["id"], repair)
-        spoke = True
+        spoke = True                        # 복구 방식은 장부가 이 말을 열 때 적는다 (expect). 예전엔 1초 뒤 "가장 최근 ask"에
+                                            # 적었는데, 메아리가 늦으면(재접속) 그 앞 ask 의 것을 덮어썼다
     ledger.expire(now)
     selfdb.link_unlinked_episodes()
 

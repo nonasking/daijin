@@ -6,7 +6,7 @@
 # 실행: python3 reflect.py [--date YYYY-MM-DD] [--dry-run] [--db PATH]   (상시는 systemd 타이머 daijin-reflect, 03:30)
 import argparse, json, os, re, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from daijin_common import sec, cloud_client, connect_with_retry
+from daijin_common import sec, cloud_client, broker_address
 import selfdb
 
 T_PERSONA_PENDING = "daijin/persona/pending"     # retained JSON: 승인 기다리는 인격 제안 수 (대시보드·알림용)
@@ -27,7 +27,8 @@ def _claude_cmd(prompt):
     import daijin_mqtt as dm                     # CLAUDE 경로·인증 환경을 그대로 쓴다 (브로커엔 붙지 않는다)
     model = sec("REFLECT_MODEL") or sec("BRAIN_MODEL") or dm.DEFAULT_MODEL
     cmd = [dm.CLAUDE, "-p", prompt, "--output-format", "json", "--model", model, "--effort", sec("REFLECT_EFFORT") or "medium",
-           "--max-turns", "1", "--allowedTools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+           "--max-turns", "1", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    # --tools "" 가 도구를 전부 끈다. 예전의 --allowedTools "" 는 "묻지 않고 허용할 도구가 없다"일 뿐이라 읽기 도구(Read, Grep)는 남았다.
     return cmd, dm._claude_env()
 
 def day_bounds(date_str=None, now=None):
@@ -105,7 +106,10 @@ def run_model(prompt, timeout_s=300):
         except Exception as e:
             return None, f"로컬 모델 실패: {e!r}"
     cmd, env = _claude_cmd(prompt)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, env=env, stdin=subprocess.DEVNULL)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, f"claude {timeout_s}초 초과"          # 호출자가 reflect_error 메모로 남긴다 (예전엔 예외로 죽어 흔적이 없었다)
     try:
         d = json.loads(r.stdout)
     except ValueError:
@@ -165,7 +169,7 @@ def publish_pending():
     try:
         n = len(selfdb.persona_pending())
         c = cloud_client("daijin-reflect")
-        connect_with_retry(c, retry_s=3)
+        c.connect(*broker_address(), 30)          # 한 번만: 밤 작업이 브로커를 기다리며 영영 서 있지 않게 (connect_with_retry 는 끝없이 되풀이한다)
         c.loop_start()
         info = c.publish(T_PERSONA_PENDING, json.dumps({"pending": n, "ts": int(time.time())}) if n else b"", qos=1, retain=True)
         info.wait_for_publish(10)

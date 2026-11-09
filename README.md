@@ -102,7 +102,7 @@ The local model is clearly weaker than Claude: it misplaces dates, cannot search
 - **Recording** ends by itself 1.5 s after the speaker goes quiet (energy VAD on the device, tuned on real conversations: thinking pauses up to 1.4 s no longer cut a sentence), or with a second tap.
 - **Self layer** running: drives, the rebuff ledger, nightly reflection; see above.
 - **Face**: RoboEyes on the OLED with pupils that follow the gaze: blinks and looks around when idle, grows when listening, glances up-left/up-right while thinking, smiles while speaking. **Ops**: the brain warns 30 days before its subscription token expires, and a nightly job pulls its secrets, session, database and Claude transcripts to the Mac, encrypted.
-- **Own broker and over-the-air updates**: Mosquitto on the brain's VPS with a Let's Encrypt certificate and a login per device. Every board updates without a cable: `bash sketches/ota.sh dev2` builds, uploads the image to the server, tells the board, and waits until it reports the new version (about 70 s). The board checks the SHA-256 before switching, so a broken download leaves the old firmware running.
+- **Own broker and over-the-air updates**: Mosquitto on the brain's VPS with a Let's Encrypt certificate and a login per device. Every board updates without a cable: `bash sketches/ota.sh dev2` builds, uploads the image to the server, tells the board, and waits until it reports the new version (about 70 s). The board checks the SHA-256 before switching, so a broken download leaves the old firmware running; images are accepted only from the project's own server, and a new image that cannot reach the broker within five minutes rolls back to the previous one (tried on the device with a build that never connects).
 - **One brain process, many turns**: claude stays up between turns (stream-json in and out) instead of starting fresh each time, which alone cost about three seconds before the first word; the per-turn state block now travels with the turn. `BRAIN_RESIDENT=0` goes back to a process per turn.
 - **Local thinking and offline mode** working end to end; the firmware falls back to a home broker (checked on the device and both nodes with a test build that treats the cloud as down).
 - **Device UX**: ready chirp through the speaker, dim-green idle LED, status colors for record/upload/play (LTE connects can take 30+ seconds — sound beats a blinking LED).
@@ -147,9 +147,7 @@ voice/      daijin
   reflect.py          nightly look back: memories, relabels, persona proposal
   persona.py          show / approve / reject persona proposals; export, import, seed
   replay_journal.py   load past brain logs from journald into the self layer
-  broker.sh           broker choice and CA bundle for console.sh (Mac/Linux)
-  daijin_server.py    legacy: old HTTP brain (superseded by daijin_mqtt.py, kept as record)
-  talk.sh             legacy: Mac-only voice loop (Phase 0, superseded by daijin_mqtt.py)
+  broker.sh           broker arguments and CA bundle for console.sh (Mac/Linux)
   dev.sh              command a home node and verify this command's ack
   fleet.sh            fleet status: ONLINE / STALE(heartbeat gap) / OFFLINE(broker LWT)
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
@@ -220,7 +218,7 @@ bash voice/install-agents.sh           # or: register brain + fleet watcher as L
 ```
 Then tap BOOT on the device and talk. `bash voice/console.sh` shows every transcript, reply, and node command live; `bash voice/fleet.sh` lists node status; `bash voice/dev.sh red motor` drives a node by hand (nodes are called red and blue; they light up in their colour).
 
-**Optional: local broker bridge.** Running mosquitto on a Mac and bridging it to the broker gives the helper scripts a nearby endpoint. The helper scripts use `localhost:1883` automatically when it is up. Bridge config is outside the repo; the shape is a standard `connection` block with `daijin/dev/+/cmd` out and `daijin/dev/+/state|status|event` in.
+**Optional: a home broker for when the internet is gone.** Run mosquitto on a machine in the house with the same three logins as the main broker and `acl_file` pointing at `voice/mosquitto/home.acl`, and put its name in the boards' `secrets.h` (`MQTT_LOCAL_HOST`). Boards fall back to it after three failed connects, log in as themselves, and go back to the main broker every five minutes. Do not bridge it to the main broker: a bridge carries the brain's login.
 
 ### Run the brain on a Linux server (no Mac needed)
 

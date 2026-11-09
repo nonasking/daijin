@@ -64,6 +64,8 @@ case "${1:-status}" in
     done ;;
   sync)
     FROM="$(sec SELF_SYNC_FROM)"; [ -n "$FROM" ] || { echo "secrets 에 SELF_SYNC_FROM=user@host 가 필요하다"; exit 1; }
+    # 비상 모드 브레인이 도는 중이면 멈춘다: 열어 둔 DB 파일을 바꿔치고 WAL 을 지우면 그 브레인의 기록이 조용히 사라진다.
+    for s in brain initiative fleetwatch; do up "$s" && { echo "비상 모드의 $s 가 돌고 있다. 먼저: bash voice/offline-mode.sh stop"; exit 1; }; done
     if [ -f "$VOICE/daijin.db" ] && [ "${2:-}" != "--force" ]; then
       n="$("$PY" "$VOICE/selfdb_merge.py" unpushed "$VOICE/daijin.db")"
       [ "$n" = "0" ] || { echo "이 기계에 아직 서버로 올리지 않은 기록이 ${n}건 있다. 먼저: bash voice/offline-mode.sh push (버리려면 sync --force)"; exit 1; }

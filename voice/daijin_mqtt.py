@@ -25,7 +25,7 @@ try:
     import supertonic                  # pip install supertonic. 온디바이스 한국어 TTS (ONNX, CPU). 없으면 그 엔진만 빠진다
 except ImportError:
     supertonic = None
-from daijin_common import VOICE, REPO, T_AUDIO_IN, sec, load_hooks, cloud_client, connect_with_retry, broker
+from daijin_common import VOICE, T_AUDIO_IN, sec, load_hooks, cloud_client, connect_with_retry, broker
 from nodes import NODES, spoken, spellings
 import selfdb
 import local_mind, fastpath
@@ -33,7 +33,7 @@ import local_mind, fastpath
 HOME    = os.path.expanduser("~")
 # 헬퍼 스크립트(dev.sh 등)가 쓸 파이썬 = 브레인을 띄운 이 파이썬 (paho 가 깔려 있는 것). 에이전트의 셸과 local_hooks 가 물려받는다.
 os.environ.setdefault("DAIJIN_PYTHON", sys.executable)
-# 경로(VOICE, REPO)는 daijin_common 이 이 저장소의 위치에서 유도한다. 저장소를 어디에 클론해도 된다.
+# 경로(VOICE)는 daijin_common 이 이 저장소의 위치에서 유도한다. 저장소를 어디에 클론해도 된다.
 IS_MAC  = sys.platform == "darwin"
 def _which(name, *candidates):
     """실행 파일 찾기: 알려진 절대 경로 후보 → PATH → 이름 그대로(없으면 실행 시점에 실패로 드러남)."""
@@ -234,13 +234,20 @@ def save_session(sid):
     if not sid:
         return
     old = load_session()
-    if old and old != sid:
+    if old == sid:
+        return                        # 턴마다 같은 id 가 온다: 다시 쓰지 않는다
+    if old:
         # 갈아타기 직전의 세션 id를 남겨 둔다. 잘못 새 세션으로 넘어갔을 때
         # .daijin_session.prev 의 내용을 .daijin_session 에 되돌려 쓰면 기억이 돌아온다.
-        with open(SESSION_FILE + ".prev", "w") as f:
-            f.write(old)
-    with open(SESSION_FILE, "w") as f:
-        f.write(sid)
+        _write_atomic(SESSION_FILE + ".prev", old)
+    _write_atomic(SESSION_FILE, sid)
+
+def _write_atomic(path, text):
+    """임시 파일에 쓰고 이름을 바꾼다. 바로 쓰면 비운 뒤 쓰기 전에 죽었을 때 빈 파일이 남고, 빈 세션 파일은 새 세션(기억 없음)이다."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
 
 # ---------- 로컬 확장 (선택): voice/local_hooks.py, 인터페이스는 daijin_common.load_hooks 참고 ----------
 HOOKS = load_hooks(announce=True)
@@ -373,9 +380,13 @@ def stt_whisper_server(wav):
     return stt_http(sec("WHISPER_URL") or WHISPER_URL_DEFAULT, wav, timeout=60)
 
 def stt_whisper(wav):
-    r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
-                        "--prompt",STT_PROMPT,"-f",wav],
-                       capture_output=True, text=True)
+    try:
+        r = subprocess.run([WHISPER,"-m",MODEL,"-l","ko","-nt","-np",
+                            "--prompt",STT_PROMPT,"-f",wav],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:        # 멈춘 whisper-cli 가 워커(하나뿐이다)를 영영 붙잡지 않게
+        print("  ⚠️ whisper-cli 120초 초과 → 못 들은 것으로")
+        return "", None
     return r.stdout.strip(), None            # whisper-cli 는 신뢰도를 내주지 않는다
 
 def stt(wav):
@@ -434,6 +445,18 @@ _resume_failures = 0
 _AUTH_FAIL = re.compile(r"401|unauthori[sz]ed|authentication|invalid.{0,20}(api key|token)|token.{0,20}(expired|revoked|invalid)|not logged in|please run /login", re.I)
 AUTH_FAIL_SENTENCE = "브레인 인증에 문제가 생겼어. 서버에서 토큰을 확인해 줘."
 
+def _pop_sentences(buf):
+    """buf 에서 끝난 문장들을 떼어 낸다: (문장 목록, 남은 글). 이모지·마크다운 기호는 뺀다 (TTS 가 읽지 않게)."""
+    out = []
+    while True:
+        m = _SENT_END.search(buf)
+        if not m:
+            return out, buf
+        sent = EMOJI.sub("", buf[:m.end()]).strip()
+        buf = buf[m.end():]
+        if sent:
+            out.append(sent)
+
 def _read_turn(lines, st):
     """claude 의 stream-json 출력을 한 턴(result 이벤트까지) 읽어 문장을 yield. 결과는 st 에 남긴다:
     ok(정상 종료) · yielded(한 문장이라도 나옴) · noise(JSON 이 아닌 출력과 오류 문구, 진단용).
@@ -455,15 +478,10 @@ def _read_turn(lines, st):
             if ev.get("type") == "content_block_delta" and \
                ev.get("delta", {}).get("type") == "text_delta":
                 buf += ev["delta"]["text"]
-                while True:
-                    m = _SENT_END.search(buf)
-                    if not m:
-                        break
-                    sent = EMOJI.sub("", buf[:m.end()]).strip()
-                    buf = buf[m.end():]
-                    if sent:
-                        st["yielded"] = True
-                        yield sent
+                sents, buf = _pop_sentences(buf)
+                for sent in sents:
+                    st["yielded"] = True
+                    yield sent
             elif ev.get("type") == "content_block_stop":
                 # 텍스트 블록이 끝나면(다음은 도구 호출) 마침표 뒤 공백이 없어도 바로 내보낸다.
                 # 안 그러면 "응, 알았어."가 도구 실행이 끝난 뒤 다음 문장과 붙어서 나온다(실측).
@@ -484,13 +502,15 @@ def _read_turn(lines, st):
         st["yielded"] = True
         yield rest
 
+def _claude_cmd(resume_id, *head):
+    """claude 명령줄. head 는 앞부분("-p", 글) 또는 ("-p", "--input-format", "stream-json"): 한 번 쓰는 프로세스와 상주 프로세스가 나머지를 같이 쓴다."""
+    cmd = [CLAUDE, *head, "--output-format", "stream-json", "--include-partial-messages", "--verbose",
+           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", sys_prompt()] + _speed_opts()
+    return cmd + (["--resume", resume_id] if resume_id else [])
+
 def _claude_stream(text, resume_id, st):
     """claude -p 를 한 턴만 돌려(한 번 쓰고 버리는 프로세스) 문장을 yield. 결과는 st 에 (_read_turn 참고, timeout 도 여기서)."""
-    cmd = [CLAUDE, "-p", text, "--output-format", "stream-json",
-           "--include-partial-messages", "--verbose",
-           "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", sys_prompt()] + _speed_opts()
-    if resume_id:
-        cmd += ["--resume", resume_id]
+    cmd = _claude_cmd(resume_id, "-p", text)
     # stderr 를 stdout 에 합친다: 인증 만료나 세션 없음 같은 오류는 JSON 이 아닌 줄로 나오므로 noise 로 모인다.
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
                          stderr=subprocess.STDOUT, text=True, cwd=VOICE, env=_claude_env())
@@ -531,11 +551,7 @@ class Resident:
         return self.p is not None and self.p.poll() is None
 
     def start(self, resume_id):
-        cmd = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
-               "--include-partial-messages", "--verbose",
-               "--allowedTools", ALLOWED_TOOLS, "--append-system-prompt", sys_prompt()] + _speed_opts()
-        if resume_id:
-            cmd += ["--resume", resume_id]
+        cmd = _claude_cmd(resume_id, "-p", "--input-format", "stream-json")
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, encoding="utf-8", cwd=VOICE, env=_claude_env())
         self.sid, self.turns = resume_id, 0
@@ -648,7 +664,7 @@ def claude_think(text, out):
     global _resume_failures
     sid = load_session()
     st = _new_state()
-    text = with_state(text)
+    text = with_state(with_proactive_context(text))      # 그 사이 먼저 한 말은 Claude 의 고정 세션에만 필요하다 (로컬 엔진은 자아 층에서 읽는다)
     yield from _think_turn(text, sid, st)
     if st["timeout"]:
         print(f"  ⚠️ 에이전트 {BRAIN_TIMEOUT_S}초 초과 → 중단")
@@ -736,16 +752,11 @@ def local_think(text, out):
     yield from split_sentences(reply)
 
 def split_sentences(text):
-    buf = text
-    while True:
-        m = _SENT_END.search(buf)
-        if not m:
-            break
-        sent = buf[:m.end()].strip(); buf = buf[m.end():]
-        if sent:
-            yield sent
-    if buf.strip():
-        yield buf.strip()
+    sents, rest = _pop_sentences(text)
+    yield from sents
+    rest = EMOJI.sub("", rest).strip()
+    if rest:
+        yield rest
 
 _THINKERS = {"claude": claude_think, "local": local_think}
 _last_engine = {"name": None}
@@ -933,6 +944,7 @@ def tts_stream(text):
 # = 최대 ~19KB/s라 PCM(32KB/s)은 물리적으로 불가. ADPCM은 8KB/s로 여유.
 CHUNK_OUT = 2048      # ADPCM 청크 (=4096샘플=256ms). 디바이스가 올려 보내는 청크도 같은 크기다
 _rx = {"clip": None, "parts": {}, "at": 0}   # 수신 중인 클립 재조립 버퍼 (at = 마지막 청크 시각)
+_rx_lock = threading.Lock()          # paho 의 수신 스레드(on_message)와 heartbeat(오래된 클립 버리기)가 같이 만진다
 
 def rx_abandon(reason):
     """받다 만 클립을 버리고 로그에 남긴다. TCP 위라 중간 청크가 빠지는 일은 드물고, 실제로는 기기 연결이 끊겨 꼬리가 안 오는 쪽이다
@@ -1030,7 +1042,7 @@ def handle_clip(client, pcm):
         turn.info["path"] = "fast"
         speak_stream(client, iter([fast]), t0, turn)
         return
-    src = brain_stream(with_proactive_context(user)) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
+    src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
     speak_stream(client, src, t0, turn)
 
 # 말하기 직전 치환 — 프롬프트로 안 고쳐지는 습관어. TTS가 "ack"를 "액"으로 읽어 "액바닷서"가 됨(2026-09-16).
@@ -1136,8 +1148,9 @@ def heartbeat(client):
     while True:
         time.sleep(60)
         try:
-            if _rx["clip"] is not None and time.time() - _rx["at"] > RX_STALE_S:
-                rx_abandon(f"{int(time.time() - _rx['at'])}초 조용함 (기기 연결이 끊긴 듯)")
+            with _rx_lock:
+                if _rx["clip"] is not None and time.time() - _rx["at"] > RX_STALE_S:
+                    rx_abandon(f"{int(time.time() - _rx['at'])}초 조용함 (기기 연결이 끊긴 듯)")
             publish_status(client)
             token_watch()
             _resident.recycle_if_due()
@@ -1212,7 +1225,7 @@ def handle_ask(client, text):
     if intercepted(client, text, "ask", t0):
         return
     turn = Turn("ask", t0); turn.text_in = text
-    speak_stream(client, brain_stream(with_proactive_context(text)), t0, turn)
+    speak_stream(client, brain_stream(text), t0, turn)
 
 # 처리(STT/Claude/TTS/발행)는 워커 스레드에서 — paho 네트워크 스레드(콜백)에서 하면
 # publish가 콜백 종료까지 실제 송신되지 않아 스트리밍이 무효화됨
@@ -1249,10 +1262,21 @@ def on_message(client, userdata, msg):
     if len(p) <= 4:
         return
     clip, seq, last = p[0], (p[1] << 8) | p[2], p[3] & 1
-    if _rx["clip"] != clip or seq == 0:       # 새 클립 시작 (seq 0 도 기준: 디바이스가 재부팅하면 clipId 가 다시 0부터다)
+    with _rx_lock:
+        data = _rx_take(clip, seq, last, p)
+    if data is not None:
+        _clipq.put(("pcm", data))
+
+def _rx_take(clip, seq, last, p):
+    """청크 하나를 재조립 버퍼에 넣는다 (_rx_lock 을 쥐고 부른다). 클립이 끝났으면 PCM 을, 아니면 None 을 돌려준다."""
+    if seq == 0:                              # 클립은 seq 0 에서만 시작한다 (디바이스가 재부팅하면 clipId 가 다시 0부터라 id 만으로는 못 가른다)
         rx_abandon("다음 클립이 왔다")
         _rx["clip"], _rx["parts"] = clip, {}
         _rx["adpcm"] = bool(p[3] & 2)         # bit1 = ADPCM 압축 클립
+    elif _rx["clip"] != clip:
+        # 머리를 못 받은 클립의 청크 (버린 클립의 꼬리가 뒤늦게 왔거나, 브레인이 클립 중간에 떴다). 중간부터는 ADPCM 을 풀 수 없다.
+        rx_abandon("다른 클립의 청크가 왔다")
+        return None
     _rx["at"] = time.time()
     _rx["parts"][seq] = p[4:]
     if last:
@@ -1265,7 +1289,8 @@ def on_message(client, userdata, msg):
         print(f"\n🎧 클립 {clip} 수신: {len(_rx['parts'])} 청크, "
               f"{len(data)} bytes{' (ADPCM)' if _rx.get('adpcm') else ''}")
         _rx["clip"], _rx["parts"] = None, {}
-        _clipq.put(("pcm", data))
+        return data
+    return None
 
 def main():
     global _client
