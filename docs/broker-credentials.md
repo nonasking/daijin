@@ -43,7 +43,10 @@ MQTT 로 `ota:<url>:<sha256>` → 보드가 받아 해시를 맞춰 보고 다�
 있는 쪽이면 자기 서버의 바이너리와 그 해시를 보낼 수 있다. 그래서 `cmd` 에 쓸 수 있는 건 brain 뿐이다(ACL). 펌웨어 쪽 URL 고정은
 다음 펌웨어에서 (2026-11-01 리뷰). 토큰은 맥 secrets 의 `FW_TOKEN` 과 서버 `/var/www/daijin/fw/.token`.
 
-맥의 집 우체국(brew mosquitto, `iot` 하나, ACL 없음)은 VPS 로 `daijin/ask`·`daijin/say` 를 넘기지 않는다 (2026-11-01 다리에서 뺌).
+맥의 집 우체국(brew mosquitto)도 같은 계정·같은 권한이다 (2026-11-09): `brain`/`device`/`nodes` 를 VPS 와 같은 비밀번호로 넣고
+`acl_file` 로 `voice/mosquitto/home.acl` 을 쓴다 (그 파일은 `daijin.acl` 을 그대로 담고, 테스트가 둘이 갈라지지 않는지 본다).
+VPS 로 가던 다리는 걷었다: 읽는 곳이 없었고 맥의 설정 파일에 brain 비밀번호를 두는 것뿐이었다. 보드는 집 우체국에서도 자기
+계정(`MQTT_USER`)으로 붙는다. 옛 공용 계정 `iot` 는 보드 셋이 새 펌웨어로 올라갈 때까지만 기기·노드 토픽으로 좁혀 남겨 둔다.
 전제: 그 보드에 ota.h 가 든 펌웨어가 한 번은 USB 로 올라가 있어야 한다 (2026-10-27 이전 펌웨어에는 없다).
 
 ## HiveMQ Cloud 에서 (예전 방식)

@@ -5,8 +5,9 @@
 //   #define MQTT_LOCAL_HOST "my-mac.local"   // 집 mosquitto 가 도는 기계: 이름(.local, mDNS) 또는 고정 IP
 //                                            // 이름을 권한다: 공유기가 IP 를 바꿔도 따라간다 (2026-10-12 실제로 .143 → .189)
 //   #define MQTT_LOCAL_PORT 1883
-//   #define MQTT_LOCAL_USER "iot"
-//   #define MQTT_LOCAL_PASS "..."
+// 계정은 클라우드와 같은 것(MQTT_USER/MQTT_PASS)을 쓴다: 집 우체국도 같은 계정·같은 ACL 이다 (voice/mosquitto/home.acl).
+// 예전엔 보드 전부가 공용 계정 하나(MQTT_LOCAL_USER "iot")로 붙었고, 그 비밀번호 하나면 집 우체국에서 무엇이든 할 수 있었다.
+// 집 우체국의 계정이 정말 달라야 하면 MQTT_LOCAL_USER / MQTT_LOCAL_PASS 를 따로 적는다.
 // 동작: 시각을 못 얻어 인증서를 검증할 수 없거나 클라우드 접속이 3번 연달아 실패하면 집 우체국으로 간다.
 //       집 우체국에 있는 동안 5분마다 클라우드를 다시 시도하고, 붙으면 돌아간다. 집 우체국에 붙어 있는 중이면 dueForCloud() 가
 //       5분이 됐음을 알려 주고, 호출자가 한가할 때 연결을 끊어 다시 고르게 한다 (2026-11-01 리뷰: choose() 는 끊겨 있을 때만 불려서
@@ -52,13 +53,13 @@ struct BrokerChoice {
   bool enabled() const { return HAS_LOCAL_BROKER; }
   const char* name() const { return onLocal ? "local" : "cloud"; }
   const char* user() const {
-#if HAS_LOCAL_BROKER
+#if HAS_LOCAL_BROKER && defined(MQTT_LOCAL_USER)
     if (onLocal) return MQTT_LOCAL_USER;
 #endif
     return MQTT_USER;
   }
   const char* pass() const {
-#if HAS_LOCAL_BROKER
+#if HAS_LOCAL_BROKER && defined(MQTT_LOCAL_PASS)
     if (onLocal) return MQTT_LOCAL_PASS;
 #endif
     return MQTT_PASS;
