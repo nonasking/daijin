@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS persona_versions (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL, diff_summary TEXT,
   proposed_by TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notes (ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS node_state (node TEXT PRIMARY KEY, online INTEGER NOT NULL, since INTEGER NOT NULL, excused_at INTEGER);
+CREATE TABLE IF NOT EXISTS node_state (node TEXT PRIMARY KEY, online INTEGER NOT NULL, since INTEGER NOT NULL, excused_at INTEGER,
+  excuse_count INTEGER NOT NULL DEFAULT 0, standing INTEGER NOT NULL DEFAULT 0);
 """
 
 RESPONSE_CLASSES = ("engaged", "acknowledged", "refused_context", "negative", "unanswered")
@@ -66,10 +67,11 @@ def db():
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA busy_timeout=5000")
         c.executescript(SCHEMA)
-        try:                                   # 예전 DB: node_state 에 excused_at 이 없다
-            c.execute("ALTER TABLE node_state ADD COLUMN excused_at INTEGER")
-        except sqlite3.OperationalError:
-            pass
+        for col in ("excused_at INTEGER", "excuse_count INTEGER NOT NULL DEFAULT 0", "standing INTEGER NOT NULL DEFAULT 0"):
+            try:                               # 예전 DB: node_state 에 이 칸들이 없다
+                c.execute(f"ALTER TABLE node_state ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         _local.conn, _local.path = c, db_path()
     return c
 
@@ -264,24 +266,45 @@ def persona_set_current(text, by="human", diff_summary=None):
 
 # ---------- node_state ----------
 # 노드가 지금 상태가 된 시각. 브로커의 retained 오프라인 표시에는 시각이 없어서, 재시작 뒤에도 "언제부터 꺼져 있었나"를 알려면 여기 남겨야 한다.
+STANDING_AFTER = 2          # 같은 노드를 이만큼 "일부러 꺼 뒀다"고 하면 '평소 꺼 두는 노드'로 굳힌다
+
 @_safe
 def node_state_set(node, online, since):
-    """켜지면 '일부러 꺼 둠' 표시도 지운다 (다음에 꺼지면 다시 물어도 된다)."""
+    """켜지면 '일부러 꺼 둠' 표시를 지운다 (다음에 꺼지면 다시 물어도 된다). '평소 꺼 두는 노드'(standing)는 지우지 않는다."""
     db().execute("INSERT INTO node_state(node, online, since) VALUES(?,?,?) ON CONFLICT(node) DO UPDATE SET online=excluded.online, since=excluded.since,"
-                 " excused_at = CASE WHEN excluded.online = 1 THEN NULL ELSE node_state.excused_at END",
+                 " excused_at = CASE WHEN excluded.online = 1 AND node_state.standing = 0 THEN NULL ELSE node_state.excused_at END",
                  (node, 1 if online else 0, int(since)))
     return True
 
 @_safe
-def node_excuse(node, ts=None):
-    """사람이 이 노드는 일부러 꺼 뒀다고 했다: 다시 켜질 때까지 node_loss 가 이 노드를 세지 않는다."""
-    db().execute("INSERT INTO node_state(node, online, since, excused_at) VALUES(?,0,?,?) ON CONFLICT(node) DO UPDATE SET excused_at=excluded.excused_at",
-                 (node, int(ts or time.time()), int(ts or time.time())))
+def node_excuse(node, ts=None, standing=False):
+    """사람이 이 노드는 일부러 꺼 뒀다고 했다: 다시 켜질 때까지 node_loss 가 이 노드를 세지 않는다.
+    두 번째부터는(또는 standing=True: "원래 꺼 둬", "묻지 마") '평소 꺼 두는 노드'로 굳힌다: 켰다 꺼도 묻지 않는다.
+    2026-10-28 에 면제한 노드를 그날 밤 잠깐 켰다 끄자 면제가 풀려 사흘 뒤, 닷새 뒤에 같은 걸 또 물었다. 굳었으면 True."""
+    t = int(ts or time.time())
+    db().execute("INSERT INTO node_state(node, online, since, excused_at, excuse_count, standing) VALUES(?,0,?,?,1,?)"
+                 " ON CONFLICT(node) DO UPDATE SET excused_at=excluded.excused_at, excuse_count=node_state.excuse_count+1,"
+                 " standing = CASE WHEN ? OR node_state.excuse_count + 1 >= ? THEN 1 ELSE node_state.standing END",
+                 (node, t, t, 1 if standing else 0, 1 if standing else 0, STANDING_AFTER))
+    return bool(db().execute("SELECT standing FROM node_state WHERE node=?", (node,)).fetchone()["standing"])
+
+@_safe
+def node_unexcuse(node):
+    """사람이 이 노드는 꺼지면 다시 알려 달라고 했다: 면제도, 굳힌 것도 푼다."""
+    db().execute("UPDATE node_state SET excused_at=NULL, excuse_count=0, standing=0 WHERE node=?", (node,))
     return True
 
 def node_excused():
+    """지금 꺼져 있고 걱정하지 않을 노드: 일부러 꺼 뒀다고 했거나 평소 꺼 두는 노드."""
     try:
-        return {r["node"] for r in db().execute("SELECT node FROM node_state WHERE excused_at IS NOT NULL AND online = 0")}
+        return {r["node"] for r in db().execute("SELECT node FROM node_state WHERE (excused_at IS NOT NULL OR standing = 1) AND online = 0")}
+    except sqlite3.Error:
+        return set()
+
+def node_standing():
+    """평소 꺼 두는 노드 (켜져 있든 꺼져 있든)."""
+    try:
+        return {r["node"] for r in db().execute("SELECT node FROM node_state WHERE standing = 1")}
     except sqlite3.Error:
         return set()
 

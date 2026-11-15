@@ -693,6 +693,55 @@ class TestIntentionallyOff(DbCase):
                 self.assertEqual(initiative.excuse_from_text(text, self.now), set())
         self.assertEqual(initiative.excuse_from_text("다이진이랑 레드 일부러 꺼 뒀어", self.now), {"dev1"})   # a named node still counts
 
+    def test_said_twice_it_sticks_even_after_the_node_comes_on_and_goes_off_again(self):
+        initiative.excuse_from_text("레드는 일부러 꺼 놨어", self.now)
+        self.assertEqual(selfdb.node_standing(), set())                              # once: until it comes back on
+        initiative.excuse_from_text("레드 일부러 꺼 둔 거라니까", self.now + 60)
+        self.assertEqual(selfdb.node_standing(), {"dev1"})                           # twice: a node that is usually off
+        selfdb.node_state_set("dev1", True, self.now + 100)                          # plugged in for a while (a firmware update, say)
+        selfdb.node_state_set("dev1", False, self.now + 200)
+        self.assertIn("dev1", selfdb.node_excused())                                 # and still not asked about
+        self.assertEqual(self.loss()[1]["node"], "dev2")
+
+    def test_words_that_mean_always_stick_at_once_and_a_denial_does_not(self):
+        for text in ("레드 블루는 원래 꺼 두는 거야", "꺼져 있다고 묻지 마, 일부러 꺼 둔 거야", "평소에 꺼 놓으니까 말 안 해도 돼"):
+            with self.subTest(text=text):
+                selfdb.db().execute("UPDATE node_state SET excused_at=NULL, excuse_count=0, standing=0")
+                initiative.excuse_from_text(text, self.now)
+                self.assertEqual(selfdb.node_standing(), {"dev1", "dev2"})
+        selfdb.db().execute("UPDATE node_state SET excused_at=NULL, excuse_count=0, standing=0")
+        initiative.excuse_from_text("항상 꺼 두는 건 아니야", self.now)
+        self.assertEqual(selfdb.node_standing(), set())
+        selfdb.db().execute("UPDATE node_state SET excused_at=NULL, excuse_count=0, standing=0")
+        initiative.excuse_from_text("일부러 꺼졌으니까 신경 쓰지 말라고 하고 싶었어요.", self.now)   # "don't mind it" may mean just today
+        self.assertEqual(selfdb.node_standing(), set())                              # said once; the second time it sticks
+
+    def test_tell_me_when_it_goes_off_undoes_it(self):
+        initiative.excuse_from_text("레드 블루는 원래 꺼 두는 거야", self.now)
+        initiative.excuse_from_text("레드 꺼지면 알려 줘", self.now + 10)
+        self.assertEqual(selfdb.node_standing(), {"dev2"})
+        self.assertNotIn("dev1", selfdb.node_excused())
+        initiative.excuse_from_text("블루 켜지면 알려 줘", self.now + 20)             # about coming on: changes nothing
+        self.assertEqual(selfdb.node_standing(), {"dev2"})
+        initiative.excuse_from_text("꺼져 있으면 말해 줘", self.now + 30)             # no name: every node
+        self.assertEqual(selfdb.node_standing(), set())
+
+    def test_the_brain_and_the_fleet_watcher_treat_a_usually_off_node_as_no_news(self):
+        import fleet_watch as fw
+        initiative.excuse_from_text("블루는 원래 꺼 두는 거야", self.now)
+        dm._body["nodes"]["dev2"] = ({"online": False}, self.now)
+        self.addCleanup(dm._body["nodes"].pop, "dev2", None)
+        self.assertIn("블루 꺼짐 (평소 꺼 두는 노드", dm.state_block(self.now))
+        said = []
+        class C:
+            def publish(self, topic, payload=None, **kw): said.append((topic, payload))
+        for name, val in (("nodes", {"dev1": {"online": False, "off_since": 0}, "dev2": {"online": False, "off_since": 0}}),
+                          ("HOOKS", None), ("sec", lambda k: "")):
+            orig = getattr(fw, name); setattr(fw, name, val); self.addCleanup(setattr, fw, name, orig)
+        fw.pending_check(C(), now=fw.OFF_GRACE_S + 1)
+        self.assertEqual(len(said), 1)                                               # red going off is said, blue is not
+        self.assertIn("레드", said[0][1])
+
     def test_other_talk_about_switching_is_not_an_excuse(self):
         for text in ("레드 꺼 줘", "블루 켜 놔", "일부러 그런 거 아니야", "불 좀 꺼", "끄지 마"):
             with self.subTest(text=text):

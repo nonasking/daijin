@@ -13,6 +13,7 @@
 import json, time
 from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
 from nodes import NODES, subject
+import selfdb
 
 T_STATUS = "daijin/dev/+/status"
 T_MAIN   = "daijin/status"      # 메인 디바이스 상태 (status.sh용)
@@ -119,6 +120,9 @@ def pending_check(client, now=None):
         since = st.get("off_since")
         if since is not None and not st.get("online") and now - since >= OFF_GRACE_S:
             st.pop("off_since")
+            if node in selfdb.node_standing():           # 평소 꺼 두는 노드가 꺼진 것은 소식이 아니다 (켜진 것은 그대로 알린다)
+                print(f"[{time.strftime('%H:%M:%S')}] {node} 꺼짐: 평소 꺼 두는 노드, 보고 안 함")
+                continue
             report(client, node, lines_offline(node), "off")
 
 def stale_check(client):

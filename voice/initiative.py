@@ -159,11 +159,25 @@ def device_listening(body, now):
 # 말에 의도(일부러, 꺼 뒀어/놨어)와 꺼짐이 함께 있으면 노드를 '일부러 꺼 둠'으로 표시한다. 노드 이름이 있으면 그 노드, 없으면 지금 꺼진 노드 전부.
 INTENT = re.compile(r"일부러|꺼\s?(뒀|둔|놨|놓|둘|두)|꺼\s?놓")
 OFF = re.compile(r"꺼|끈|껐|전원")
+# 한 번의 말로 '평소 꺼 두는 노드'가 되는 말: 늘 그렇다는 말이거나, 그 일로 묻지 말라는 말.
+ALWAYS = re.compile(r"(원래|평소|항상|늘|맨날|계속|보통)\s?.{0,6}꺼|(묻|물어보|알리|말하)지 ?(마|말)|말 ?안 ?해도 ?돼")
+# "신경 쓰지 마"는 넣지 않았다: 오늘만 그렇다는 말일 수 있다. 그런 말은 두 번째에 굳는다 (selfdb.STANDING_AFTER).
+# 굳힌 것을 푸는 말: 꺼지면 다시 알려 달라.
+TELL_ME = re.compile(r"꺼(지|져 ?있으)면.{0,10}(알려|말해|물어)|(다시|이제|앞으로).{0,6}(알려|물어 ?봐|신경 ?써)")
 
 def excuse_from_text(text, now=None):
     """말에서 '일부러 꺼 둠'을 읽어 node_state 에 표시한다. 표시한 노드 집합을 돌려준다.
     "이따 레드 꺼 둘게"처럼 아직 켜진 노드도 표시되는데, 켜진 동안은 node_excused 가 세지 않고(online=0 만) 다시 켜지면
-    node_state_set 이 지우므로, 말한 대로 꺼졌을 때만 효력이 난다."""
+    node_state_set 이 지우므로, 말한 대로 꺼졌을 때만 효력이 난다.
+    같은 노드를 두 번 이렇게 말했거나 "원래 꺼 둬", "묻지 마" 같은 말이면 '평소 꺼 두는 노드'로 굳는다 (켰다 꺼도 유지).
+    "꺼지면 알려 줘"는 그걸 푼다."""
+    if TELL_ME.search(text) and (OFF.search(text) or mentioned(text)):
+        back = mentioned(text) or (selfdb.node_standing() | selfdb.node_excused())
+        for nid in back:
+            selfdb.node_unexcuse(nid)
+        if back:
+            print(f"[{time.strftime('%H:%M:%S')}] 다시 알림: {', '.join(spoken(n) for n in sorted(back))} ← {text[:40]!r}")
+        return set()
     if not (INTENT.search(text) and OFF.search(text)) or re.search(r"안 ?꺼|끄지 ?마|켜 ?(줘|놔|둬)", text):
         return set()
     named = mentioned(text)
@@ -171,10 +185,11 @@ def excuse_from_text(text, now=None):
         return set()                               # 노드가 아니라 다이진 자신을 꺼 뒀다는 말: 노드들은 그대로 걱정한다
     off_now = {nid for nid, (online, _) in selfdb.node_state_all().items() if not online}
     targets = named or off_now
-    for nid in targets:
-        selfdb.node_excuse(nid, now)
+    always = bool(ALWAYS.search(text)) and not re.search(r"아니|않", text)   # "항상 꺼 두는 건 아니야"는 굳히지 않는다
+    stuck = {nid for nid in targets if selfdb.node_excuse(nid, now, standing=always)}
     if targets:
-        print(f"[{time.strftime('%H:%M:%S')}] 일부러 꺼 둠: {', '.join(spoken(n) for n in sorted(targets))} ← {text[:40]!r}")
+        print(f"[{time.strftime('%H:%M:%S')}] 일부러 꺼 둠: {', '.join(spoken(n) for n in sorted(targets))} ← {text[:40]!r}"
+              + (f" (평소 꺼 두는 노드로 굳힘: {', '.join(spoken(n) for n in sorted(stuck))})" if stuck else ""))
     return targets
 
 class Ledger:

@@ -153,7 +153,7 @@ def state_block(now=None):
             parts.append(f"몸: 온도 {d.get('temp_c', '?')}도, 신호 {d.get('rssi', '?')}, 켜진 지 {int((d.get('uptime_s') or 0) // 60)}분"
                          + (f" ({_age(age)} 값)" if age > 150 else ""))
     nodes = []
-    excused = selfdb.node_excused()
+    excused, standing = selfdb.node_excused(), selfdb.node_standing()
     for nid, (nd, rts) in sorted(_body["nodes"].items()):
         name = spoken(nid)
         if nd.get("online"):
@@ -161,7 +161,8 @@ def state_block(now=None):
             stale = beat > 1_700_000_000 and now - beat > 90
             nodes.append(f"{name} 켜짐" + (" (하트비트 끊김)" if stale else ""))
         else:
-            nodes.append(f"{name} 꺼짐" + (" (사람이 일부러 꺼 둠, 걱정하지 마)" if nid in excused else ""))
+            nodes.append(f"{name} 꺼짐" + (" (평소 꺼 두는 노드, 꺼져 있다고 말 꺼내지 마)" if nid in standing else
+                                         " (사람이 일부러 꺼 둠, 걱정하지 마)" if nid in excused else ""))
     if nodes:
         parts.append("노드: " + ", ".join(nodes))
     if token_line(now):
