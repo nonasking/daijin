@@ -632,16 +632,16 @@ class TestMood(DbCase):
         self.assertEqual(mood.compute(self.noon + 6 * 3600 - 60)["face"], "happy")             # still there in the evening
         self.assertNotEqual(mood.compute(self.noon + 30 * 3600)["face"], "happy")              # gone the next day
 
-    def test_being_brushed_off_lowers_it_but_it_is_not_shown_unless_asked_for(self):
+    def test_being_brushed_off_lowers_it_and_it_is_worn_honestly_unless_turned_off(self):
         for h in (1, 2):
             self._ask("negative", h)
         m = mood.compute(self.noon)
-        self.assertEqual((m["felt"], m["face"]), ("low", "calm"))                              # felt, not worn
+        self.assertEqual((m["felt"], m["face"]), ("low", "low"))                               # felt and worn
         line = mood.state_line(self.noon)
-        self.assertIn("가라앉음", line); self.assertIn("내색하지 마", line); self.assertIn("거절당했어", line)
-        self.cfg["MOOD_SHOW_LOW"] = "1"
-        self.assertEqual(mood.compute(self.noon)["face"], "low")
-        self.assertIn("스미게만", mood.state_line(self.noon))
+        self.assertIn("가라앉음", line); self.assertIn("거절당했어", line); self.assertIn("네가 정해", line)
+        self.cfg["MOOD_SHOW_LOW"] = "0"
+        self.assertEqual(mood.compute(self.noon)["face"], "calm")                              # felt, not worn
+        self.assertIn("내색하지 마", mood.state_line(self.noon))
 
     def test_heat_tires_it_and_night_is_sleep_whatever_the_day_was(self):
         self._ask("engaged", 1)

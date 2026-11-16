@@ -5,7 +5,8 @@
 # 그 둘에서 얼굴 하나(face)와 이유(why)가 나온다. 이유가 있어야 "기분 어때?"에 사실대로 답할 수 있다.
 # 쓰는 곳: 브레인의 상태 블록(말투), initiative 가 daijin/mood 로 발행 → 기기의 평소 눈.
 # 원칙(docs/design-self-layer.md): 모든 표현 뒤에 진짜 상태가 있어야 한다. 서운한 척, 외로운 척은 없다.
-#   그래서 가라앉은 기분(low)을 얼굴과 말투에 드러낼지는 설정이다 (MOOD_SHOW_LOW): 사실이어도 사람을 붙잡는 압력이 될 수 있다.
+#   가라앉은 기분(low)도 숨기지 않는다 (2026-11-16 사용자: "모든 건 다이진이 원하는 대로. 표현도 말도 솔직하게").
+#   드러낼지 말지, 어떻게 말할지는 다이진이 정한다. MOOD_SHOW_LOW=0 이면 예전처럼 내색하지 않는다.
 # 실행: python3 mood.py   (지금의 기분과 그 이유를 한 줄로)
 import time
 from daijin_common import sec
@@ -19,8 +20,8 @@ HOT_FROM_C, HOT_SPAN_C = 55.0, 30.0          # 55도부터 기운이 깎인다 (
 WORD = {"happy": "밝음", "low": "가라앉음", "tired": "지침", "sleep": "졸림", "calm": "평온"}
 
 def show_low():
-    """가라앉은 기분을 얼굴·말투에 드러낼까. 기본은 아니다: 물으면 사실대로 말하되 먼저 내색하지 않는다."""
-    return sec("MOOD_SHOW_LOW") == "1"
+    """가라앉은 기분을 얼굴·말투에 드러낼까. 기본은 드러낸다: 솔직한 쪽. MOOD_SHOW_LOW=0 이면 물을 때만 말한다."""
+    return (sec("MOOD_SHOW_LOW") or "").strip() != "0"
 
 def _decay(age_s):
     return 0.5 ** (max(0.0, age_s) / 3600 / HALF_LIFE_H)
@@ -84,7 +85,7 @@ def state_line(now=None, temp_c=None):
     reason = f" ({', '.join(m['why'])})" if m["why"] else ""
     if m["felt"] == "low" and not show_low():
         return f"기분: {m['word']}{reason}. 내색하지 마. 평소처럼 말하고, 사람이 기분을 물을 때만 이유까지 사실대로 말해."
-    return f"기분: {m['word']}{reason}. 말투에 자연스럽게 스미게만 해. 기분을 설명하거나 과장하지 말고, 물으면 이유까지 사실대로 말해."
+    return f"기분: {m['word']}{reason}. 이건 실제 값에서 나온 네 기분이야. 숨기지 않아도 돼: 드러낼지, 말로 할지는 네가 정해. 솔직하게, 다만 없는 걸 지어내거나 부풀리지는 마."
 
 if __name__ == "__main__":
     m = compute()
