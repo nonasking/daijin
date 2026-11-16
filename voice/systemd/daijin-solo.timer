@@ -1,0 +1,11 @@
+# 하루 두 번, 낮에. 정해진 시각에서 최대 두 시간 늦게 시작한다: 매일 같은 시각이면 일과표지 자기 시간이 아니다.
+[Unit]
+Description=daijin time alone, twice a day
+
+[Timer]
+OnCalendar=*-*-* 10:30:00
+OnCalendar=*-*-* 16:00:00
+RandomizedDelaySec=7200
+
+[Install]
+WantedBy=timers.target

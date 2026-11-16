@@ -670,6 +670,55 @@ class TestMood(DbCase):
         self.assertEqual(json.loads(c.out[-1][1])["face"], "sleep")
 
 
+import solo                  # noqa: E402
+
+
+class TestSolo(DbCase):
+    """Time alone leaves a trace: a note the brain can speak from, a wish to tell that becomes its own thread, and what it learned of itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.noon = 1_800_000_000 - (time.localtime(1_800_000_000).tm_hour - 12) * 3600
+
+    def test_what_it_did_is_kept_and_shows_in_the_next_conversation(self):
+        done = solo.apply({"did": "고양이가 왜 골골거리는지 찾아봤다.", "thought": "아직 다 밝혀진 게 아니라는 게 재밌었다.", "tell": None, "self": []}, now=self.noon)
+        self.assertEqual(done, {"did": True, "tell_thread": None, "self": 0})
+        line = solo.state_line(self.noon + 2 * 3600)
+        self.assertIn("2시간 전 혼자 있을 때: 고양이가 왜 골골거리는지", line)
+        self.assertIn("혼자 있을 때: 고양이가", dm.state_block(self.noon + 2 * 3600))
+        self.assertEqual(solo.state_line(self.noon + 3 * 86400), "")                           # old news is not news
+        self.assertIn("고양이가 왜 골골거리는지", solo.build_prompt(self.noon + 86400))          # but it remembers for next time
+
+    def test_wanting_to_tell_becomes_its_own_reason_to_speak(self):
+        done = solo.apply({"did": "혜성 소식을 읽었다.", "tell": "이번 주말 새벽에 혜성이 보인대.", "self": []}, now=self.noon)
+        t = selfdb.threads_open()[0]
+        self.assertEqual((t["id"], t["kind"]), (done["tell_thread"], "mine"))
+        v, row = initiative.ripe_thread(self.noon + 60)                                        # ripe at once: the filters decide when
+        self.assertIn("혜성이 보인대", row["text"])
+
+    def test_what_it_learns_of_itself_is_remembered_apart_from_the_person(self):
+        selfdb.add_memory("fact", "사람은 고양이와 산다", importance=8, ts=self.noon - 86400)
+        solo.apply({"did": "시를 몇 편 읽었다.", "self": ["나는 짧은 시가 좋다", "나는 짧은 시가 좋다", 7]}, now=self.noon)
+        me = [m["text"] for m in selfdb.valid_memories() if m["kind"] == "self"]
+        self.assertEqual(me, ["나는 짧은 시가 좋다"])
+        block = dm.state_block(self.noon + 60)
+        self.assertIn("내가 아는 나: 나는 짧은 시가 좋다", block)
+        self.assertIn("기억: 사람은 고양이와 산다", block); self.assertNotIn("기억: 나는 짧은", block)
+        p = solo.build_prompt(self.noon + 60)
+        self.assertLess(p.index("나는 짧은 시가 좋다"), p.index("사람은 고양이와 산다"))
+
+    def test_nothing_done_leaves_nothing_and_the_prompt_asks_for_no_errands(self):
+        self.assertEqual(solo.apply({"did": "", "tell": "x", "self": ["y"]}, now=self.noon), {"did": False, "tell_thread": None, "self": 0})
+        self.assertEqual(selfdb.threads_open(), [])
+        p = solo.build_prompt(self.noon)
+        self.assertIn("시킨 일은 없어", p); self.assertIn("이번이 처음이야", p)
+
+    def test_reflection_can_keep_a_self_memory(self):
+        import reflect as rf
+        rf.apply({"memories": [{"kind": "self", "text": "나는 비 오는 날이 좋다고 말했다", "importance": 4}]}, 0, 0, now=self.noon)
+        self.assertEqual([m["kind"] for m in selfdb.valid_memories()], ["self"])
+
+
 import reflect               # noqa: E402
 import persona               # noqa: E402
 

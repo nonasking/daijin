@@ -124,7 +124,7 @@ EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
 T_DEV_STATUS  = "daijin/status"
 T_NODE_STATUS = "daijin/dev/+/status"
 _body = {"device": None, "device_ts": 0, "nodes": {}}     # nodes: id -> (json dict, 수신 시각)
-STATE_MAX_CHARS = 800
+STATE_MAX_CHARS = 1000
 
 def note_status(topic, payload):
     try:
@@ -178,9 +178,16 @@ def state_block(now=None):
                    "negative": "싫어함", "unanswered": "응답 없음", None: "응답 기다리는 중"}
             parts.append("내가 먼저 말 건 기록: " + " / ".join(
                 f"{_age(now - a['ts'])} '{a['text'][:24]}' → {kor.get(a['response_class'], a['response_class'])}" for a in asks))
-        mems = selfdb.top_memories(5, 200)
+        mems = [m for m in selfdb.top_memories(8, 320) if m["kind"] != "self"][:5]
         if mems:
             parts.append("기억: " + " · ".join(m["text"] for m in mems))
+        me = [m["text"] for m in selfdb.valid_memories() if m["kind"] == "self"][-3:]
+        if me:
+            parts.append("내가 아는 나: " + " · ".join(x[:60] for x in me))
+        import solo                                  # 여기서 import: solo 가 daijin_mqtt 를 늦게 가져다 쓴다
+        sl = solo.state_line(now)
+        if sl:
+            parts.append(sl + " (얘기하고 싶으면 해)")
         # 끝나지 않은 일: 대화 안에서는 조심스러운 주제도 실린다 (FOLLOWUP_SENSITIVE=never 가 아니면). 먼저 스피커로 꺼내는 것은 initiative 가 따로 가린다.
         never = (sec("FOLLOWUP_SENSITIVE") or "").strip() == "never"
         th = [t for t in selfdb.threads_open() if not (t["sensitive"] and never)]

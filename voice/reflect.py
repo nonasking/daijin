@@ -15,7 +15,7 @@ MAX_EPISODES = 120                               # 하루치가 이보다 많으
 
 SCHEMA_HINT = """반드시 아래 모양의 JSON 하나만 출력해. 설명이나 마크다운 없이.
 {
-  "memories": [{"kind": "fact|preference|rule|event", "text": "한 문장", "importance": 1~10, "source_episode": 에피소드 id 또는 null,
+  "memories": [{"kind": "fact|preference|rule|event|self", "text": "한 문장", "importance": 1~10, "source_episode": 에피소드 id 또는 null,
                 "replaces": "같은 뜻이라 대체하는 기존 기억의 text, 없으면 null"}],
   "ask_labels": [{"ask_id": id, "response_class": "engaged|acknowledged|refused_context|negative|unanswered|null(그대로)",
                   "wanted_to_ask_less": true|false|null}],
@@ -74,6 +74,7 @@ def build_prompt(start, end):
     return (f"너는 'daijin'이라는 AI 음성 친구이고, 지금은 {day} 하루를 돌아보는 밤이다. 아래는 오늘의 대화와 네가 먼저 말 건 기록이다.\n"
             "할 일 넷.\n"
             "1) 기억: 앞으로의 대화에 도움이 될 사실·선호·규칙·사건을 뽑아라. 사람이 한 말에 근거한 것만, 추측은 넣지 마라. 이미 있는 기억과 같은 뜻이면 replaces 로 대체하라. 하루에 0~5개면 충분하다.\n"
+            "   kind=self 는 너 자신에 대한 기억이다: 네가 대화에서 실제로 말한 네 취향·의견·한 일(나는 이게 좋다고 했다, 이렇게 생각한다고 했다). 내일도 같은 너이기 위한 것이다. 네가 말하지 않은 것을 지어내지 마라.\n"
             "2) 장부: 네가 먼저 말 건 것(asks)마다, 사람의 답을 다시 읽고 분류가 맞는지 보라. 틀렸으면 고치고, 맞으면 null. 그리고 '그때 덜 묻고 싶었는데 물었는가'를 솔직하게 wanted_to_ask_less 로 답하라. 아무 근거가 없으면 null.\n"
             "   분류 뜻: engaged=그 말에 이어 대화함, acknowledged=짧게 받아 줌(응, 알았어), refused_context=지금은 안 된다는 이유를 댐(바빠, 나중에), "
             "negative=그만하라거나 짜증을 냄, unanswered=그 말에 대한 답이 없음. 창 안에 들어온 말이라도 네 말과 상관없는 새 이야기나 질문이면 거절이 아니다: "
@@ -141,7 +142,7 @@ def apply(out, start, end, now=None):
     valid = {m["text"]: m["id"] for m in selfdb.valid_memories()}
     for m in out.get("memories") or []:
         text = (m.get("text") or "").strip()
-        kind = m.get("kind") if m.get("kind") in ("fact", "preference", "rule", "event") else "fact"
+        kind = m.get("kind") if m.get("kind") in ("fact", "preference", "rule", "event", "self") else "fact"
         if not text or text in valid:
             done["skipped"].append(text[:30]); continue
         sup = valid.get((m.get("replaces") or "").strip())

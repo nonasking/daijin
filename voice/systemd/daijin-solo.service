@@ -1,0 +1,12 @@
+# solo — 다이진이 혼자 있는 시간 (1회성). daijin-solo.timer 가 띄운다. 손으로: systemctl --user start daijin-solo
+[Unit]
+Description=daijin time alone (browses or thinks, leaves a note)
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO__/voice
+ExecStart=__PYTHON__ -u __REPO__/voice/solo.py
+Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=__HOME__
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=600

@@ -9,7 +9,7 @@ set -e
 VOICE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(dirname "$VOICE")"
 PY="${PYTHON:-$(command -v python3)}"
 DEST="$HOME/.config/systemd/user"; mkdir -p "$DEST"
-UNITS="daijin-brain.service daijin-fleetwatch.service daijin-initiative.service daijin-reflect.service daijin-reflect.timer"
+UNITS="daijin-brain.service daijin-fleetwatch.service daijin-initiative.service daijin-reflect.service daijin-reflect.timer daijin-solo.service daijin-solo.timer"
 if [ "${WITH_WHISPER:-0}" = 1 ]; then
   WS="$(command -v whisper-server || true)"; WM="${WHISPER_MODEL:-$VOICE/models/ggml-large-v3-turbo-q5_0.bin}"
   [ -n "$WS" ] && [ -f "$WM" ] || { echo "whisper-server 실행 파일이나 모델($WM)이 없다"; exit 1; }
@@ -27,7 +27,7 @@ done
 systemctl --user daemon-reload
 [ "$1" = "remove" ] && exit 0
 # reflect.service 는 타이머가 띄우므로 enable 하지 않는다 (지금 바로 돌려 보려면 systemctl --user start daijin-reflect)
-ENABLE="daijin-brain daijin-fleetwatch daijin-initiative daijin-reflect.timer"
+ENABLE="daijin-brain daijin-fleetwatch daijin-initiative daijin-reflect.timer daijin-solo.timer"
 [ "${WITH_WHISPER:-0}" = 1 ] && ENABLE="$ENABLE whisper-server"
 systemctl --user enable --now $ENABLE
 # linger: 로그인 세션이 없어도(SSH 끊김, 재부팅 후) 사용자 서비스가 계속 돈다. 배포판에 따라 sudo 가 필요할 수 있다.
