@@ -670,16 +670,15 @@ class TestMood(DbCase):
         self.assertEqual(json.loads(c.out[-1][1])["face"], "sleep")
 
 
-class TestOpenEars(DbCase):
-    """Clips the device sent on its own (no button) may not be meant for daijin: it may stay quiet, and the person can turn the ears on and off by voice."""
+class TestTalkMode(DbCase):
+    """Conversation mode: the device sends what it hears without the button. Those clips are ordinary speech, except that noise is not answered."""
 
     def setUp(self):
         super().setUp()
         self.said, self.asked = [], []
-        self.reply = ["응, 듣고 있어."]
         def fake_brain(text):
             self.asked.append(text)
-            yield from self.reply
+            yield "응, 듣고 있어."
         def fake_speak(client, src, t0, turn=None):
             self.said.extend(src)
             if turn:
@@ -693,46 +692,39 @@ class TestOpenEars(DbCase):
     def _no_reply(self):
         return [p for t, p in self.c.out if t == dm.T_AUDIO_OUT and len(p) == 4]
 
-    def test_reading_the_wish_to_be_heard_or_left_alone(self):
-        for s in ("이제 계속 듣고 있어", "버튼 없이 들어 줘", "귀 열어", "열린 귀 켜 줘"):
-            self.assertEqual(dm.ears_from_text(s), "on", s)
-        for s in ("이제 그만 들어", "듣지 마", "귀 닫아", "열린 귀 꺼 줘", "계속 듣지 마"):
-            self.assertEqual(dm.ears_from_text(s), "off", s)
-        for s in ("오늘 노래 들었어", "그 얘기 계속 해 봐", "귀가 아파"):
-            self.assertIsNone(dm.ears_from_text(s), s)
+    def test_reading_the_wish_to_talk_freely_or_to_stop(self):
+        for s in ("얘기 좀 하자", "대화 모드 켜 줘", "우리 이야기 할까", "버튼 없이 말할게", "대화 모드"):
+            self.assertEqual(dm.talk_from_text(s), "on", s)
+        for s in ("대화 모드 꺼 줘", "대화 끝", "이제 그만 얘기하자", "얘기는 그만", "대화 모드 종료"):
+            self.assertEqual(dm.talk_from_text(s), "off", s)
+        for s in ("오늘 노래 들었어", "그 얘기 계속 해 봐", "친구랑 얘기했어"):
+            self.assertIsNone(dm.talk_from_text(s), s)
 
-    def test_an_overheard_line_goes_to_the_agent_with_the_choice_and_quiet_means_no_sound(self):
-        self.heard, self.reply = "어 엄마 나 지금 집이야", [dm.QUIET_MARK]
+    def test_a_clip_heard_in_talk_mode_is_plain_conversation(self):
+        self.heard = "오늘 날씨 어때"
         dm.handle_clip(self.c, b"\0" * 64000, ear=True)
-        self.assertIn("대답할지 말지는 네가 정해", self.asked[0])
-        self.assertEqual(self.said, []); self.assertEqual(len(self._no_reply()), 1)
-        self.assertIsNone(selfdb.last_voice_ts())                                             # heard, not a conversation
-        self.assertEqual([e["kind"] for e in selfdb.episodes_since(0)], ["heard"])
+        self.assertEqual(self.asked, ["오늘 날씨 어때"])                                        # nothing added to what was said
+        self.assertEqual(self.said, ["응, 듣고 있어."]); self.assertIsNotNone(selfdb.last_voice_ts())
 
-    def test_an_overheard_line_it_chooses_to_answer_is_a_conversation(self):
-        self.heard = "다이진 오늘 날씨 어때"
-        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
-        self.assertEqual(self.said, ["응, 듣고 있어."]); self.assertEqual(self._no_reply(), [])
-        self.assertIsNotNone(selfdb.last_voice_ts())
-
-    def test_an_unclear_sound_is_not_met_with_say_that_again(self):
+    def test_noise_in_talk_mode_is_not_met_with_say_that_again(self):
         self.heard = ""
         dm.handle_clip(self.c, b"\0" * 64000, ear=True)
         self.assertEqual((self.said, self.asked), ([], [])); self.assertEqual(len(self._no_reply()), 1)
         dm.handle_clip(self.c, b"\0" * 64000)                                                 # with the button it still asks
         self.assertEqual(self.said, ["잘 못 들었어, 다시 말해줄래?"])
 
-    def test_voice_turns_the_ears_on_and_off_and_off_is_always_answered(self):
-        self.heard = "이제 계속 듣고 있어"
+    def test_voice_turns_it_on_and_off_and_only_when_that_changes_something(self):
+        self.heard = "얘기 좀 하자"
         dm.handle_clip(self.c, b"\0" * 64000)
-        self.assertIn((dm.T_CMD, "ears:on"), self.c.out); self.assertIn("열린 귀를 켰어", self.asked[0])
-        self.assertNotIn("대답할지 말지", self.asked[0])
-        self.heard, self.reply = "이제 그만 들어", [dm.QUIET_MARK]
+        self.assertIn((dm.T_CMD, "talk:on"), self.c.out); self.assertIn("대화 모드를 켰어", self.asked[0])
+        self.c.out.clear()
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)                                       # already on: just words
+        self.assertNotIn(dm.T_CMD, [t for t, _ in self.c.out]); self.assertEqual(self.asked[1], "얘기 좀 하자")
+        self.heard = "대화 끝"
         dm.handle_clip(self.c, b"\0" * 64000, ear=True)
-        self.assertIn((dm.T_CMD, "ears:off"), self.c.out)
-        self.assertNotIn("대답할지 말지", self.asked[1]); self.assertIn("열린 귀를 껐어", self.asked[1])
+        self.assertIn((dm.T_CMD, "talk:off"), self.c.out); self.assertIn("대화 모드를 껐어", self.asked[2])
 
-    def test_the_flag_rides_the_first_chunk_and_the_state_says_the_ears_are_open(self):
+    def test_the_flag_rides_the_first_chunk_and_the_state_says_talk_mode_is_on(self):
         q = dm.queue.Queue(); orig = dm._clipq; dm._clipq = q; self.addCleanup(setattr, dm, "_clipq", orig)
         msg = types.SimpleNamespace(topic=dm.T_AUDIO_IN, payload=bytes([7, 0, 0, 1 | 4]) + b"\x01\x02")
         dm.on_message(self.c, None, msg)
@@ -740,9 +732,8 @@ class TestOpenEars(DbCase):
         msg.payload = bytes([8, 0, 0, 1]) + b"\x01\x02"
         dm.on_message(self.c, None, msg)
         self.assertEqual(q.get_nowait()[0], "pcm")
-        dm.note_status(dm.T_DEV_STATUS if hasattr(dm, "T_DEV_STATUS") else "daijin/status",
-                       json.dumps({"online": True, "ts": int(time.time()), "temp_c": 40, "ears": True}).encode())
-        self.assertIn("열린 귀 켜짐", dm.state_block(time.time()))
+        dm.note_status("daijin/status", json.dumps({"online": True, "ts": int(time.time()), "temp_c": 40, "talk": True}).encode())
+        self.assertIn("대화 모드 켜짐", dm.state_block(time.time()))
 
 
 import solo                  # noqa: E402

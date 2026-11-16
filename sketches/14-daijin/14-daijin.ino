@@ -261,25 +261,31 @@ void ringPush16(int16_t s) {
 
 static volatile bool capturing = false;          // 마이크가 열려 있나 (captureTask). 녹음 루프와 아래 수신 콜백이 같이 본다
 
-// ---------- 열린 귀 ----------
-// 켜져 있는 동안 버튼 없이 듣는 상태. 사람이 켜고 끈다: BOOT 을 1초 길게 누르거나, 말로("계속 듣고 있어" / "그만 들어": 브레인이
-// daijin/cmd 에 ears:on|off 를 보낸다). 켜 둔 상태는 재부팅해도 남고(NVS), 평소 LED 가 초록 대신 보라색이며 status 의 ears 로 보인다.
+// ---------- 대화 모드 ----------
+// 버튼 없이 주고받는 상태. 사람이 켜고 끈다: BOOT 을 1초 길게 누르거나, 말로("얘기 좀 하자" / "대화 끝": 브레인이 daijin/cmd 에
+// talk:on|off 를 보낸다). 켜져 있는 동안 평소 LED 가 초록 대신 보라색이고 status 의 talk 로 보인다. 대화는 재부팅을 넘기지 않는다.
 // 동작: 한가할 때(재생도, 답 기다리기도 아닐 때) 마이크를 열어 0.75초 링에 덮어쓰며 듣기만 한다. 이 동안의 소리는 기기 밖으로 나가지 않는다.
-//   말소리가 EAR_SPEECH_MS 이어지면 그 직전(링에 남은 만큼)부터 보통 녹음과 똑같이 보낸다: 무음 1.5초, 탭, 최대 길이에서 끝난다.
-//   그 클립은 flags bit2 를 달고 간다: 누구에게 한 말인지 모르니 대답할지는 브레인(다이진)이 정한다.
-//   답이 재생되는 동안과 그 뒤 EAR_HOLD_MS 는 귀를 닫는다 (자기 목소리를 다시 듣지 않게).
-#include <Preferences.h>
-Preferences prefs;
-bool earsOn = false;                             // 사람이 정한 상태
+//   말소리가 EAR_SPEECH_MS 이어지면 그 직전 0.5초부터 클립으로 보낸다 (flags bit2). 말 끝은 TALK_SILENCE_MS 로 짧게 본다:
+//   버튼 녹음의 1.5초는 주고받기엔 길다. 답이 재생되는 동안과 그 뒤 EAR_HOLD_MS 는 귀를 닫는다 (자기 목소리를 다시 듣지 않게).
+//   그래서 말로는 끼어들 수 없다: 다이진이 말하는 중에 탭하면 그 말을 끊고 바로 듣는다.
+//   TALK_IDLE_MS 동안 아무 말이 없으면 스스로 끝난다 (켜 둔 걸 잊어도 계속 듣고 있지 않게).
+bool talkOn = false;                             // 사람이 정한 상태
+uint32_t talkActiveAt = 0;                       // 마지막으로 말이 오간 시각 (TALK_IDLE_MS 판정)
+static volatile bool earClip = false;            // 지금 녹음은 대화 모드가 스스로 들은 것 (말 끝을 짧게 본다)
+int rxClip = -1;                                 // 받고 있는(재생 중인) 클립 id: 탭으로 끊을 때 남은 청크를 버리려고
 static volatile bool earWait = false;            // 귀를 열고 말소리를 기다리는 중 (아직 보내지 않는다)
 static volatile bool earHeard = false;           // 말소리를 들었다: loop 가 전송을 시작한다
 static volatile bool capAlive = false;           // captureTask 가 살아 있다
-static volatile size_t recBase = 0;              // 이 녹음이 시작된 capW 위치 (열린 귀에선 말 직전, 버튼 녹음에선 0)
+static volatile size_t recBase = 0;              // 이 녹음이 시작된 capW 위치 (대화 모드에선 말 직전, 버튼 녹음에선 0)
 uint32_t earHoldUntil = 0, awaitingSince = 0;    // 귀를 다시 열어도 되는 시각 · 답을 기다리기 시작한 시각 (0 = 기다리지 않음)
-bool lastClipEar = false;                        // 마지막으로 보낸 클립이 열린 귀로 들은 것인가 ("답할 것 없음"에 소리를 내지 않으려고)
+bool lastClipEar = false;                        // 마지막으로 보낸 클립이 대화 모드로 들은 것인가 ("답할 것 없음"에 소리를 내지 않으려고)
 const uint32_t EAR_SPEECH_MS = 400;              // 이만큼 말소리가 이어져야 듣기 시작한다 (문 닫는 소리, 기침은 넘긴다)
 const uint32_t EAR_HOLD_MS = 600;
-#define LED_EARS led(6,0,10)                     // 은은한 보라 = 대기 + 열린 귀
+#ifndef TALK_SILENCE_MS
+#define TALK_SILENCE_MS 800                      // 대화 모드의 말 끝 (생각하다 쉬는 틈에 잘리면 늘릴 것: 실측 쉼은 최대 1.4초였다)
+#endif
+const uint32_t TALK_IDLE_MS = 120000;            // 이만큼 말이 없으면 대화 모드가 스스로 끝난다
+#define LED_EARS led(6,0,10)                     // 은은한 보라 = 대기 + 대화 모드
 static int droppingClip = -1;                    // 녹음 중에 시작해서 버리는 중인 재생 클립의 id (-1 = 없음)
 
 void onMqtt(char* topic, byte* payload, unsigned int len) {
@@ -297,6 +303,7 @@ void onMqtt(char* topic, byte* payload, unsigned int len) {
   if (droppingClip == payload[0]) { if (payload[3] & 1) droppingClip = -1; return; }
   size_t n = len - HDR;
   if (payload[1] == 0 && payload[2] == 0) {     // seq 0 = 새 클립
+    rxClip = payload[0];
     WiFi.setSleep(false);                       // 재생 세션 → 풀속도
     rw = rr = 0; gotLast = false; playing = false;
     adPred = 0; adIdx = 0;                      // ADPCM 상태 리셋 (브레인 인코더와 동기)
@@ -404,18 +411,18 @@ void captureTask(void*) {
       } else capDrops++;                             // 링 포화 (발행이 0.75초 이상 정체)
     }
     if (n) vadBlock(sqrtf((float)(sumsq / n)), (uint32_t)(n * 1000 / SR));
-    if (earWait) {                                   // 열린 귀: 말소리를 기다린다
+    if (earWait) {                                   // 대화 모드: 말소리를 기다린다
       if (vadSilenceMs >= 500) { vadSpeechMs = 0; vadPeak = 0; }   // 띄엄띄엄한 소리는 말이 아니다
       if (vadSpeechMs >= EAR_SPEECH_MS) {
         if (capAvail() > (size_t)SR) capR = capW - SR;            // 말 직전 0.5초만 남긴다: 링에 전송이 따라붙을 틈을 둔다
-        recBase = capR; vadSilenceMs = 0; btnEdge = false; earHeard = true; earWait = false;
+        recBase = capR; vadSilenceMs = 0; btnEdge = false; earClip = true; earHeard = true; earWait = false;
       }
       continue;
     }
     if (capW - recBase < REC_MIN_B) btnEdge = false;
     else if (btnEdge || digitalRead(BTN) == LOW) { stopTap = true; capturing = false; }   // 종료 탭
 #if VAD_AUTO_STOP
-    else if (vadSpeechMs >= VAD_SPEECH_MS && vadSilenceMs >= VAD_SILENCE_MS) { stopVad = true; capturing = false; }   // 말 끝
+    else if (vadSpeechMs >= VAD_SPEECH_MS && vadSilenceMs >= (uint32_t)(earClip ? TALK_SILENCE_MS : VAD_SILENCE_MS)) { stopVad = true; capturing = false; }   // 말 끝
 #endif
     if (capW - recBase >= REC_MAX_B) capturing = false;                                   // 자동컷
   }
@@ -425,7 +432,7 @@ void captureTask(void*) {
 
 bool capStart(bool ear) {                                      // 캡처 태스크를 띄운다. ear 면 듣기만 하며 말소리를 기다린다
   capW = capR = 0; recBase = 0; capDrops = 0; stopTap = false; btnEdge = false; vadReset();
-  earHeard = false; earWait = ear; capturing = true; capAlive = true;
+  earHeard = false; earClip = false; earWait = ear; capturing = true; capAlive = true;
   if (xTaskCreatePinnedToCore(captureTask, "cap", 4096, NULL, 10, NULL, 0) == pdPASS) return true;   // 힙이 30KB 대라 4KB 스택이 안 잡힐 수 있다
   capturing = false; capAlive = false; earWait = false;        // 그대로 두면 전송 루프가 캡처를 영영 기다린다 (mqtt.loop 도 안 돈다)
   logf("캡처 태스크 생성 실패 (힙 %u)\n", (unsigned)ESP.getFreeHeap());
@@ -437,18 +444,19 @@ void earClose() {                                              // 듣기만 하�
   for (int i = 0; i < 100 && capAlive; i++) delay(5);          // 태스크는 32ms 블록마다 capturing 을 본다
   earWait = false; earHeard = false;
 }
-void idleLed() { if (earsOn) LED_EARS; else LED_IDLE; }
-void earsSet(bool on, const char* how) {
+bool busyNow() { return playing || gotLast || ringAvail() > 0 || awaitingSince; }
+void idleLed() { if (talkOn) LED_EARS; else LED_IDLE; }
+void talkSet(bool on, const char* how) {
   earClose();
-  earsOn = on; prefs.putBool("ears", on);
-  logf("열린 귀 %s (%s)\n", on ? "켬" : "끔", how);
+  talkOn = on; talkActiveAt = millis();
+  logf("대화 모드 %s (%s)\n", on ? "켬" : "끔", how);
   if (on) { tone16(660.f, 5000, 90); hush(40); tone16(880.f, 5000, 120); }     // 올라가는 두 음 = 켬
   else    { tone16(880.f, 5000, 90); hush(40); tone16(660.f, 5000, 120); }     // 내려가는 두 음 = 끔
   hush(32);
   idleLed(); statusDue = true; earHoldUntil = millis() + EAR_HOLD_MS;
 }
 
-void recordAndPublish(bool ear) {                      // ear: 열린 귀가 말소리를 들었다 (캡처는 이미 돌고 있다)
+void recordAndPublish(bool ear) {                      // ear: 대화 모드가 말소리를 들었다 (캡처는 이미 돌고 있다)
   if (!ear) {
     while (digitalRead(BTN) == LOW) delay(10);                 // 시작 탭에서 손 뗄 때까지
     delay(80);                                                 // 디바운스
@@ -456,7 +464,7 @@ void recordAndPublish(bool ear) {                      // ear: 열린 귀가 말
   WiFi.setSleep(false);                                        // 오디오 세션 시작 → 풀속도
   led(0,40,0);                                                 // 초록 = 녹음 중 (말하세요)
   face(F_LISTEN);
-  logf("녹음+전송 시작 (clip %u, %s)\n", clipId, ear ? "열린 귀" : "탭-토글");
+  logf("녹음+전송 시작 (clip %u, %s)\n", clipId, ear ? "대화 모드" : "탭-토글");
   const size_t CHUNK_UP = 2048;                                // ADPCM 청크 (=4096샘플=256ms)
   static uint8_t msg[HDR + CHUNK];
   encPred = 0; encIdx = 0; encLo = -1;                         // 인코더 리셋 (브레인 디코더와 동기)
@@ -465,7 +473,7 @@ void recordAndPublish(bool ear) {                      // ear: 열린 귀가 말
     led(40,0,0); softChirp(220.f, 300); idleLed(); face(F_IDLE); WiFi.setSleep(true);
     return;
   }
-  lastClipEar = ear;
+  lastClipEar = ear; talkActiveAt = millis();
   size_t fill = 0; uint16_t seq = 0;
   bool lastSent = false, shown = false;
   uint16_t sendFails = 0;
@@ -487,7 +495,7 @@ void recordAndPublish(bool ear) {                      // ear: 열린 귀가 말
     if (last && encLo >= 0) { msg[HDR + fill++] = (uint8_t)encLo; encLo = -1; }  // 홀수 니블
     if (fill == CHUNK_UP || last) {
       msg[0] = clipId; msg[1] = seq >> 8; msg[2] = seq & 0xFF;
-      msg[3] = (last ? 1 : 0) | 2 | (ear ? 4 : 0);             // bit1 = ADPCM, bit2 = 열린 귀로 들은 클립
+      msg[3] = (last ? 1 : 0) | 2 | (ear ? 4 : 0);             // bit1 = ADPCM, bit2 = 대화 모드로 들은 클립
       if (!mqtt.publish(T_AUDIO_IN, msg, HDR + fill)) { sendFails++; logf("청크 %u 발행 실패\n", seq); }
       mqtt.loop();
       seq++; fill = 0;
@@ -502,7 +510,7 @@ void recordAndPublish(bool ear) {                      // ear: 열린 귀가 말
        stopTap ? "탭으로 종료" : (stopVad ? "무음 감지" : "자동컷"), (unsigned)vadSpeechMs, vadFloor, vadPeak);
   clipId++;
   if (stopVad && ear) {
-    // 열린 귀: 확인음도 쿨다운도 없다. 버튼을 누를 일이 없고, 말할 때마다 삑 소리가 나면 대화가 아니다
+    // 대화 모드: 확인음도 쿨다운도 없다. 버튼을 누를 일이 없고, 말할 때마다 삑 소리가 나면 대화가 아니다
   } else if (stopVad) {
     // 무음 감지로 끝났으면 사용자가 습관처럼 "종료" 탭을 할 수 있다. 짧은 확인음을 내고,
     // 자동컷과 같은 방식으로 버튼이 1.5초 떼어져 있을 때까지 새 녹음을 받지 않는다.
@@ -585,7 +593,6 @@ void setupTls() {
 void setup() {
   Serial.begin(115200); Serial0.begin(115200);
   pinMode(BTN, INPUT_PULLUP);
-  prefs.begin("daijin", false); earsOn = prefs.getBool("ears", false);   // 열린 귀: 사람이 켜 둔 상태는 재부팅해도 남는다
   attachInterrupt(digitalPinToInterrupt(BTN), onBtnDown, FALLING);   // 녹음 종료 탭을 놓치지 않게 (captureTask 가 읽는다)
   led(20,20,20);
   faceInit();                                    // OLED 있으면 얼굴, 없으면 조용히 생략
@@ -635,9 +642,9 @@ void publishStatus() {
   last = millis();
   char js[256];
   snprintf(js, sizeof(js),
-    "{\"online\":true,\"ts\":%ld,\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u,\"broker\":\"%s\",\"fw\":\"%s\",\"ears\":%s}",
+    "{\"online\":true,\"ts\":%ld,\"temp_c\":%.1f,\"ssid\":\"%s\",\"rssi\":%d,\"uptime_s\":%lu,\"heap\":%u,\"broker\":\"%s\",\"fw\":\"%s\",\"talk\":%s}",
     (long)time(nullptr), temperatureRead(), WiFi.SSID().c_str(), WiFi.RSSI(),
-    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap(), broker.name(), FW_VERSION, earsOn ? "true" : "false");
+    (unsigned long)(millis()/1000), (unsigned)ESP.getFreeHeap(), broker.name(), FW_VERSION, talkOn ? "true" : "false");
   mqtt.publish(T_STATUS, (const uint8_t*)js, strlen(js), true);   // retained
 }
 
@@ -662,8 +669,8 @@ void loop() {
   if (pendingCmd.length() && !playing) {                         // 지금은 ota 만: 재생 중이 아닐 때, loop 에서
     String c = pendingCmd; pendingCmd = "";
     String why;
-    if (c == "ears:on" || c == "ears:off") {                     // 말로 켜고 끈다 (브레인이 사람 말을 듣고 보낸다)
-      if ((c == "ears:on") != earsOn) earsSet(c == "ears:on", "명령");
+    if (c == "talk:on" || c == "talk:off") {                     // 말로 켜고 끈다 (브레인이 사람 말을 듣고 보낸다)
+      if ((c == "talk:on") != talkOn) talkSet(c == "talk:on", "명령");
     } else if (c.startsWith("ota:") && !otaAccepts(c, !broker.onLocal, &why)) {
       logf("OTA 거절: %s\n", why.c_str()); mqtt.publish(T_STATE_OTA, why.c_str(), true);   // MQTT 를 끊기 전에 거절
     } else if (c.startsWith("ota:")) {
@@ -692,6 +699,7 @@ void loop() {
       hush(32);                                 // 팝 방지 무음
       playing = false; gotLast = false; idleLed(); face(F_IDLE);
       earHoldUntil = millis() + EAR_HOLD_MS;    // 스피커의 꼬리가 가라앉은 뒤에 귀를 연다
+      talkActiveAt = millis();
       WiFi.setSleep(true);                      // 오디오 세션 끝 → 절전 복귀
       logf("재생 완료 · 언더런 %u회\n", underruns);
     }
@@ -700,7 +708,7 @@ void loop() {
   // "답할 것 없음": 헤더만 있는 마지막 청크를 받았다 (재생할 게 없는데 클립이 끝남)
   if (!playing && gotLast && ringAvail() == 0) {
     gotLast = false; awaitingSince = 0;
-    if (!lastClipEar) softChirp(320.f, 150);    // 열린 귀로 들은 말에 대답하지 않기로 한 것은 조용히 넘어간다
+    if (!lastClipEar) softChirp(320.f, 150);    // 대화 모드에서 흘려보낸 소리(소음, 못 알아들은 말)는 조용히 넘어간다
     idleLed(); face(F_IDLE); if (hasFace && !lastClipEar) eyes.anim_confused();   // 갸웃
     earHoldUntil = millis() + 200;
     WiFi.setSleep(true);
@@ -709,20 +717,27 @@ void loop() {
 
   if (awaitingSince && millis() - awaitingSince > 90000) awaitingSince = 0;   // 답이 영영 안 왔다
 
-  // 열린 귀: 한가하면 열고, 무슨 일이 생기면(재생할 소리가 왔다) 닫고, 말소리를 들었으면 보낸다
-  bool busy = playing || gotLast || ringAvail() > 0 || awaitingSince;
-  if (capAlive && (earWait || earHeard) && (busy || !earsOn)) earClose();   // 들은 직후에 재생할 소리가 먼저 와 있었으면 그 말은 버린다
-  if (earsOn && !busy && !capAlive && (int32_t)(millis() - earHoldUntil) >= 0) {
+  if (talkOn && !busyNow() && millis() - talkActiveAt > TALK_IDLE_MS) talkSet(false, "조용해서");
+
+  // 대화 모드: 한가하면 귀를 열고, 무슨 일이 생기면(재생할 소리가 왔다) 닫고, 말소리를 들었으면 보낸다
+  bool busy = busyNow();
+  if (capAlive && (earWait || earHeard) && (busy || !talkOn)) earClose();   // 들은 직후에 재생할 소리가 먼저 와 있었으면 그 말은 버린다
+  if (talkOn && !busy && !capAlive && (int32_t)(millis() - earHoldUntil) >= 0) {
     if (!capStart(true)) earHoldUntil = millis() + 5000;         // 힙이 모자라면 5초 뒤에 다시
   }
   if (earHeard) { earHeard = false; recordAndPublish(true); }
 
-  if (digitalRead(BTN) == LOW && !playing) {
-    uint32_t t0 = millis();                                      // 짧게 = 녹음, 1초 길게 = 열린 귀 켜고 끄기
+  if (digitalRead(BTN) == LOW) {
+    if (playing || ringAvail() > 0) {                            // 말하는 중에 눌렀다: 그 말을 끊는다 (남은 청크는 버린다)
+      if (!gotLast && rxClip >= 0) droppingClip = rxClip;
+      rw = rr = 0; playing = false; gotLast = false; inUnderrun = false; awaitingSince = 0;
+      hush(32); logf("탭 → 재생 끊음\n");
+    }
+    uint32_t t0 = millis();                                      // 짧게 = 녹음, 1초 길게 = 대화 모드 켜고 끄기
     while (digitalRead(BTN) == LOW && millis() - t0 < 1000) { faceTick(); delay(10); }
     earClose();
     if (digitalRead(BTN) == LOW) {
-      earsSet(!earsOn, "버튼");
+      talkSet(!talkOn, "버튼");
       while (digitalRead(BTN) == LOW) delay(10);
       delay(120); btnEdge = false;
     } else {
