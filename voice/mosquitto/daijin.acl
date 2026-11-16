@@ -10,6 +10,7 @@ topic read  daijin/audio/out
 topic write daijin/audio/in
 topic write daijin/status
 topic read  daijin/cmd
+topic read  daijin/mood
 topic write daijin/ota
 
 # 홈 노드는 자기들 토픽만, 그것도 이름을 하나하나 적는다 (2026-11-01). daijin/dev/# 를 통째로 주면 노드 비밀번호로

@@ -599,6 +599,77 @@ class TestThreads(DbCase):
         self.assertIn(f"thread{rows['출근 전날 다시 물어보기로 했다']['id']} 네 약속", rf.build_prompt(0, 2_000_000_000))
 
 
+import mood                  # noqa: E402
+
+
+class TestMood(DbCase):
+    """The day leaves a mood, computed from what happened: how its own words were received, how much was said, heat, the hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = {"INITIATIVE_QUIET": "23-08"}
+        for mod in (mood, dm):
+            orig = mod.sec; mod.sec = lambda k: self.cfg.get(k, ""); self.addCleanup(setattr, mod, "sec", orig)
+        self.noon = 1_800_000_000 - (time.localtime(1_800_000_000).tm_hour - 12) * 3600
+
+    def _ask(self, cls, ago_h):
+        aid = selfdb.open_ask("contact", "say", f"x{ago_h}{cls}", "initiative", ts=self.noon - ago_h * 3600 - 60)
+        selfdb.close_ask(aid, cls, response_ts=self.noon - ago_h * 3600)
+
+    def test_an_ordinary_day_is_calm_and_says_nothing(self):
+        m = mood.compute(self.noon)
+        self.assertEqual((m["face"], m["why"]), ("calm", []))
+        self.assertEqual(mood.state_line(self.noon), "")
+
+    def test_being_received_well_and_talking_brightens_and_it_fades(self):
+        self._ask("engaged", 1)
+        for i in range(5):
+            selfdb.episode("voice", user_text=f"말 {i}", reply="응", ts=self.noon - 1800 - i * 60)
+        m = mood.compute(self.noon)
+        self.assertEqual(m["face"], "happy")
+        self.assertIn("받아 줬어", " ".join(m["why"])); self.assertIn("5마디", " ".join(m["why"]))
+        self.assertIn("기분: 밝음", mood.state_line(self.noon))
+        self.assertEqual(mood.compute(self.noon + 6 * 3600 - 60)["face"], "happy")             # still there in the evening
+        self.assertNotEqual(mood.compute(self.noon + 30 * 3600)["face"], "happy")              # gone the next day
+
+    def test_being_brushed_off_lowers_it_but_it_is_not_shown_unless_asked_for(self):
+        for h in (1, 2):
+            self._ask("negative", h)
+        m = mood.compute(self.noon)
+        self.assertEqual((m["felt"], m["face"]), ("low", "calm"))                              # felt, not worn
+        line = mood.state_line(self.noon)
+        self.assertIn("가라앉음", line); self.assertIn("내색하지 마", line); self.assertIn("거절당했어", line)
+        self.cfg["MOOD_SHOW_LOW"] = "1"
+        self.assertEqual(mood.compute(self.noon)["face"], "low")
+        self.assertIn("스미게만", mood.state_line(self.noon))
+
+    def test_heat_tires_it_and_night_is_sleep_whatever_the_day_was(self):
+        self._ask("engaged", 1)
+        self.assertEqual(mood.compute(self.noon, temp_c=45)["face"], "happy")                  # warm is not hot
+        m = mood.compute(self.noon, temp_c=68)
+        self.assertEqual(m["face"], "tired"); self.assertIn("68도", m["why"][0])
+        night = self.noon + 13 * 3600                                                          # 01:xx
+        self.assertEqual(mood.compute(night)["face"], "sleep")
+        self.assertEqual(mood.compute(self.noon + 10 * 3600)["energy"], 0.6)                    # 22:xx: winding down, not asleep
+        self.assertIn("기분: 졸림 (한밤중이야)", mood.state_line(night))
+
+    def test_the_brain_carries_it_and_the_device_is_told_only_when_it_changes(self):
+        for h in (1, 2):
+            self._ask("engaged", h)
+        self.assertIn("기분: 밝음", dm.state_block(self.noon))
+        c = FakeClient(); body = initiative.Body()
+        initiative._mood_sent.update(face=None, at=0.0)
+        self.addCleanup(initiative._mood_sent.update, face=None, at=0.0)
+        initiative.mood_tick(c, body, now=self.noon)
+        self.assertEqual(json.loads(c.out[0][1])["face"], "happy"); self.assertEqual(c.out[0][0], initiative.T_MOOD)
+        initiative.mood_tick(c, body, now=self.noon + 60)
+        self.assertEqual(len(c.out), 1)                                                        # same face a minute later: quiet
+        initiative.mood_tick(c, body, now=self.noon + 700)
+        self.assertEqual(len(c.out), 2)                                                        # refreshed every ten minutes
+        initiative.mood_tick(c, body, now=self.noon + 13 * 3600)
+        self.assertEqual(json.loads(c.out[-1][1])["face"], "sleep")
+
+
 import reflect               # noqa: E402
 import persona               # noqa: E402
 

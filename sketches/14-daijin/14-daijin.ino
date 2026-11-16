@@ -43,6 +43,7 @@
 #define T_AUDIO_OUT "daijin/audio/out"
 #define T_STATUS    "daijin/status"
 #define T_STATE_OTA "daijin/ota"          // 기기 → 브레인/맥: OTA 결과 (retained). 성공은 재부팅 뒤 status 의 fw 로 보인다
+#define T_MOOD      "daijin/mood"         // 브레인 → 기기 (retained JSON): 평소 눈에 드러나는 기분. voice/mood.py 가 실제 값에서 계산한다
 #define T_CMD       "daijin/cmd"          // 브레인/맥 → 기기: 지금은 ota 만. ACL 에서 device 가 읽을 수 있는 토픽
 String pendingCmd;                      // 콜백은 받아만 두고 loop() 가 실행한다 (OTA 는 길다)
 
@@ -86,6 +87,9 @@ bool hasFace = false;
 Face faceState = F_IDLE;
 uint32_t faceSince = 0, faceTickAt = 0;
 bool faceFrame = false;
+enum Mood { M_CALM, M_HAPPY, M_LOW, M_TIRED, M_SLEEP };       // daijin/mood 의 face. 평소 얼굴(F_IDLE)에만 드러난다
+volatile Mood moodNow = M_CALM;
+volatile bool moodDirty = false;                              // 수신 콜백이 세우고 faceTick 이 반영한다
 
 void face(Face f) {
   if (!hasFace || faceState == f) return;
@@ -95,7 +99,15 @@ void face(Face f) {
   eyes.setWidth(36, 36); eyes.setHeight(36, 36); eyes.setPosition(DEFAULT); eyes.setAutoblinker(ON, 2, 3);
   eyes.setFramerate(12);
   switch (f) {
-    case F_IDLE:   eyes.setIdleMode(ON, 2, 3); eyes.setCuriosity(ON); break;             // 가끔 깜빡, 가끔 둘러봄
+    case F_IDLE:                                                                         // 가끔 깜빡, 가끔 둘러봄. 기분이 여기에 스민다
+      switch (moodNow) {
+        case M_HAPPY: eyes.setMood(HAPPY); eyes.setIdleMode(ON, 2, 3); eyes.setCuriosity(ON); break;   // 웃는 눈
+        case M_LOW:   eyes.setPosition(S); eyes.setAutoblinker(ON, 4, 3); break;                       // 아래를 본다, 둘러보지 않는다
+        case M_TIRED: eyes.setMood(TIRED); eyes.setIdleMode(ON, 5, 4); eyes.setAutoblinker(ON, 4, 3); break;   // 처진 눈, 느리게
+        case M_SLEEP: eyes.setHeight(6, 6); eyes.setAutoblinker(OFF); break;                           // 감은 눈 (말을 걸면 다른 얼굴로 뜬다)
+        default:      eyes.setIdleMode(ON, 2, 3); eyes.setCuriosity(ON); break;
+      }
+      break;
     case F_LISTEN: eyes.setWidth(40, 40); eyes.setHeight(44, 44); break;                 // 듣는 중: 눈 크게, 정면
     case F_UPLOAD: eyes.setPosition(N); eyes.setFramerate(6); break;                     // 보내는 중: 위를 봄
     case F_THINK:  eyes.setPosition(NW); break;                                          // 생각 중: 좌우 위를 번갈아 (faceTick)
@@ -106,6 +118,10 @@ void face(Face f) {
 void faceTick() {                                             // loop() 와 녹음 루프에서 호출: 프레임 그리기 + 상태별 변화
   if (!hasFace) return;
   uint32_t now = millis();
+  if (moodDirty) {                                            // 기분이 바뀌었다: 평소 얼굴이면 다시 그린다 (다른 얼굴이면 돌아올 때 반영)
+    moodDirty = false;
+    if (faceState == F_IDLE) { faceState = F_ERROR; face(F_IDLE); }
+  }
   if (faceState == F_THINK && now - faceTickAt >= 700) {       // 생각: 왼쪽 위, 오른쪽 위를 번갈아 본다
     faceTickAt = now; faceFrame = !faceFrame; eyes.setPosition(faceFrame ? NE : NW);
   }
@@ -247,6 +263,12 @@ static volatile bool capturing = false;          // 마이크가 열려 있나 (
 static int droppingClip = -1;                    // 녹음 중에 시작해서 버리는 중인 재생 클립의 id (-1 = 없음)
 
 void onMqtt(char* topic, byte* payload, unsigned int len) {
+  if (strcmp(topic, T_MOOD) == 0) {                            // {"face":"happy",...}: face 값만 본다. 모르는 값이면 평온
+    char b[96]; unsigned n = len < sizeof(b) - 1 ? len : sizeof(b) - 1; memcpy(b, payload, n); b[n] = 0;
+    Mood m = strstr(b, "\"happy\"") ? M_HAPPY : strstr(b, "\"low\"") ? M_LOW : strstr(b, "\"tired\"") ? M_TIRED : strstr(b, "\"sleep\"") ? M_SLEEP : M_CALM;
+    if (m != moodNow) { moodNow = m; moodDirty = true; }
+    return;
+  }
   if (strcmp(topic, T_CMD) == 0) { pendingCmd = ""; for (unsigned i = 0; i < len; i++) pendingCmd += (char)payload[i]; return; }
   if (strcmp(topic, T_AUDIO_OUT) != 0 || len < HDR) return;      // len == HDR: 페이로드 없는 청크 ("답할 것 없음" 신호)
   // 녹음 중에 온 말(능동 발화·say)은 클립 통째로 버린다. 받으면 링이 차는 순간 스피커로 나가 마이크에 다시 녹음됐다 (2026-11-01 리뷰).
@@ -470,6 +492,7 @@ bool mqttTry() {
   if (ok) {
     mqtt.subscribe(T_AUDIO_OUT, 0);     // QoS0: ACK 게이팅 없이 TCP 스트리밍
     mqtt.subscribe(T_CMD, 1);
+    mqtt.subscribe(T_MOOD, 1);          // retained: 붙자마자 지금의 기분이 온다
     logf("MQTT 연결 OK (%s)\n", broker.name());
     statusDue = true;                   // 접속 즉시 online 상태를 올려 LWT 의 offline 을 덮는다
     otaConfirm(!broker.onLocal);        // 새 펌웨어면 이제 "정상"으로 표시 (못 붙으면 otaWatch 가 되돌린다)

@@ -28,7 +28,7 @@ except ImportError:
 from daijin_common import VOICE, T_AUDIO_IN, sec, load_hooks, cloud_client, connect_with_retry, broker
 from nodes import NODES, spoken, spellings
 import selfdb
-import local_mind, fastpath
+import local_mind, fastpath, mood
 
 HOME    = os.path.expanduser("~")
 # 헬퍼 스크립트(dev.sh 등)가 쓸 파이썬 = 브레인을 띄운 이 파이썬 (paho 가 깔려 있는 것). 에이전트의 셸과 local_hooks 가 물려받는다.
@@ -165,6 +165,10 @@ def state_block(now=None):
                                          " (사람이 일부러 꺼 둠, 걱정하지 마)" if nid in excused else ""))
     if nodes:
         parts.append("노드: " + ", ".join(nodes))
+    temp = d.get("temp_c") if d and d.get("online") is not False and now - (d.get("ts") or _body["device_ts"] or 0) < 300 else None
+    ml = mood.state_line(now, temp if isinstance(temp, (int, float)) else None)
+    if ml:
+        parts.append(ml)
     if token_line(now):
         parts.append(token_line(now))
     try:

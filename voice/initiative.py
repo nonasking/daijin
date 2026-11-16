@@ -14,7 +14,7 @@
 import argparse, json, re, time
 from daijin_common import sec, load_hooks, cloud_client, connect_with_retry
 from nodes import NODES, spoken, mentioned
-import selfdb, ledger_rules as rules
+import selfdb, ledger_rules as rules, mood
 
 T_DEV_STATUS  = "daijin/status"
 T_NODE_STATUS = "daijin/dev/+/status"
@@ -22,6 +22,7 @@ T_SAY, T_ASK  = "daijin/say", "daijin/ask"
 T_TXT_IN, T_TXT_OUT = "daijin/text/in", "daijin/text/out"
 T_BRAIN_TURN  = "daijin/brain/turn"
 T_PLAN        = "daijin/initiative/plan"
+T_MOOD        = "daijin/mood"              # retained JSON: 기기의 평소 눈이 읽는다 (mood.py)
 
 TICK_S = 60
 SOURCE = "initiative"
@@ -374,6 +375,26 @@ def tick(client, body, ledger, hooks, dry_run, now=None):
     for tid in selfdb.threads_let_go(now, THREAD_MAX_AGE_S, THREAD_MAX_ASKS, THREAD_REASK_S) or []:
         print(f"[{time.strftime('%H:%M:%S')}] 실 #{tid} 놓음 (오래됐거나 물어도 소식이 없었다)")
 
+_mood_sent = {"face": None, "at": 0.0}
+
+def mood_tick(client, body, now=None):
+    """지금의 기분을 계산해, 얼굴이 바뀌었거나 10분이 지났으면 daijin/mood 에 retained 로 올린다. 바뀔 때는 메모도 남긴다."""
+    now = time.time() if now is None else now
+    temp = None
+    if body.device and body.device.get("online") is not False and now - body.device_rx < 300:
+        temp = body.device.get("temp_c")
+    m = mood.compute(now, temp if isinstance(temp, (int, float)) else None)
+    changed = m["face"] != _mood_sent["face"]
+    if not changed and now - _mood_sent["at"] < 600:
+        return m
+    client.publish(T_MOOD, json.dumps({"face": m["face"], "v": m["valence"], "e": m["energy"], "ts": int(now)}), qos=1, retain=True)
+    if changed:
+        print(f"[{time.strftime('%H:%M:%S')}] 기분 → {m['word']} (얼굴 {m['face']}, 밝음 {m['valence']:+.2f}, 기운 {m['energy']:.2f})"
+              + (f": {', '.join(m['why'])}" if m["why"] else ""))
+        selfdb.note("mood", json.dumps({"face": m["face"], "felt": m["felt"], "v": m["valence"], "e": m["energy"], "why": m["why"]}, ensure_ascii=False), ts=now)
+    _mood_sent.update(face=m["face"], at=now)
+    return m
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="말하지 않고 계획만 기록 (secrets INITIATIVE_DRY_RUN=1 과 같음)")
@@ -406,6 +427,7 @@ def main():
         while True:
             try:
                 tick(c, body, ledger, hooks, dry_run)
+                mood_tick(c, body)
             except Exception as e:
                 print(f"  ⚠️ tick 오류: {e!r}")
             if a.once:

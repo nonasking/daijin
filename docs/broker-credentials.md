@@ -11,7 +11,7 @@
 | 누가 | 필요한 토픽 | 권한 |
 |---|---|---|
 | 브레인 (플릿 워처, 헬퍼 스크립트 포함) | `daijin/#` | 발행 + 구독 |
-| 디바이스 (14-daijin) | `daijin/audio/out` 구독, `daijin/audio/in`·`daijin/status` 발행 | 아래 참고 |
+| 디바이스 (14-daijin) | `daijin/audio/out`·`daijin/cmd`·`daijin/mood` 구독, `daijin/audio/in`·`daijin/status` 발행 | 아래 참고 |
 | 홈 노드 (15-home-node) | 노드마다 `daijin/dev/<id>/status·state·event` 쓰기, `daijin/dev/<id>/cmd`·`daijin/dev/all/cmd` 읽기 | 이름을 하나하나 적는다 |
 
 핵심은 **노드 자격증명**이다. 노드는 자기 상태를 쓰고 명령을 읽기만 하므로 `daijin/ask`·`daijin/say`·`daijin/audio/in` 에 닿지 못하고,
