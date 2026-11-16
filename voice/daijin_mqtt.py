@@ -187,7 +187,7 @@ def state_block(now=None):
         theirs = [t["text"] for t in th if t["kind"] == "theirs"][:2]
         mine = [t["text"] for t in th if t["kind"] == "mine"][:2]
         if theirs:
-            parts.append("아직 뒷이야기를 못 들은 일 (대화가 그쪽으로 가면 물어봐도 돼, 억지로 꺼내지는 마): " + " · ".join(x[:80] for x in theirs))
+            parts.append("아직 뒷이야기를 못 들은 일 (물을지, 언제 어떻게 물을지는 네가 정해): " + " · ".join(x[:80] for x in theirs))
         if mine:
             parts.append("내가 하기로 한 일: " + " · ".join(x[:80] for x in mine))
         cur = selfdb.persona_current()

@@ -112,14 +112,14 @@ def compute_drives(body, last_voice_ts, now=None):
     """이름 → (값, 입력, 말 걸 때 쓸 이유·문장). 입력은 drives.inputs 에 그대로 저장한다."""
     now = time.time() if now is None else now
     out = {}
-    # followup: 때가 된 실 하나. 에이전트가 그 일을 아는 채로 한 문장을 짓게 상황으로 넘긴다.
+    # followup: 때가 된 실 하나. 상황만 넘긴다. 무엇을 어떤 말투로 물을지는 다이진이 정한다 (2026-11-16 사용자: "말투도 내용도 모두 다이진이 원하는 대로").
     ripe = ripe_thread(now)
     if ripe:
         v, t = ripe
         days = max(1, int((now - t["ts"]) // 86400))
-        line = (f"[상황] {days}일 전에 네가 이렇게 하기로 했어: {t['text']} 지금 그 약속을 지켜 줘. 할 수 없게 됐으면 그렇다고 말해 줘."
+        line = (f"[상황] {days}일 전에 네가 이렇게 하기로 했어: {t['text']} 그 약속을 어떻게 할지, 뭐라고 말할지는 네가 정해. 네 말투로, 솔직하게."
                 if t["kind"] == "mine" else
-                f"[상황] {days}일 전에 사람이 이런 얘기를 했어: {t['text']} 그 뒤가 어떻게 됐는지, 캐묻지 말고 한 문장으로 다정하게 물어봐 줘.")
+                f"[상황] {days}일 전에 사람이 이런 얘기를 했어: {t['text']} 뒷이야기는 아직 못 들었어. 무엇을 어떻게 물을지는 네가 정해. 네 말투로, 네가 궁금한 대로.")
         out["followup"] = (v, {"thread": t["id"], "kind": t["kind"], "asked": t["asked_count"]},
                            {"trigger": "네가 하기로 한 일이 있어서" if t["kind"] == "mine" else "전에 들은 일의 뒷이야기가 궁금해서", "line": line})
     else:

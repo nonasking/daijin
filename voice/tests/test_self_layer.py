@@ -557,7 +557,7 @@ class TestThreads(DbCase):
         initiative.tick(c, self.body, ledger, types.SimpleNamespace(), dry_run=False, now=self.noon)
         asked = [p for t, p in c.out if t == initiative.T_ASK]
         self.assertEqual(len(asked), 1)
-        self.assertIn("글 마감이 금요일이라고 했다", asked[0]); self.assertIn("다정하게 물어봐 줘", asked[0])
+        self.assertIn("글 마감이 금요일이라고 했다", asked[0]); self.assertIn("네가 정해", asked[0]); self.assertNotIn("다정하게", asked[0])
         self.assertEqual([p for t, p in c.out if t == initiative.T_SAY], [])                   # not the contact line as well
         self.assertEqual(selfdb.threads_open()[0]["asked_count"], 1)
         ledger.on_bus(initiative.T_ASK, asked[0].encode(), now=self.noon + 1)                  # the echo opens the ledger row
@@ -571,7 +571,7 @@ class TestThreads(DbCase):
         selfdb.thread_open("mine", "내일 날씨를 찾아보고 알려 주기로 했다", ts=self.opened)
         v, inputs, info = initiative.compute_drives(self.body, self.noon, self.noon)["followup"]
         self.assertEqual(inputs["kind"], "mine")
-        self.assertIn("그 약속을 지켜 줘", info["line"])
+        self.assertIn("그 약속을 어떻게 할지", info["line"])
         self.assertIn("내가 하기로 한 일: 내일 날씨를", dm.state_block(self.noon))
 
     def test_old_or_twice_unanswered_threads_are_let_go(self):
