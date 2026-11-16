@@ -18,7 +18,7 @@ One take on the voice side: I talk to daijin at home, the Claude brain on my Mac
 
 daijin is not "a better Siri." It's a **different kind of thing**.
 
-- **The brain is an agent that reasons and acts, not a command matcher.** Siri pattern-matches fixed commands. daijin's brain is Claude — it holds a real conversation and *acts* on my scripts, MQTT devices, and data through shell access on my Mac.
+- **The brain is an agent that reasons and acts, not a command matcher.** Siri pattern-matches fixed commands. daijin's brain is Claude — it holds a real conversation and *acts* on my scripts, MQTT devices, and data through shell access on the machine it runs on.
 - **I own it and I can rewire it.** Personality, prompts, and the set of allowed actions are mine to define. Closed assistants (Siri, Alexa, even ChatGPT voice) can't give you an agent that *works inside your own infrastructure*.
 - **It's a separate being, not an app on my phone.** Something you place on a desk or carry around. A relationship, not a tool.
 
@@ -53,9 +53,9 @@ flowchart LR
 ```
 
 - **They meet at a broker on the internet** → the device works on any network: home WiFi or a phone hotspot on LTE, always connecting outbound. The broker is Mosquitto with TLS on the same small VPS as the brain (`voice/mosquitto/`); any TLS broker works, and the repo was first built against the free HiveMQ Cloud tier. The brain can also be a Mac at home that only goes outbound. See [Run the brain on a Linux server](#run-the-brain-on-a-linux-server-no-mac-needed).
-- **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers: a full round trip (record → STT → agent → TTS → playback) typically takes **6–22 s** depending on how much the agent thinks and does — streaming hides part of that, but this is a conversation, not real-time.
+- **Fully streaming reply pipeline**: Claude's answer is split into sentences *as it generates* → each sentence is synthesized and published immediately → the device starts speaking after the **first sentence**, not the full answer. Honest numbers, measured on the VPS over twenty turns in a row: from the transcript to the first sentence going out takes **1.2–3.6 s** for plain talk and **4–5 s** when the agent uses a tool; speech recognition adds about 0.3 s before that, and the recording and the playback come on top. (With the brain on a Mac and a new process per turn, a full round trip took 6–22 s.) This is a conversation, not real-time.
 - **Audio protocol** ([docs/chunking-protocol.md](docs/chunking-protocol.md)): PCM 16 kHz/16-bit mono, chunked over MQTT with a 4-byte header `[clipId][seq:2][flags]`. **Both directions are IMA ADPCM-compressed 4:1** — the ~19KB/s bandwidth ceiling applies to the ESP32's send buffer too, so raw 32KB/s PCM can't keep up in either direction. Downstream plays through a jitter ring buffer; upstream is drained by a dedicated capture task so a blocking TLS publish never drops samples.
-- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on the Mac — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker with certificate verification on every side (the firmware keeps verifying even when NTP is blocked), credentials kept only in gitignored files, the brain makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one). The broker enforces the rest: the brain, the device and the nodes each have their own login, and the ACL (`voice/mosquitto/daijin.acl`) keeps a node's login on `daijin/dev/#`, so a node left in a park cannot publish to `daijin/ask` or the audio topic: [docs/broker-credentials.md](docs/broker-credentials.md).
+- The brain = `claude -p` (it's an agent, so it controls the home's LEDs and devices by voice) with a **pinned session** for cross-conversation memory. **Security trade-off, stated plainly**: the agent runs with broad tool access (shell, file read/write, web search/fetch) so it can genuinely act on its machine — which means the **MQTT broker credential *is* the security boundary**: anyone who can publish to the audio topic can drive the agent. Mitigations in place: TLS to the broker with certificate verification on every side (the firmware keeps verifying even when NTP is blocked), credentials kept only in gitignored files, the brain makes outbound connections only, and the system prompt requires spoken confirmation before destructive actions (a soft guard, not a hard one). The broker enforces the rest: the brain, the device and the nodes each have their own login, and the ACL (`voice/mosquitto/daijin.acl`) names each topic: a node's login can write its own status, state and events and read its own commands, nothing else. So a node left in a park cannot publish to `daijin/ask` or the audio topic, cannot command another node, and cannot invent a topic whose name the agent would read: [docs/broker-credentials.md](docs/broker-credentials.md).
 
 ### Why ADPCM? (a physics lesson)
 
@@ -76,7 +76,10 @@ daijin **separates the "ears + mouth" (device) from the "brain" (agent) over MQT
 
 Where does daijin's "self" live? Not in the model. It lives next to the brain, in code and a SQLite file, so the model that turns it into words can be Claude today and a local model later without daijin becoming someone else. Design: [docs/design-self-layer.md](docs/design-self-layer.md).
 
-- **A body, wired to behaviour.** The device and nodes already report temperature, signal and outages. `initiative.py` turns them into drives (*contact*: hours since the last conversation; *node loss*: how long a node has been gone; *body*: heat and weak signal) and, when one rises far enough, speaks first.
+- **A body, wired to behaviour.** The device and nodes already report temperature, signal and outages. `initiative.py` turns them into drives (*contact*: hours since the last conversation; *node loss*: how long a node has been gone; *body*: heat and weak signal) and, when one rises far enough, speaks first. A node the person has twice said is off on purpose (or once, with "원래 꺼 둬") becomes a node that is *usually off*: it is no longer asked about, even after it has been plugged in and unplugged again, until the person says "꺼지면 알려 줘".
+- **The other person's business.** Those three drives are all about daijin itself, so the line it offered was always the same. A fourth, *followup*, comes from threads the nightly reflection keeps: things the person was waiting on or meant to do, and things daijin said it would do. When one is due daijin is handed what was said, and what to ask and how is its own call. A thread is raised at most twice and let go after three weeks; topics reflection marks sensitive are not brought up out loud by default.
+- **A mood with reasons.** `mood.py` computes two numbers from values that already exist: brightness from how its proactive lines were received and how much the person talked (fading by half every eight hours), energy from the hour and the board's heat. They give one face and the reasons in words, so "기분 어때?" has a true answer. The mood rides in the state block and goes to the device's idle eyes. A low mood is not hidden; whether and how to show it is daijin's call, and inventing one is ruled out.
+- **Time of its own.** Twice a day, when nobody is talking, `solo.py` gives daijin a turn nobody asked for: look something up, turn a past conversation over, or do nothing. What it did is kept, so "I read about that earlier" is true when it says it; what it learns about itself is kept as self memories, apart from memories of the person. That turn has web search and page reading only, no shell or files.
 - **An admissibility filter before speaking.** Quiet hours, a daily budget, a per-drive interval that doubles after each refusal, hours to avoid, and never in the middle of a conversation. Every time it stays quiet, the reason is logged.
 - **A rebuff ledger.** Asking wrong is the default (a mother and infant are out of sync over 70% of the time; repair is what matters), so the ledger records what happened *after* daijin spoke first: engaged, a short acknowledgement, refused with a reason, told to stop, or no answer. Each outcome changes that drive's policy, and after a refusal the next line opens with an explanation or a promise — never a denial.
 - **A current-state block.** Every turn the agent is handed its body readings, which nodes are up, how its last proactive lines went, its top memories and its persona. It answers "블루 켜져 있어?" or "아까 나한테 뭐 물어봤어?" without calling a tool.
@@ -89,7 +92,7 @@ The goal is that daijin keeps talking even if every outside AI service is gone. 
 - **Thinking engines are swappable.** `BRAIN_ENGINE=claude` (default), `local` (any OpenAI-compatible endpoint: Ollama, llama.cpp, LM Studio, vLLM), or an order such as `claude,local`, which falls back to the local model when Claude gives no answer. The local engine gets three tools only (node command, fleet status, device status), invented commands are refused, and a reply that claims an action no command carried out is replaced with the truth. Its conversation memory comes from the self layer instead of a model session.
 - **Some answers need no model.** Clear short commands ("레드 모터 돌려 줘") and time, date and weekday questions are answered by rules in about 2 seconds (`fastpath.py`). A 4B model got the weekday wrong one time in three; the clock does not.
 - **Ears and voice at home.** A whisper.cpp server for speech recognition, Supertonic for speech, both on the CPU or GPU of the machine running them.
-- **A home broker when the internet is gone.** With `MQTT_LOCAL_HOST` in the firmware secrets (a `.local` name is looked up with mDNS), the device and nodes move to a mosquitto on the home WiFi after three failed cloud connects or when there is no clock to check certificates, and go back to the cloud every five minutes.
+- **A home broker when the internet is gone.** With `MQTT_LOCAL_HOST` in the firmware secrets (a `.local` name is looked up with mDNS), the device and nodes move to a mosquitto on the home WiFi after three failed cloud connects or when there is no clock to check certificates, log in there as themselves under the same ACL, and try the cloud again every five minutes.
 - **Offline mode.** `voice/offline-mode.sh start` runs the whole brain on one Mac with all of the above. Measured on an M1 Pro with qwen3.5:4b: rule answers 2-3 s, conversation 9-17 s. `sync` copies the server's self layer here first and `push` merges what was said offline back into it afterwards, so nothing said during an outage is forgotten.
 - **A home helper for the server.** `voice/mac-helper.sh` keeps whisper running on a Mac and exposes it and Ollama to the server over Tailscale only, so the server falls back to the Mac's model when Claude fails.
 
@@ -101,8 +104,8 @@ The local model is clearly weaker than Claude: it misplaces dates, cannot search
 - **Voice**: **Supertonic** (`TTS_ENGINE=supertonic`) speaks Korean on the CPU with no network, about 0.2× real time even on a 2-vCPU VPS; **Edge TTS** (free neural voice) and a custom **ElevenLabs** voice remain, and the engines fall through to one another.
 - **Talk mode**: hold BOOT for a second (or say "let's talk") and the conversation goes on without the button: the device sends a clip whenever it hears speech and a turn ends after 0.8 s of quiet. The LED is purple while it is on, a tap cuts daijin off mid-sentence, and the mode ends by itself after two quiet minutes.
 - **Recording** ends by itself 1.5 s after the speaker goes quiet (energy VAD on the device, tuned on real conversations: thinking pauses up to 1.4 s no longer cut a sentence), or with a second tap.
-- **Self layer** running: drives, the rebuff ledger, nightly reflection; see above.
-- **Face**: RoboEyes on the OLED with pupils that follow the gaze: blinks and looks around when idle, grows when listening, glances up-left/up-right while thinking, smiles while speaking. **Ops**: the brain warns 30 days before its subscription token expires, and a nightly job pulls its secrets, session, database and Claude transcripts to the Mac, encrypted.
+- **Self layer** running: drives, the rebuff ledger, nightly reflection, follow-ups, mood and time alone; see above.
+- **Face**: RoboEyes on the OLED with pupils that follow the gaze: blinks and looks around when idle, grows when listening, glances up-left/up-right while thinking, smiles while speaking. **Ops**: the brain warns 30 days before its subscription token expires, and once a day a Mac pulls its secrets, session, database and Claude transcripts, encrypted (`voice/backup.sh`, whose header says how to restore onto a new server).
 - **Own broker and over-the-air updates**: Mosquitto on the brain's VPS with a Let's Encrypt certificate and a login per device. Every board updates without a cable: `bash sketches/ota.sh dev2` builds, uploads the image to the server, tells the board, and waits until it reports the new version (about 70 s). The board checks the SHA-256 before switching, so a broken download leaves the old firmware running; images are accepted only from the project's own server, and a new image that cannot reach the broker within five minutes rolls back to the previous one (tried on the device with a build that never connects).
 - **One brain process, many turns**: claude stays up between turns (stream-json in and out) instead of starting fresh each time, which alone cost about three seconds before the first word; the per-turn state block now travels with the turn. `BRAIN_RESIDENT=0` goes back to a process per turn.
 - **Local thinking and offline mode** working end to end; the firmware falls back to a home broker (checked on the device and both nodes with a test build that treats the cloud as down).
@@ -141,11 +144,15 @@ voice/      daijin
   ollama/             Modelfile for the local model with a context large enough for daijin
   daijin_common.py    shared by the brain, the fleet watcher and the tools: secrets, local hooks, broker client
   nodes.json          the home nodes in one place: id, number, spoken name, LED colour, firmware flags
+  nodes.py            reads that table: names and aliases, finding node names in text, firmware flags for flash-node.sh
+  fleet_watch.py      says so when a node goes off or comes back (not for a node that is usually off); fleet_status.py renders fleet.sh
   nodectl.py          node/device control on one broker connection; dev.sh, fleet.sh, status.sh, say.sh wrap it
   selfdb.py           the self outside the model: episodes, the rebuff ledger, drives, policy, memories, persona versions (SQLite)
   initiative.py       drives → admissibility filter → proactive speech; the ledger on the bus (INITIATIVE_DRY_RUN=1 plans without speaking)
   ledger_rules.py     reply classes, quiet hours, back-off, repair lines
-  reflect.py          nightly look back: memories, relabels, persona proposal
+  reflect.py          nightly look back: memories, relabels, threads to follow up, persona proposal
+  mood.py             the day as a mood: two numbers from the ledger, the talk, the hour and the heat, with reasons
+  solo.py             time alone twice a day: a turn nobody asked for, web only; notes, self memories, things to tell
   persona.py          show / approve / reject persona proposals; export, import, seed
   replay_journal.py   load past brain logs from journald into the self layer
   broker.sh           broker arguments and CA bundle for console.sh (Mac/Linux)
@@ -154,7 +161,7 @@ voice/      daijin
   say.sh              proactive speech: daijin/say (verbatim) · daijin/ask (agent composes)
   install-agents.sh   macOS: register brain + fleet watcher as LaunchAgents
   install-services.sh Linux: register them as systemd user services (systemd/*.service)
-  mosquitto/          the broker: config, per-login ACL, install.sh (Mosquitto + Let's Encrypt + three logins)
+  mosquitto/          the broker: config, per-login ACL, install.sh (Mosquitto + Let's Encrypt + three logins); home.acl for a home broker
   ota/                install-server.sh: nginx on the broker's certificate serving firmware images for ota.sh
   backup.sh           nightly from a Mac: pull the server's secrets, session, database and Claude transcripts, encrypted
   offline-mode.sh     run everything on this machine with no outside services (home broker, local model, whisper.cpp, Supertonic); sync/push the self layer with the server
@@ -163,7 +170,7 @@ voice/      daijin
   mac-helper.sh       keep whisper.cpp running on a Mac and expose it and Ollama to the server over Tailscale only
   test_device.py      device stand-in: sends a question as ADPCM chunks, decodes the reply (`--say "..."` needs no recording)
   mic_test_server.py  HTTP endpoint for mic verification
-  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer, the local engine, token expiry, firmware headers shared between sketches) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
+  tests/              unit tests (ADPCM pair, clip reassembly, session handling, TTS/STT engines, node table, node commands, the self layer with follow-ups, mood and time alone, the local engine, the resident brain process, token expiry, the broker ACLs against the node table, firmware headers shared between sketches) — run `python3 -m unittest discover -s voice/tests`; stdlib only, no network or hardware
 docs/       start at docs/README.md: current documents (audio protocol, self layer, broker and OTA) and kept plans
 ```
 
@@ -233,7 +240,7 @@ The brain is the only piece that ran on the Mac, and nothing in it needs macOS. 
 | LaunchAgent | systemd user service (`install-services.sh`) |
 | The agent's shell is your Mac | The agent's shell is the server. Home nodes are still driven over MQTT, so `dev.sh`/`fleet.sh` work unchanged; anything that needed *the Mac itself* (its files, its apps) does not. |
 
-Conversation memory (the pinned Claude session) lives on the machine that runs the brain, so a new machine starts with a blank memory.
+Conversation memory (the pinned Claude session) lives on the machine that runs the brain, so a new machine starts with a blank memory unless you restore it: `voice/backup.sh` on a Mac keeps a daily encrypted copy of the session, the transcripts and the self-layer database.
 
 ```bash
 # Debian/Ubuntu
@@ -244,7 +251,7 @@ curl -fsSL https://claude.ai/install.sh | bash      # Claude Code CLI → ~/.loc
 git clone https://github.com/nonasking/daijin.git && cd daijin
 cp secrets.local.example secrets.local.txt     # broker creds + GROQ_API_KEY + CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token` on the Mac)
 python3 -u voice/daijin_mqtt.py                # foreground first: tap BOOT, talk, watch the log
-bash voice/install-services.sh                 # then register brain, fleet watcher, initiative and the 03:30 reflect timer as systemd user services
+bash voice/install-services.sh                 # then register brain, fleet watcher, initiative, the 03:30 reflect timer and the solo timer as systemd user services
 python3 voice/persona.py seed                  # first persona version from voice/props.txt; later: persona.py show / approve <id>
 journalctl --user -u daijin-brain -f           # the services log to journald
 python3 voice/test_device.py --say "지금 몇 시야?"   # no device at hand: a stand-in sends the question and saves the spoken reply
