@@ -2,7 +2,8 @@
 # reflect — 밤에 하루를 돌아본다. 설계: docs/design-self-layer.md §8.
 #   입력: 오늘의 episodes, asks, drives 요약, 현재 persona.
 #   모델: claude -p 를 대화 세션과 별개로(--resume 없이) 한 번. 도구 없음. 출력은 JSON 하나로 강제.
-#   적용: memories 추가(같은 뜻의 옛 기억은 valid_to 를 채워 대체), asks 재분류와 wanted_to_ask_less, persona 변경 제안(승인 대기).
+#   적용: memories 추가(같은 뜻의 옛 기억은 valid_to 를 채워 대체), asks 재분류와 wanted_to_ask_less, persona 변경 제안(승인 대기),
+#         threads 열고 닫기 (끝나지 않은 일: 이어서 물을 것과 다이진이 한 약속. initiative 의 followup 추동이 쓴다).
 # 실행: python3 reflect.py [--date YYYY-MM-DD] [--dry-run] [--db PATH]   (상시는 systemd 타이머 daijin-reflect, 03:30)
 import argparse, json, os, re, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,9 @@ SCHEMA_HINT = """반드시 아래 모양의 JSON 하나만 출력해. 설명이�
                 "replaces": "같은 뜻이라 대체하는 기존 기억의 text, 없으면 null"}],
   "ask_labels": [{"ask_id": id, "response_class": "engaged|acknowledged|refused_context|negative|unanswered|null(그대로)",
                   "wanted_to_ask_less": true|false|null}],
+  "threads_open": [{"kind": "theirs|mine", "text": "한 문장, 사실로: 사람이 무슨 일이 있다고 했고 무엇이 아직 안 끝났나 (mine 이면 네가 무엇을 하기로 했나)", "due": "YYYY-MM-DD(그 결과가 나올 법한 날) 또는 null",
+                    "importance": 1~10, "sensitive": true|false, "source_episode": 에피소드 id 또는 null}],
+  "threads_close": [{"thread_id": id, "how": "resolved|dropped", "note": "한 문장"}],
   "persona_new": "인격 글 전체(바꿀 게 있을 때만, 없으면 null)",
   "persona_change_summary": "무엇을 왜 바꿨는지 한두 문장, persona_new 가 null 이면 null",
   "note": "오늘 한 줄"
@@ -64,9 +68,11 @@ def build_prompt(start, end):
                  (f", 사람 답({int(a['latency_s'] or 0) // 60}분 {int(a['latency_s'] or 0) % 60}초 뒤): {a['response_text'][:60]}" if a["response_text"] else "")
                  for a in asks]
     mem_lines = [f"- ({m['kind']}, 중요도 {m['importance']}) {m['text']}" for m in mems][:40]
+    thread_lines = [f"- [thread{t['id']} {'네 약속' if t['kind'] == 'mine' else '사람의 일'}, {time.strftime('%m-%d', time.localtime(t['ts']))}에 열림, {t['asked_count']}번 물음] {t['text']}"
+                    for t in selfdb.threads_open()]
     day = time.strftime("%Y-%m-%d", time.localtime(start))
     return (f"너는 'daijin'이라는 AI 음성 친구이고, 지금은 {day} 하루를 돌아보는 밤이다. 아래는 오늘의 대화와 네가 먼저 말 건 기록이다.\n"
-            "할 일 셋.\n"
+            "할 일 넷.\n"
             "1) 기억: 앞으로의 대화에 도움이 될 사실·선호·규칙·사건을 뽑아라. 사람이 한 말에 근거한 것만, 추측은 넣지 마라. 이미 있는 기억과 같은 뜻이면 replaces 로 대체하라. 하루에 0~5개면 충분하다.\n"
             "2) 장부: 네가 먼저 말 건 것(asks)마다, 사람의 답을 다시 읽고 분류가 맞는지 보라. 틀렸으면 고치고, 맞으면 null. 그리고 '그때 덜 묻고 싶었는데 물었는가'를 솔직하게 wanted_to_ask_less 로 답하라. 아무 근거가 없으면 null.\n"
             "   분류 뜻: engaged=그 말에 이어 대화함, acknowledged=짧게 받아 줌(응, 알았어), refused_context=지금은 안 된다는 이유를 댐(바빠, 나중에), "
@@ -74,7 +80,15 @@ def build_prompt(start, end):
             "engaged 나 unanswered 로 두고, 거절(refused_context, negative)은 사람이 네 말을 물리친 게 분명할 때만 붙여라. "
             "답은 네가 말한 뒤 10분 안에 들어온 말만이다: 그보다 뒤의 대화는 네 말에 대한 답이 아니니 unanswered 를 engaged 로 바꾸지 마라.\n"
             "3) 인격: 현재 인격 글을 읽고, 오늘 배운 것 때문에 고쳐야 할 문장이 있으면 글 전체를 다시 써서 persona_new 에 넣어라. 바꿀 이유가 분명할 때만. 사람이 승인해야 반영된다.\n\n"
+            "4) 이어서 물을 것: 사람이 결과를 기다리던 일, 하겠다고 한 일, 걱정하던 일처럼 '그 뒤가 어떻게 됐는지' 며칠 뒤에 묻는 게 자연스러운 것만 "
+            "threads_open 에 넣어라(kind=theirs). 사람이 실제로 한 말에 근거한 것만, 하루에 0~2개. 이미 끝난 이야기, 잡담, 네가 지어낸 걱정은 넣지 마라. "
+            "text 는 네 궁금증('~인지 궁금하다')이 아니라 있었던 일을 적어라('~라고 했다', '~하기로 했다'): 나중에 그 글을 보고 질문을 새로 짓는다. 한 가지 일만, 짧게. "
+            "네가 스스로 하겠다고 말한 것(내일 다시 물어볼게, 찾아보고 알려 줄게)은 kind=mine 으로 넣어라. "
+            "건강·돈·사람 사이의 일처럼 다른 사람이 듣는 데서 꺼내기 조심스러운 주제면 sensitive=true. due 는 결과가 나올 법한 날이고 모르면 null. "
+            "그리고 아래 '열려 있는 것' 가운데 오늘 대화로 뒷이야기를 들었으면 threads_close 에 resolved 로, "
+            "사람이 그 얘기를 원치 않거나 더 물을 일이 아니게 됐으면 dropped 로 닫아라. 이미 열려 있는 것과 같은 일은 다시 열지 마라.\n\n"
             f"현재 인격 글:\n{cur['text'] if cur else '(아직 없음)'}\n\n"
+            f"열려 있는 것:\n" + ("\n".join(thread_lines) or "(없음)") + "\n\n"
             f"이미 있는 기억:\n" + ("\n".join(mem_lines) or "(없음)") + "\n\n"
             f"오늘의 대화 {len(eps)}턴:\n" + ("\n".join(lines) or "(없음)") + "\n\n"
             f"오늘 먼저 말 건 기록 {len(asks)}건:\n" + ("\n".join(ask_lines) or "(없음)") + "\n\n" + SCHEMA_HINT)
@@ -123,7 +137,7 @@ def run_model(prompt, timeout_s=300):
 def apply(out, start, end, now=None):
     """모델 출력(dict) → DB. 무엇을 했는지 요약 dict 로 돌려준다."""
     now = time.time() if now is None else now
-    done = {"memories": 0, "replaced": 0, "relabeled": 0, "wanted": 0, "persona": None, "skipped": []}
+    done = {"memories": 0, "replaced": 0, "relabeled": 0, "wanted": 0, "persona": None, "skipped": [], "threads": 0, "threads_closed": 0}
     valid = {m["text"]: m["id"] for m in selfdb.valid_memories()}
     for m in out.get("memories") or []:
         text = (m.get("text") or "").strip()
@@ -155,6 +169,35 @@ def apply(out, start, end, now=None):
         if cls is not None or wanted is not None:
             selfdb.relabel_ask(aid, response_class=cls, wanted_to_ask_less=wanted)
             done["relabeled"] += 1 if cls else 0; done["wanted"] += 1 if wanted is not None else 0
+    open_ids = {t["id"] for t in selfdb.threads_open()}
+    for c in out.get("threads_close") or []:                # 먼저 닫는다: 오늘 답을 들은 일을 같은 날 다시 여는 일이 없게
+        tid = c.get("thread_id")
+        if isinstance(tid, str):
+            digits = re.sub(r"\D", "", tid)
+            tid = int(digits) if digits else None
+        how = c.get("how") if c.get("how") in ("resolved", "dropped") else None
+        if tid in open_ids and how and selfdb.thread_close(tid, how, (c.get("note") or "")[:200] or None, ts=now):
+            done["threads_closed"] += 1
+    for t in (out.get("threads_open") or [])[:3]:
+        text = (t.get("text") or "").strip()[:200]
+        kind = t.get("kind") if t.get("kind") in selfdb.THREAD_KINDS else "theirs"
+        if not text:
+            continue
+        due = None
+        try:
+            if t.get("due"):
+                d = time.strptime(str(t["due"])[:10], "%Y-%m-%d")
+                due = int(time.mktime((d.tm_year, d.tm_mon, d.tm_mday, 10, 0, 0, 0, 0, -1)))     # 그날 오전 10시부터
+        except ValueError:
+            due = None
+        try:
+            imp = max(1, min(10, int(t.get("importance") or 5)))
+        except (TypeError, ValueError):
+            imp = 5
+        before = len(selfdb.threads_open())
+        src = t.get("source_episode") if isinstance(t.get("source_episode"), int) else None
+        selfdb.thread_open(kind, text, due_ts=due, importance=imp, sensitive=bool(t.get("sensitive")), source_episode=src, ts=now)
+        done["threads"] += len(selfdb.threads_open()) - before
     new = (out.get("persona_new") or "").strip()
     cur = selfdb.persona_current()
     if new and new != (cur["text"] if cur else ""):
@@ -202,7 +245,8 @@ def main():
     if a.dry_run:
         print("(dry-run: 적용 안 함)"); return 0
     done = apply(out, start, end)
-    print(f"✅ 적용: 기억 {done['memories']}개(대체 {done['replaced']}), 장부 재분류 {done['relabeled']}, 덜 묻고 싶었나 {done['wanted']}건, "
+    print(f"✅ 적용: 기억 {done['memories']}개(대체 {done['replaced']}), 실 {done['threads']}개 열고 {done['threads_closed']}개 닫음, "
+          f"장부 재분류 {done['relabeled']}, 덜 묻고 싶었나 {done['wanted']}건, "
           f"인격 제안 {'#%d (승인 대기: python3 voice/persona.py show)' % done['persona'] if done['persona'] else '없음'}")
     publish_pending()
     return 0

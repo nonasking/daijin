@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS persona_versions (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL, diff_summary TEXT,
   proposed_by TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notes (ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS threads (
+  id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+  due_ts INTEGER, importance INTEGER NOT NULL DEFAULT 5, sensitive INTEGER NOT NULL DEFAULT 0, source_episode INTEGER,
+  status TEXT NOT NULL DEFAULT 'open', closed_ts INTEGER, closed_note TEXT,
+  asked_count INTEGER NOT NULL DEFAULT 0, last_asked_ts INTEGER);
 CREATE TABLE IF NOT EXISTS node_state (node TEXT PRIMARY KEY, online INTEGER NOT NULL, since INTEGER NOT NULL, excused_at INTEGER,
   excuse_count INTEGER NOT NULL DEFAULT 0, standing INTEGER NOT NULL DEFAULT 0);
 """
@@ -229,6 +234,47 @@ def top_memories(n=5, max_chars=200):
 
 def valid_memories():
     return db().execute("SELECT * FROM memories WHERE valid_to IS NULL ORDER BY ts").fetchall()
+
+# ---------- threads: 끝나지 않은 일 ----------
+# 기억은 "알아 둘 것"이고 실은 "이어서 물을 것"이다. 사람이 결과를 기다리던 일, 하겠다고 한 일(kind=theirs)과
+# 다이진이 스스로 하겠다고 한 약속(kind=mine). 밤 반성이 열고 닫는다. initiative 의 followup 추동이 때가 된 것을 묻는다.
+THREAD_KINDS = ("theirs", "mine")
+
+@_safe
+def thread_open(kind, text, due_ts=None, importance=5, sensitive=False, source_episode=None, ts=None):
+    """새 실. 같은 글이 이미 열려 있으면 그 id 를 돌려준다."""
+    assert kind in THREAD_KINDS, kind
+    row = db().execute("SELECT id FROM threads WHERE status='open' AND text=?", (text,)).fetchone()
+    if row:
+        return row["id"]
+    cur = db().execute("INSERT INTO threads(ts,kind,text,due_ts,importance,sensitive,source_episode) VALUES(?,?,?,?,?,?,?)",
+                       (int(ts or time.time()), kind, text, int(due_ts) if due_ts else None, int(importance), 1 if sensitive else 0, source_episode))
+    return cur.lastrowid
+
+def threads_open():
+    return db().execute("SELECT * FROM threads WHERE status='open' ORDER BY importance DESC, ts").fetchall()
+
+@_safe
+def thread_close(thread_id, how="resolved", note=None, ts=None):
+    """resolved=뒷이야기를 들었다, dropped=더 묻지 않기로 했다. 열려 있던 것을 닫았으면 True."""
+    assert how in ("resolved", "dropped"), how
+    cur = db().execute("UPDATE threads SET status=?, closed_ts=?, closed_note=? WHERE id=? AND status='open'",
+                       (how, int(ts or time.time()), note, thread_id))
+    return cur.rowcount == 1
+
+@_safe
+def thread_asked(thread_id, ts=None):
+    db().execute("UPDATE threads SET asked_count=asked_count+1, last_asked_ts=? WHERE id=?", (int(ts or time.time()), thread_id))
+    return True
+
+@_safe
+def threads_let_go(now, max_age_s, max_asks, grace_s):
+    """놓아 줄 실을 닫는다: 너무 오래 열려 있었거나, 물을 만큼 물었는데 그 뒤로도 소식이 없는 것. 닫은 id 목록."""
+    rows = db().execute("SELECT id FROM threads WHERE status='open' AND (? - ts > ? OR (asked_count >= ? AND ? - last_asked_ts > ?))",
+                        (int(now), int(max_age_s), int(max_asks), int(now), int(grace_s))).fetchall()
+    for r in rows:
+        db().execute("UPDATE threads SET status='dropped', closed_ts=?, closed_note='놓음: 오래됐거나 물어도 소식이 없었다' WHERE id=?", (int(now), r["id"]))
+    return [r["id"] for r in rows]
 
 # ---------- persona ----------
 def persona_current():

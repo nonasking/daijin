@@ -30,6 +30,7 @@ SOURCE = "initiative"
 # value(state) → 0~1. threshold 를 넘으면 말 걸기 후보. base_interval_s 는 같은 추동으로 다시 묻기까지의 기본 간격.
 # channel: say = 고정 문장을 그대로, ask = 상황 설명을 에이전트에 넘겨 표현하게 (느리지만 맥락이 붙는다).
 DRIVES = {
+    "followup":  {"threshold": 0.5, "base_interval_s": 20 * 3600, "channel": "ask"},   # 맨 앞: 같은 틱에 둘이 차면 이쪽이 말한다
     "contact":   {"threshold": 0.5, "base_interval_s": 8 * 3600,  "channel": "say"},
     "node_loss": {"threshold": 0.25, "base_interval_s": 24 * 3600, "channel": "ask"},
     "body":      {"threshold": 0.5, "base_interval_s": 2 * 3600,  "channel": "say"},
@@ -37,8 +38,39 @@ DRIVES = {
 BODY_DANGER = 0.9      # 이 위면 조용한 시간에도 말한다 (온도 68도쯤)
 DEVICE_FRESH_S = 180   # 기기는 60초마다 상태를 보낸다. 이만큼 소식이 없으면 꺼진 것으로 보고 말을 걸지 않는다
 
+# followup: 끝나지 않은 일(selfdb.threads)을 이어서 묻는다. 다이진이 먼저 말하는 이유가 처음으로 자기 사정(얘기한 지 오래됐다,
+# 노드가 꺼졌다, 몸이 뜨겁다)이 아니라 상대의 일이 된다.
+THREAD_WAIT_S   = 18 * 3600        # 날짜가 없는 실은 이만큼 지난 뒤부터 (그날 밤에 들은 것을 다음 날 묻는다)
+THREAD_REASK_S  = 3 * 86400        # 한 번 물은 실은 이만큼 지나야 다시
+THREAD_MAX_ASKS = 2                # 실 하나를 이보다 많이 묻지 않는다
+THREAD_MAX_AGE_S = 21 * 86400      # 이만큼 열려 있으면 놓는다
+PROACTIVE_GAP_S = 30 * 60          # 무엇으로든 먼저 말한 뒤 이만큼은 또 먼저 말하지 않는다 (몸이 위험할 때만 예외)
+
 def clamp(x):
     return max(0.0, min(1.0, x))
+
+def followup_mode():
+    """조심스러운 주제(건강·돈·관계)의 실을 어떻게 다룰까. secrets FOLLOWUP_SENSITIVE:
+    conversation(기본) = 스피커로 먼저 꺼내지 않고, 사람이 시작한 대화 안에서만 (브레인의 상태 블록에 실린다)
+    speak = 다른 실처럼 먼저 묻는다 · never = 아예 다루지 않는다."""
+    v = (sec("FOLLOWUP_SENSITIVE") or "").strip()
+    return v if v in ("speak", "conversation", "never") else "conversation"
+
+def ripe_thread(now):
+    """지금 먼저 물어도 되는 실 가운데 가장 무르익은 것: (값, 행) 또는 None."""
+    best = None
+    for t in selfdb.threads_open():
+        if t["sensitive"] and followup_mode() != "speak":
+            continue
+        due = t["due_ts"] or t["ts"] + THREAD_WAIT_S
+        if now < due or t["asked_count"] >= THREAD_MAX_ASKS:
+            continue
+        if t["last_asked_ts"] and now - t["last_asked_ts"] < THREAD_REASK_S:
+            continue
+        v = clamp(0.4 + t["importance"] / 20 + (now - due) / 86400 / 10)      # 중요도 5 가 때가 되면 0.65, 하루 묵을 때마다 +0.1
+        if best is None or v > best[0]:
+            best = (v, t)
+    return best
 
 class Body:
     """버스에서 받은 마지막 상태. 추동 계산의 입력."""
@@ -79,6 +111,18 @@ def compute_drives(body, last_voice_ts, now=None):
     """이름 → (값, 입력, 말 걸 때 쓸 이유·문장). 입력은 drives.inputs 에 그대로 저장한다."""
     now = time.time() if now is None else now
     out = {}
+    # followup: 때가 된 실 하나. 에이전트가 그 일을 아는 채로 한 문장을 짓게 상황으로 넘긴다.
+    ripe = ripe_thread(now)
+    if ripe:
+        v, t = ripe
+        days = max(1, int((now - t["ts"]) // 86400))
+        line = (f"[상황] {days}일 전에 네가 이렇게 하기로 했어: {t['text']} 지금 그 약속을 지켜 줘. 할 수 없게 됐으면 그렇다고 말해 줘."
+                if t["kind"] == "mine" else
+                f"[상황] {days}일 전에 사람이 이런 얘기를 했어: {t['text']} 그 뒤가 어떻게 됐는지, 캐묻지 말고 한 문장으로 다정하게 물어봐 줘.")
+        out["followup"] = (v, {"thread": t["id"], "kind": t["kind"], "asked": t["asked_count"]},
+                           {"trigger": "네가 하기로 한 일이 있어서" if t["kind"] == "mine" else "전에 들은 일의 뒷이야기가 궁금해서", "line": line})
+    else:
+        out["followup"] = (0.0, {"thread": None}, {"trigger": "", "line": ""})
     # contact: 마지막 대화로부터의 경과. 24시간이면 1.
     gap = (now - last_voice_ts) if last_voice_ts else None
     out["contact"] = (clamp((gap or 0) / 86400), {"since_last_voice_s": int(gap) if gap else None},
@@ -134,6 +178,8 @@ def admissible(name, value, body, hooks, now=None):
         budget = 3
     if budget_used_today(now) >= budget:
         return False, "daily_budget"
+    if selfdb.asks_since(now - PROACTIVE_GAP_S, source=SOURCE) and not (name == "body" and value >= BODY_DANGER):
+        return False, "just_spoke"                 # 방금 다른 이유로 먼저 말했다: 연달아 말 걸지 않는다
     pol = selfdb.policy_get(name, spec["base_interval_s"])
     if pol is None:
         return False, "no_policy"
@@ -318,11 +364,15 @@ def tick(client, body, ledger, hooks, dry_run, now=None):
             continue
         ledger.expect(line, name, value, info["trigger"], now, repair=repair)
         client.publish(T_SAY if channel == "say" else T_ASK, line, qos=1)
+        if name == "followup" and inputs.get("thread"):
+            selfdb.thread_asked(inputs["thread"], now)     # 답을 들었는지는 밤 반성이 대화를 읽고 정한다 (닫거나, 그대로 두거나)
         print(f"[{time.strftime('%H:%M:%S')}] {name}={value:.2f} 말함 ({channel}): {line!r}")
         spoke = True                        # 복구 방식은 장부가 이 말을 열 때 적는다 (expect). 예전엔 1초 뒤 "가장 최근 ask"에
                                             # 적었는데, 메아리가 늦으면(재접속) 그 앞 ask 의 것을 덮어썼다
     ledger.expire(now)
     selfdb.link_unlinked_episodes()
+    for tid in selfdb.threads_let_go(now, THREAD_MAX_AGE_S, THREAD_MAX_ASKS, THREAD_REASK_S) or []:
+        print(f"[{time.strftime('%H:%M:%S')}] 실 #{tid} 놓음 (오래됐거나 물어도 소식이 없었다)")
 
 def main():
     ap = argparse.ArgumentParser()

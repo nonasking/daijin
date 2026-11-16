@@ -124,7 +124,7 @@ EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
 T_DEV_STATUS  = "daijin/status"
 T_NODE_STATUS = "daijin/dev/+/status"
 _body = {"device": None, "device_ts": 0, "nodes": {}}     # nodes: id -> (json dict, 수신 시각)
-STATE_MAX_CHARS = 600
+STATE_MAX_CHARS = 800
 
 def note_status(topic, payload):
     try:
@@ -177,6 +177,15 @@ def state_block(now=None):
         mems = selfdb.top_memories(5, 200)
         if mems:
             parts.append("기억: " + " · ".join(m["text"] for m in mems))
+        # 끝나지 않은 일: 대화 안에서는 조심스러운 주제도 실린다 (FOLLOWUP_SENSITIVE=never 가 아니면). 먼저 스피커로 꺼내는 것은 initiative 가 따로 가린다.
+        never = (sec("FOLLOWUP_SENSITIVE") or "").strip() == "never"
+        th = [t for t in selfdb.threads_open() if not (t["sensitive"] and never)]
+        theirs = [t["text"] for t in th if t["kind"] == "theirs"][:2]
+        mine = [t["text"] for t in th if t["kind"] == "mine"][:2]
+        if theirs:
+            parts.append("아직 뒷이야기를 못 들은 일 (대화가 그쪽으로 가면 물어봐도 돼, 억지로 꺼내지는 마): " + " · ".join(x[:80] for x in theirs))
+        if mine:
+            parts.append("내가 하기로 한 일: " + " · ".join(x[:80] for x in mine))
         cur = selfdb.persona_current()
         if cur:
             parts.append("나에 대해: " + cur["text"].replace("\n", " ")[:300])

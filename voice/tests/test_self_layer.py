@@ -417,6 +417,9 @@ class TestInitiativeFilter(DbCase):
             selfdb.open_ask("contact", "say", f"x{i}", initiative.SOURCE, ts=self.noon - 60)
         self.assertEqual(self._ok(), (False, "daily_budget"))
         self.cfg["INITIATIVE_DAILY_BUDGET"] = "9"
+        self.assertEqual(self._ok(), (False, "just_spoke"))                                    # something was said a minute ago
+        self.assertEqual(self._ok("body", 0.95), (True, None))                                 # danger speaks anyway
+        selfdb.db().execute("UPDATE asks SET ts=?", (self.noon - 2 * 3600,))
         selfdb.policy_update("contact", last_ask_ts=self.noon - 60)
         self.assertEqual(self._ok(), (False, "interval"))
         selfdb.policy_update("contact", last_ask_ts=0, avoid_hours=[f"{time.localtime(self.noon).tm_hour:02d}"])
@@ -496,6 +499,104 @@ class TestInitiativeFilter(DbCase):
         line, strategy = initiative.compose("contact", info, self.noon)
         self.assertEqual(strategy, "explain")
         self.assertTrue(line.startswith("어제는 14시간째 얘기를 못 해서 말 걸었어. 오늘은"), line)    # the reason it spoke then, a day ago
+
+
+class TestThreads(DbCase):
+    """Unfinished business: what the person was waiting on, and what daijin said it would do. Reflection opens and closes;
+    the followup drive asks when one is due."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = {"INITIATIVE_QUIET": "23-08", "INITIATIVE_DAILY_BUDGET": "3"}
+        for mod in (initiative, dm):
+            orig = mod.sec; mod.sec = lambda k: self.cfg.get(k, ""); self.addCleanup(setattr, mod, "sec", orig)
+        self.body = initiative.Body()
+        self.noon = 1_800_000_000 - (time.localtime(1_800_000_000).tm_hour - 12) * 3600
+        self.body.note(initiative.T_DEV_STATUS, b'{"online": true, "rssi": -55}', now=self.noon)
+        self.opened = self.noon - 20 * 3600                       # heard last night
+
+    def test_a_thread_opens_once_closes_once_and_counts_its_asks(self):
+        a = selfdb.thread_open("theirs", "글 마감이 금요일이라고 했다", importance=6, ts=self.opened)
+        self.assertEqual(selfdb.thread_open("theirs", "글 마감이 금요일이라고 했다", ts=self.opened + 5), a)     # same thing: not twice
+        selfdb.thread_asked(a, self.noon)
+        row = selfdb.threads_open()[0]
+        self.assertEqual((row["asked_count"], row["last_asked_ts"], row["kind"]), (1, self.noon, "theirs"))
+        self.assertTrue(selfdb.thread_close(a, "resolved", "잘 냈다고 했다"))
+        self.assertFalse(selfdb.thread_close(a, "dropped"))
+        self.assertEqual(selfdb.threads_open(), [])
+
+    def test_ripe_means_due_not_just_asked_and_not_asked_too_often(self):
+        tid = selfdb.thread_open("theirs", "글 마감이 금요일이라고 했다", importance=6, ts=self.opened)
+        self.assertIsNone(initiative.ripe_thread(self.opened + 3600))                          # the same evening: too soon
+        v, row = initiative.ripe_thread(self.noon)
+        self.assertEqual(row["id"], tid); self.assertGreaterEqual(v, initiative.DRIVES["followup"]["threshold"])
+        selfdb.thread_asked(tid, self.noon)
+        self.assertIsNone(initiative.ripe_thread(self.noon + 86400))                           # asked yesterday: wait
+        self.assertIsNotNone(initiative.ripe_thread(self.noon + initiative.THREAD_REASK_S + 1))
+        selfdb.thread_asked(tid, self.noon + initiative.THREAD_REASK_S + 1)
+        self.assertIsNone(initiative.ripe_thread(self.noon + 30 * 86400))                      # twice is enough
+        later = selfdb.thread_open("theirs", "다음 주에 발표가 있다고 했다", ts=self.opened)
+        selfdb.db().execute("UPDATE threads SET due_ts=? WHERE id=?", (self.noon + 5 * 86400, later))
+        self.assertIsNone(initiative.ripe_thread(self.noon))                                   # not before the day it is about
+        self.assertEqual(initiative.ripe_thread(self.noon + 5 * 86400 + 60)[1]["id"], later)
+
+    def test_a_sensitive_thread_is_not_raised_out_loud_unless_told_to(self):
+        selfdb.thread_open("theirs", "병원 검사 결과를 기다린다고 했다", importance=9, sensitive=True, ts=self.opened)
+        self.assertIsNone(initiative.ripe_thread(self.noon))                                   # default: only inside a conversation
+        self.assertIn("병원 검사 결과", dm.state_block(self.noon))
+        self.cfg["FOLLOWUP_SENSITIVE"] = "speak"
+        self.assertIsNotNone(initiative.ripe_thread(self.noon))
+        self.cfg["FOLLOWUP_SENSITIVE"] = "never"
+        self.assertIsNone(initiative.ripe_thread(self.noon))
+        self.assertNotIn("병원 검사 결과", dm.state_block(self.noon))
+
+    def test_the_drive_hands_the_agent_the_story_marks_it_asked_and_nothing_else_follows_right_after(self):
+        tid = selfdb.thread_open("theirs", "글 마감이 금요일이라고 했다", importance=6, ts=self.opened)
+        selfdb.episode("voice", user_text="안녕", ts=self.noon - 30 * 3600)                     # contact is high too
+        c = FakeClient(); ledger = initiative.Ledger()
+        initiative.tick(c, self.body, ledger, types.SimpleNamespace(), dry_run=False, now=self.noon)
+        asked = [p for t, p in c.out if t == initiative.T_ASK]
+        self.assertEqual(len(asked), 1)
+        self.assertIn("글 마감이 금요일이라고 했다", asked[0]); self.assertIn("다정하게 물어봐 줘", asked[0])
+        self.assertEqual([p for t, p in c.out if t == initiative.T_SAY], [])                   # not the contact line as well
+        self.assertEqual(selfdb.threads_open()[0]["asked_count"], 1)
+        ledger.on_bus(initiative.T_ASK, asked[0].encode(), now=self.noon + 1)                  # the echo opens the ledger row
+        self.assertEqual(selfdb.recent_asks(1)[0]["drive"], "followup")
+        c.out.clear()
+        initiative.tick(c, self.body, ledger, types.SimpleNamespace(), dry_run=False, now=self.noon + 60)
+        self.assertEqual([t for t, _ in c.out if t in (initiative.T_SAY, initiative.T_ASK)], [])   # contact waits its turn
+        self.assertEqual(tid, selfdb.threads_open()[0]["id"])                                  # still open: reflection decides
+
+    def test_its_own_promise_is_asked_of_itself(self):
+        selfdb.thread_open("mine", "내일 날씨를 찾아보고 알려 주기로 했다", ts=self.opened)
+        v, inputs, info = initiative.compute_drives(self.body, self.noon, self.noon)["followup"]
+        self.assertEqual(inputs["kind"], "mine")
+        self.assertIn("그 약속을 지켜 줘", info["line"])
+        self.assertIn("내가 하기로 한 일: 내일 날씨를", dm.state_block(self.noon))
+
+    def test_old_or_twice_unanswered_threads_are_let_go(self):
+        old = selfdb.thread_open("theirs", "오래된 일", ts=self.noon - initiative.THREAD_MAX_AGE_S - 10)
+        twice = selfdb.thread_open("theirs", "두 번 물은 일", ts=self.noon - 8 * 86400)
+        selfdb.db().execute("UPDATE threads SET asked_count=2, last_asked_ts=? WHERE id=?", (self.noon - 4 * 86400, twice))
+        keep = selfdb.thread_open("theirs", "어제 들은 일", ts=self.opened)
+        gone = selfdb.threads_let_go(self.noon, initiative.THREAD_MAX_AGE_S, initiative.THREAD_MAX_ASKS, initiative.THREAD_REASK_S)
+        self.assertEqual(sorted(gone), sorted([old, twice]))
+        self.assertEqual([t["id"] for t in selfdb.threads_open()], [keep])
+
+    def test_reflection_opens_and_closes(self):
+        import reflect as rf
+        was = selfdb.thread_open("theirs", "면접 결과를 기다린다고 했다", ts=self.opened)
+        done = rf.apply({"threads_close": [{"thread_id": f"thread{was}", "how": "resolved", "note": "붙었다고 했다"}],
+                         "threads_open": [{"kind": "theirs", "text": "첫 출근이 다음 주 월요일이라고 했다", "due": "2027-01-18", "importance": 7, "sensitive": False},
+                                          {"kind": "mine", "text": "출근 전날 다시 물어보기로 했다", "due": None},
+                                          {"kind": "nonsense", "text": ""}]}, 0, 0, now=self.noon)
+        self.assertEqual((done["threads"], done["threads_closed"]), (2, 1))
+        rows = {t["text"]: t for t in selfdb.threads_open()}
+        self.assertNotIn("면접 결과를 기다린다고 했다", rows)
+        due = rows["첫 출근이 다음 주 월요일이라고 했다"]["due_ts"]
+        self.assertEqual(time.strftime("%Y-%m-%d %H", time.localtime(due)), "2027-01-18 10")
+        self.assertEqual(rows["출근 전날 다시 물어보기로 했다"]["kind"], "mine")
+        self.assertIn(f"thread{rows['출근 전날 다시 물어보기로 했다']['id']} 네 약속", rf.build_prompt(0, 2_000_000_000))
 
 
 import reflect               # noqa: E402
