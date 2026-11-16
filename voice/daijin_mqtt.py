@@ -15,7 +15,7 @@
 # - 서비스 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속 (daijin_common).
 
 import subprocess, re, os, sys, time, json, threading, queue, shutil, socket, uuid, types, pathlib
-import array, asyncio, math, tempfile
+import array, asyncio, itertools, math, tempfile
 import urllib.request, urllib.parse
 try:
     import edge_tts                    # pip install edge-tts. 없으면 edge 엔진만 못 쓰고 다음 엔진으로 넘어간다
@@ -151,7 +151,8 @@ def state_block(now=None):
         else:
             age = now - (d.get("ts") or _body["device_ts"])
             parts.append(f"몸: 온도 {d.get('temp_c', '?')}도, 신호 {d.get('rssi', '?')}, 켜진 지 {int((d.get('uptime_s') or 0) // 60)}분"
-                         + (f" ({_age(age)} 값)" if age > 150 else ""))
+                         + (f" ({_age(age)} 값)" if age > 150 else "")
+                         + (", 열린 귀 켜짐(버튼 없이도 들려)" if d.get("ears") else ""))
     nodes = []
     excused, standing = selfdb.node_excused(), selfdb.node_standing()
     for nid, (nd, rts) in sorted(_body["nodes"].items()):
@@ -1027,9 +1028,38 @@ def speech_rms(pcm):
     vals.sort(); top = vals[-max(1, len(vals)//10):]
     return sum(top) / len(top)
 
-def handle_clip(client, pcm):
+# ---------- 열린 귀 ----------
+# 기기가 켜져 있는 동안 버튼 없이 듣는 상태. 사람이 켜고 끈다: 버튼을 길게(1초) 누르거나, 말로, 또는 daijin/cmd 에 ears:on|off.
+# 켜져 있으면 기기가 말소리를 듣는 순간부터 무음 1.5초까지를 클립으로 보낸다 (그 전의 소리는 기기 밖으로 나가지 않는다).
+# 그렇게 온 클립(flags bit2)은 누구에게 한 말인지 모른다: 대답할지는 다이진이 정하고, 가만히 있기로 하면 QUIET_MARK 한마디를 낸다.
+T_CMD = "daijin/cmd"
+QUIET_MARK = "(가만히)"
+EAR_NOTE = (" [열린 귀로 들린 말이야. 버튼을 누르고 한 말이 아니라서 너한테 한 말이 아닐 수도 있어 (혼잣말, 통화, 다른 사람, TV). "
+            f"대답할지 말지는 네가 정해. 대답하지 않기로 했으면 다른 말 없이 {QUIET_MARK} 한마디만 해.]")
+_EARS_ON = re.compile(r"(계속|버튼\s*(없이|안\s*누르고|누르지\s*않고)).{0,12}(듣고|들어|들을)|(열린\s*)?귀\s*(를|좀)?\s*(열어|켜)")
+_EARS_OFF = re.compile(r"(그만|이제)\s*.{0,6}(듣지|들어)|듣지\s*마|엿듣지|(열린\s*)?귀\s*(를|좀)?\s*(닫아|꺼)")
+
+def ears_from_text(text):
+    """사람 말에서 열린 귀를 켜라/끄라는 뜻을 읽는다: "on" | "off" | None. 끄라는 말이 먼저다 ("계속 듣지 마")."""
+    if _EARS_OFF.search(text or ""):
+        return "off"
+    if _EARS_ON.search(text or ""):
+        return "on"
+    return None
+
+def _first_or_quiet(src):
+    """열린 귀로 들은 말에 대한 답: 첫 문장이 QUIET_MARK 면(또는 아무 말도 없으면) None, 아니면 문장 이터레이터."""
+    first = next(src, None)
+    if first is None or QUIET_MARK.strip("()") in first:
+        if hasattr(src, "close"):
+            src.close()
+        return None
+    return itertools.chain([first], src)
+
+def handle_clip(client, pcm, ear=False):
     t0 = time.monotonic()
     turn = Turn("voice", t0)
+    if ear: turn.info["ear"] = True
     turn.info["clip_s"] = round(len(pcm) / 32000, 2)
     rms = speech_rms(pcm)
     turn.info["rms"] = int(rms)
@@ -1058,12 +1088,33 @@ def handle_clip(client, pcm):
         turn.info["path"] = "hook"; turn.done(client)
         return
     # 문장 완성 즉시 TTS→발행 (완전 스트리밍 파이프라인)
-    fast = try_fastpath(user) if user else None
+    want = ears_from_text(user) if user else None
+    note = ""
+    if want:                                               # 말로 켜고 끈다. 기기가 받아 저장하고 status 의 ears 로 알려 온다
+        client.publish(T_CMD, f"ears:{want}", qos=1)
+        print(f"  👂 열린 귀 {'켬' if want == 'on' else '끔'} (말로)")
+        note = f" [방금 이 말로 열린 귀를 {'켰어: 이제 버튼 없이도 들려' if want == 'on' else '껐어: 이제 버튼을 눌러야 들려'}.]"
+        ear = ear and want != "off"                        # 끄라는 말은 분명히 다이진에게 한 말이다
+    fast = try_fastpath(user) if user and not want else None
     if fast:
         turn.info["path"] = "fast"
         speak_stream(client, iter([fast]), t0, turn)
         return
-    src = brain_stream(user) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
+    if ear:
+        if not user:                                       # 못 알아들은 소리에 "다시 말해줄래?"라고 끼어들지 않는다
+            publish_no_reply(client)
+            turn.info["dropped"] = "ear_unclear"; turn.done(client)
+            return
+        src = _first_or_quiet(brain_stream(user + note + EAR_NOTE))
+        if src is None:
+            print("  🤫 열린 귀: 대답하지 않기로 함")
+            publish_no_reply(client)
+            turn.kind = "heard"                            # 들었지만 대화는 아니다: "얘기한 지 오래됐다"와 기분 계산에 대화로 세지 않는다
+            turn.info["path"] = "ear_quiet"; turn.done(client)
+            return
+        speak_stream(client, src, t0, turn)
+        return
+    src = brain_stream(user + note) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
     speak_stream(client, src, t0, turn)
 
 # 말하기 직전 치환 — 프롬프트로 안 고쳐지는 습관어. TTS가 "ack"를 "액"으로 읽어 "액바닷서"가 됨(2026-09-16).
@@ -1257,6 +1308,7 @@ def worker(client):
         kind, data = _clipq.get()
         try:
             if   kind == "pcm": handle_clip(client, data)
+            elif kind == "ear": handle_clip(client, data, ear=True)
             elif kind == "say": handle_say(client, data)
             elif kind == "ask": handle_ask(client, data)
         except Exception as e:
@@ -1286,7 +1338,7 @@ def on_message(client, userdata, msg):
     with _rx_lock:
         data = _rx_take(clip, seq, last, p)
     if data is not None:
-        _clipq.put(("pcm", data))
+        _clipq.put(("ear" if _rx.pop("ear", False) else "pcm", data))
 
 def _rx_take(clip, seq, last, p):
     """청크 하나를 재조립 버퍼에 넣는다 (_rx_lock 을 쥐고 부른다). 클립이 끝났으면 PCM 을, 아니면 None 을 돌려준다."""
@@ -1294,6 +1346,7 @@ def _rx_take(clip, seq, last, p):
         rx_abandon("다음 클립이 왔다")
         _rx["clip"], _rx["parts"] = clip, {}
         _rx["adpcm"] = bool(p[3] & 2)         # bit1 = ADPCM 압축 클립
+        _rx["ear"] = bool(p[3] & 4)           # bit2 = 열린 귀로 들은 클립 (버튼 없이 기기가 말소리를 듣고 스스로 보냈다)
     elif _rx["clip"] != clip:
         # 머리를 못 받은 클립의 청크 (버린 클립의 꼬리가 뒤늦게 왔거나, 브레인이 클립 중간에 떴다). 중간부터는 ADPCM 을 풀 수 없다.
         rx_abandon("다른 클립의 청크가 왔다")
