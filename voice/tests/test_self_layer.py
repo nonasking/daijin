@@ -687,6 +687,7 @@ class TestTalkMode(DbCase):
                          ("stt", lambda wav: (self.heard, -0.2)), ("try_fastpath", lambda t: None),
                          ("intercepted", lambda *a: False), ("pcm_to_wav", lambda pcm, wav: None)):
             orig = getattr(dm, name); setattr(dm, name, fn); self.addCleanup(setattr, dm, name, orig)
+        orig = hearing.speech; hearing.speech = lambda pcm: (None, None); self.addCleanup(setattr, hearing, "speech", orig)   # where the real models exist, zeros are "no speech"
         self.c = FakeClient()
 
     def _no_reply(self):
