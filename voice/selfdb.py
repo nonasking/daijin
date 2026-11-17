@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS persona_versions (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL, diff_summary TEXT,
   proposed_by TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notes (ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS voices (name TEXT PRIMARY KEY, ts INTEGER NOT NULL, model TEXT NOT NULL, n INTEGER NOT NULL, emb BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS threads (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
   due_ts INTEGER, importance INTEGER NOT NULL DEFAULT 5, sensitive INTEGER NOT NULL DEFAULT 0, source_episode INTEGER,
@@ -275,6 +276,21 @@ def threads_let_go(now, max_age_s, max_asks, grace_s):
     for r in rows:
         db().execute("UPDATE threads SET status='dropped', closed_ts=?, closed_note='놓음: 오래됐거나 물어도 소식이 없었다' WHERE id=?", (int(now), r["id"]))
     return [r["id"] for r in rows]
+
+# ---------- voices: 목소리 지문 (hearing.py) ----------
+def voice_get(name):
+    return db().execute("SELECT * FROM voices WHERE name=?", (name,)).fetchone()
+
+@_safe
+def voice_set(name, model, n, emb, ts=None):
+    db().execute("INSERT INTO voices(name,ts,model,n,emb) VALUES(?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET ts=excluded.ts, model=excluded.model, n=excluded.n, emb=excluded.emb",
+                 (name, int(ts or time.time()), model, int(n), emb))
+    return True
+
+@_safe
+def voice_forget(name):
+    db().execute("DELETE FROM voices WHERE name=?", (name,))
+    return True
 
 # ---------- persona ----------
 def persona_current():

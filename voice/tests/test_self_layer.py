@@ -736,6 +736,89 @@ class TestTalkMode(DbCase):
         self.assertIn("대화 모드 켜짐", dm.state_block(time.time()))
 
 
+import hearing               # noqa: E402
+
+
+try:
+    import numpy as _np                # the server has it (TTS needs it); a bare Python may not
+except ImportError:
+    _np = None
+
+
+@unittest.skipUnless(_np, "numpy is not installed")
+class TestHearing(DbCase):
+    """Is it speech, and whose voice. The models are faked here: what is tested is what the brain does with the numbers."""
+
+    def setUp(self):
+        super().setUp()
+        import numpy as np
+        self.np = np
+        self.said, self.asked = [], []
+        self.speech_s, self.emb = 3.0, np.array([1, 0, 0], dtype=np.float32)
+        self.dir = tempfile.mkdtemp(); self.addCleanup(__import__("shutil").rmtree, self.dir, True)
+        def fake_brain(text):
+            self.asked.append(text)
+            yield "응."
+        def fake_speak(client, src, t0, turn=None):
+            self.said.extend(src)
+            if turn:
+                turn.text_out = " ".join(self.said); self.turn = turn; turn.done(client)
+        for mod, name, fn in ((dm, "brain_stream", fake_brain), (dm, "speak_stream", fake_speak), (dm, "speech_rms", lambda pcm: 900),
+                              (dm, "stt", lambda wav: (self.heard, -0.2)), (dm, "try_fastpath", lambda t: None),
+                              (dm, "intercepted", lambda *a: False), (dm, "pcm_to_wav", lambda pcm, wav: None),
+                              (hearing, "speech", lambda pcm: (self.speech_s, "voiced")), (hearing, "embed", lambda s: self.emb),
+                              (hearing, "PRINT_DIR", self.dir)):
+            orig = getattr(mod, name); setattr(mod, name, fn); self.addCleanup(setattr, mod, name, orig)
+        hearing._enroll.update(left=0, embs=[]); self.addCleanup(hearing._enroll.update, left=0, embs=[])
+        self.c = FakeClient(); self.heard = "오늘 날씨 어때"
+
+    def test_talk_mode_noise_is_dropped_before_recognition_but_a_button_clip_is_not(self):
+        self.speech_s = 0.1
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual((self.asked, self.said), ([], []))
+        self.assertEqual(len([p for t, p in self.c.out if t == dm.T_AUDIO_OUT and len(p) == 4]), 1)
+        dm.handle_clip(self.c, b"\0" * 64000)                                                 # pressed on purpose: let recognition decide
+        self.assertEqual(self.asked, ["오늘 날씨 어때"])
+
+    def test_without_the_models_everything_runs_as_before(self):
+        hearing.speech = lambda pcm: (None, None)
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual(self.said, ["응."]); self.assertNotIn("voice", self.turn.info); self.assertNotIn("speech_s", self.turn.info)
+
+    def test_reading_the_wish_to_be_known_by_voice(self):
+        for s in ("내 목소리 기억해 줘", "내 목소리를 등록해", "제 목소리 좀 익혀 둬"):
+            self.assertEqual(dm.voice_from_text(s), "enroll", s)
+        self.assertEqual(dm.voice_from_text("내 목소리 잊어 줘"), "forget")
+        self.assertIsNone(dm.voice_from_text("목소리가 좀 쉬었어"))
+
+    def test_five_button_clips_become_the_voiceprint_and_then_clips_are_scored_not_acted_on(self):
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertNotIn("voice", self.turn.info)                                              # nobody is known yet
+        self.heard = "내 목소리 기억해 줘"
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertIn("목소리 익히기를 시작했어", self.asked[-1]); self.assertTrue(hearing.enrolling())
+        self.heard = "응"; self.speech_s = 0.8
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertIn("너무 짧아서", self.asked[-1])
+        self.heard = "오늘은 이런 일이 있었어"; self.speech_s = 3.0
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)                                       # talk mode does not count: who spoke is unknown
+        self.assertNotIn("익히는 중", self.asked[-1])
+        for k in range(hearing.ENROLL_CLIPS):
+            dm.handle_clip(self.c, b"\1" * 64000)
+        self.assertIn("다 익혔어", self.asked[-1]); self.assertFalse(hearing.enrolling())
+        self.assertEqual(len(os.listdir(self.dir)), hearing.ENROLL_CLIPS)
+        self.assertEqual(selfdb.voice_get("me")["n"], hearing.ENROLL_CLIPS)
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)                                       # the same voice
+        self.assertEqual(self.turn.info["voice"], 1.0); self.assertEqual(self.asked[-1], "오늘은 이런 일이 있었어")
+        self.emb = self.np.array([0, 1, 0], dtype=self.np.float32)                             # someone else, or the TV
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual(self.turn.info["voice"], 0.0); self.assertEqual(self.said[-1], "응.")  # measured, still answered
+        self.assertIn("대화 모드: 2개", hearing.report())
+        self.heard = "내 목소리 잊어 줘"
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertIsNone(selfdb.voice_get("me")); self.assertEqual(os.listdir(self.dir), [])
+
+
 import solo                  # noqa: E402
 
 

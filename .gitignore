@@ -45,3 +45,6 @@ voice/.vadlab/
 # 브로커 이전 때 남긴 옛 비밀 사본 (비밀번호 들어 있음)
 secrets.local.txt.bak-*
 **/secrets.h.bak-*
+
+# 등록한 목소리 녹음 (hearing.py)
+voice/voiceprint/

@@ -28,7 +28,7 @@ except ImportError:
 from daijin_common import VOICE, T_AUDIO_IN, sec, load_hooks, cloud_client, connect_with_retry, broker
 from nodes import NODES, spoken, spellings
 import selfdb
-import local_mind, fastpath, mood
+import local_mind, fastpath, mood, hearing
 
 HOME    = os.path.expanduser("~")
 # 헬퍼 스크립트(dev.sh 등)가 쓸 파이썬 = 브레인을 띄운 이 파이썬 (paho 가 깔려 있는 것). 에이전트의 셸과 local_hooks 가 물려받는다.
@@ -1036,6 +1036,17 @@ T_CMD = "daijin/cmd"
 _TALK_OFF = re.compile(r"대화\s*모드\s*(를|좀|는|은)?\s*(꺼|끄|끝|종료|그만|해제)|대화\s*(는|를)?\s*(끝|그만)|(그만|이제\s*그만)\s*(얘기|이야기|대화)|(얘기|이야기)\s*(는)?\s*(그만|끝)")
 _TALK_ON = re.compile(r"대화\s*모드|(얘기|이야기|대화)\s*(좀)?\s*(하자|할까|할래)|버튼\s*(없이|안\s*누르고|누르지\s*않고)")
 
+_VOICE_FORGET = re.compile(r"(내|제)\s*목소리\s*(를|는|좀)?\s*(잊어|지워|삭제)")
+_VOICE_ENROLL = re.compile(r"(내|제)\s*목소리\s*(를|좀)?\s*(등록|기억|익혀|외워|알아\s*둬|배워)")
+
+def voice_from_text(text):
+    """사람 말에서 목소리를 익히라/잊으라는 뜻을 읽는다: "enroll" | "forget" | None."""
+    if _VOICE_FORGET.search(text or ""):
+        return "forget"
+    if _VOICE_ENROLL.search(text or ""):
+        return "enroll"
+    return None
+
 def talk_from_text(text):
     """사람 말에서 대화 모드를 켜라/끄라는 뜻을 읽는다: "on" | "off" | None. 끄라는 말이 먼저다 ("대화 모드 꺼 줘")."""
     if _TALK_OFF.search(text or ""):
@@ -1056,6 +1067,25 @@ def handle_clip(client, pcm, ear=False):
         publish_no_reply(client)
         turn.info["dropped"] = "silence"; turn.done(client)
         return
+    # 말소리의 양과 목소리 닮음 (hearing.py). 기기는 소리 크기만 보므로, 대화 모드가 주운 클립에 말소리가 거의 없으면 여기서 버린다.
+    speech_s, voiced = hearing.speech(pcm)
+    if speech_s is not None:
+        turn.info["speech_s"] = speech_s
+        if ear and speech_s < hearing.MIN_SPEECH_S:
+            print(f"  🔇 말소리 {speech_s}초 (< {hearing.MIN_SPEECH_S}) → 소음으로 보고 무시")
+            publish_no_reply(client)
+            turn.info["dropped"] = "no_speech"; turn.done(client)
+            return
+        if not hearing.enrolling():                        # 닮음 점수는 재 보기만 한다: 답을 기다리게 하지 않도록 배경에서
+            box = []
+            def _score():
+                try:
+                    s = hearing.score(voiced)
+                    if s is not None: box.append(s)
+                except Exception as e:
+                    print(f"  (목소리 닮음 재기 실패: {e!r})")
+            th = threading.Thread(target=_score, daemon=True); th.start()
+            turn.voice_job = (th, box)
     with tempfile.TemporaryDirectory() as d:
         wav = f"{d}/clip.wav"
         pcm_to_wav(pcm, wav)
@@ -1084,6 +1114,24 @@ def handle_clip(client, pcm, ear=False):
         note = f" [방금 이 말로 대화 모드를 {'켰어: 이제 버튼 없이 주고받아' if want == 'on' else '껐어: 이제 버튼을 눌러야 들려'}.]"
     else:
         want = None
+    # 목소리 익히기: "내 목소리 기억해" 뒤로, 버튼을 누르고 한 말 몇 개가 지문이 된다 (버튼을 누른 사람이 그 사람이다)
+    vcmd = voice_from_text(user) if user else None
+    if vcmd == "enroll" and speech_s is not None:
+        hearing.enroll_start(); want = want or "voice"
+        note += (f" [방금 이 말로 목소리 익히기를 시작했어. 앞으로 버튼을 누르고 하는 말 {hearing.ENROLL_CLIPS}번이 이 사람의 목소리로 남아. "
+                 "대화 모드 말고 버튼을 누르고, 평소처럼 두세 문장씩 말해 달라고 알려 줘.]")
+    elif vcmd == "enroll":
+        note += " [목소리를 익히는 기능이 지금 서버에 준비돼 있지 않아. 그렇다고 말해 줘.]"
+    elif vcmd == "forget":
+        hearing.forget(); want = want or "voice"
+        note += " [방금 이 말로 익혀 둔 목소리를 지웠어.]"
+    elif hearing.enrolling() and not ear and user:
+        st, left = hearing.enroll_add(pcm, voiced, speech_s)
+        note += {"more": f" [목소리 익히는 중: {hearing.ENROLL_CLIPS - left}번째를 들었어, {left}번 남았어.]",
+                 "done": " [이 사람 목소리를 다 익혔어. 이제부터 들리는 말이 이 목소리와 얼마나 닮았는지 재 볼 거야 (아직은 재 보기만 해).]",
+                 "short": f" [목소리 익히는 중인데 방금 말은 너무 짧아서 못 썼어. 조금 더 길게 말해 달라고 해. {left}번 남았어.]",
+                 "failed": " [목소리 익히기가 방금 실패했어. 그렇다고 말해 줘.]"}[st]
+        print(f"  🎙️ 목소리 익히기: {st}, 남은 {left}")
     fast = try_fastpath(user) if user and not want else None
     if fast:
         turn.info["path"] = "fast"
@@ -1218,12 +1266,16 @@ class Turn:
         self.kind, self.t0 = kind, (time.monotonic() if t0 is None else t0)
         self.marks, self.info = {}, {}
         self.text_in, self.text_out = None, None   # selfdb.episodes 에 남길 들린 말·한 말
+        self.voice_job = None                      # 배경에서 재는 목소리 닮음 (hearing.score). done 이 기다렸다가 info["voice"] 에 넣는다
     def mark(self, name):
         self.marks.setdefault(name, round(time.monotonic() - self.t0, 2))
     def done(self, client):
         global _turns
         _turns += 1
         self.mark("done")
+        if self.voice_job is not None:
+            self.voice_job[0].join(timeout=3)
+            if self.voice_job[1]: self.info["voice"] = self.voice_job[1][0]
         d = {"kind": self.kind, **self.info, **self.marks, "ts": int(time.time())}
         line = json.dumps(d, ensure_ascii=False)
         print(f"  ⏱ turn {line}")
