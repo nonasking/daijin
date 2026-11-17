@@ -21,6 +21,11 @@ class DbCase(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.dir, True)
         selfdb.use(os.path.join(self.dir, "t.db"))
         self.addCleanup(selfdb.use, None)
+        # Tests must not depend on whether this machine has the hearing models (the server does, a laptop may not):
+        # by default nothing can be heard; TestHearing puts fakes in.
+        import hearing as _h
+        for name, fn in (("available", lambda: False), ("speech", lambda pcm: (None, None))):
+            self.addCleanup(setattr, _h, name, getattr(_h, name)); setattr(_h, name, fn)
 
 
 class TestSchema(DbCase):
@@ -768,7 +773,7 @@ class TestHearing(DbCase):
                               (dm, "stt", lambda wav: (self.heard, -0.2)), (dm, "try_fastpath", lambda t: None),
                               (dm, "intercepted", lambda *a: False), (dm, "pcm_to_wav", lambda pcm, wav: None),
                               (hearing, "speech", lambda pcm: (self.speech_s, "voiced")), (hearing, "embed", lambda s: self.emb),
-                              (hearing, "PRINT_DIR", self.dir)):
+                              (hearing, "PRINT_DIR", self.dir), (hearing, "available", lambda: True)):
             orig = getattr(mod, name); setattr(mod, name, fn); self.addCleanup(setattr, mod, name, orig)
         hearing._enroll.update(left=0, embs=[]); self.addCleanup(hearing._enroll.update, left=0, embs=[])
         self.c = FakeClient(); self.heard = "오늘 날씨 어때"
@@ -787,10 +792,12 @@ class TestHearing(DbCase):
         self.assertEqual(self.said, ["응."]); self.assertNotIn("voice", self.turn.info); self.assertNotIn("speech_s", self.turn.info)
 
     def test_reading_the_wish_to_be_known_by_voice(self):
-        for s in ("내 목소리 기억해 줘", "내 목소리를 등록해", "제 목소리 좀 익혀 둬"):
+        for s in ("내 목소리 기억해 줘", "내 목소리를 등록해", "제 목소리 좀 익혀 둬", "이게 내 목소리야. 기억해줘, 다이진."):
             self.assertEqual(dm.voice_from_text(s), "enroll", s)
         self.assertEqual(dm.voice_from_text("내 목소리 잊어 줘"), "forget")
-        self.assertIsNone(dm.voice_from_text("목소리가 좀 쉬었어"))
+        for s in ("목소리가 좀 쉬었어", "그 목소리 기억나", "목소리 기억 내용이야. 그 뒤로 몇 번 더 대화하면 아마 기억하게 될 거야."):
+            self.assertIsNone(dm.voice_from_text(s), s)
+        self.assertIn("목소리를 익힐 수 있어", dm.state_block(time.time()))
 
     def test_five_button_clips_become_the_voiceprint_and_then_clips_are_scored_not_acted_on(self):
         dm.handle_clip(self.c, b"\0" * 64000)
@@ -802,9 +809,14 @@ class TestHearing(DbCase):
         dm.handle_clip(self.c, b"\0" * 64000)
         self.assertIn("너무 짧아서", self.asked[-1])
         self.heard = "오늘은 이런 일이 있었어"; self.speech_s = 3.0
-        dm.handle_clip(self.c, b"\0" * 64000, ear=True)                                       # talk mode does not count: who spoke is unknown
-        self.assertNotIn("익히는 중", self.asked[-1])
-        for k in range(hearing.ENROLL_CLIPS):
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)                                       # talk mode counts too: that is where people say it
+        self.assertIn("1번째를 들었어", self.asked[-1])
+        mine, self.emb = self.emb, self.np.array([0, 1, 0], dtype=self.np.float32)
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)                                       # the TV cuts in: not this voice
+        self.assertIn("앞서 들은 목소리와 달라서", self.asked[-1])
+        self.emb = mine
+        self.assertIn("목소리를 익히는 중", dm.state_block(time.time()))
+        for k in range(hearing.ENROLL_CLIPS - 1):
             dm.handle_clip(self.c, b"\1" * 64000)
         self.assertIn("다 익혔어", self.asked[-1]); self.assertFalse(hearing.enrolling())
         self.assertEqual(len(os.listdir(self.dir)), hearing.ENROLL_CLIPS)

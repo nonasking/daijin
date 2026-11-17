@@ -25,6 +25,7 @@ PRINT_DIR = os.path.join(VOICE, "voiceprint")
 ME = "me"                              # 지금은 한 사람만 등록한다
 ENROLL_CLIPS = 5                       # 지문 하나에 쓰는 말의 수
 ENROLL_MIN_SPEECH_S = 2.0              # 이보다 짧은 말은 지문에 넣지 않는다
+ENROLL_MIN_SIM = 0.35                  # 익히는 중에 앞서 들은 목소리와 이만큼도 안 닮은 말은 다른 소리(TV, 다른 사람)로 보고 넣지 않는다
 MIN_SPEECH_S = 0.4                     # 대화 모드: 말소리가 이보다 적으면 말이 아니다
 _lock = threading.Lock()               # sherpa 객체는 스레드 하나씩만 쓴다 (턴 스레드와 배경 채점이 겹칠 수 있다)
 _vad = _ext = None
@@ -66,6 +67,18 @@ def _load(kind):
         _failed.add(kind)
         print(f"  (hearing: {kind} 를 쓸 수 없다 → 예전처럼 돈다: {e!r})")
         return None
+
+_avail = None
+def available():
+    """이 설치본이 들을 준비가 됐나 (sherpa-onnx 와 두 모델). 한 번만 확인한다."""
+    global _avail
+    if _avail is None:
+        try:
+            import sherpa_onnx  # noqa: F401
+            _avail = os.path.exists(VAD_MODEL) and os.path.exists(speaker_model())
+        except ImportError:
+            _avail = False
+    return _avail
 
 def speech(pcm):
     """클립에서 말소리만: (말소리 초, 말소리 PCM float 배열). VAD 를 쓸 수 없으면 (None, None)."""
@@ -130,7 +143,7 @@ def _save_print(embs, name=ME):
     m = (m / np.linalg.norm(m)).astype(np.float32)
     selfdb.voice_set(name, os.path.basename(speaker_model()), len(embs), m.tobytes())
 
-# ---------- 등록: 버튼을 누르고 한 말 ENROLL_CLIPS 개 ----------
+# ---------- 등록: "내 목소리 기억해" 뒤에 이어진 말 ENROLL_CLIPS 개 ----------
 _enroll = {"left": 0, "embs": []}
 
 def enroll_start():
@@ -144,12 +157,19 @@ def enrolling():
     return _enroll["left"] > 0
 
 def enroll_add(pcm, samples, speech_s):
-    """등록 중에 온 버튼 클립 하나. 돌려주는 값: ("short"|"failed"|"more"|"done", 남은 수)."""
+    """등록 중에 온 클립 하나. 돌려주는 값: ("short"|"failed"|"other"|"more"|"done", 남은 수).
+    대화 모드 클립도 받는다 (2026-11-17: 처음엔 버튼 클립만 받았는데, 사람은 대화 모드에서 "내 목소리 기억해"라고 하고 그대로 말을 이었다).
+    대신 앞서 들은 목소리들과 닮지 않은 말은 넣지 않는다: 익히는 도중에 끼어든 TV 나 다른 사람을 막는다."""
     if speech_s is None or speech_s < ENROLL_MIN_SPEECH_S:
         return "short", _enroll["left"]
     e = embed(samples)
     if e is None:
         return "failed", _enroll["left"]
+    if _enroll["embs"]:
+        import numpy as np
+        m = np.mean(np.stack(_enroll["embs"]), axis=0)
+        if float(e @ (m / np.linalg.norm(m))) < ENROLL_MIN_SIM:
+            return "other", _enroll["left"]
     _enroll["embs"].append(e); _enroll["left"] -= 1
     k = ENROLL_CLIPS - _enroll["left"]
     with open(os.path.join(PRINT_DIR, f"{ME}-{k}.pcm"), "wb") as f:      # 원래 클립 그대로 (16kHz 16비트 모노)

@@ -198,6 +198,14 @@ def state_block(now=None):
             parts.append("아직 뒷이야기를 못 들은 일 (물을지, 언제 어떻게 물을지는 네가 정해): " + " · ".join(x[:80] for x in theirs))
         if mine:
             parts.append("내가 하기로 한 일: " + " · ".join(x[:80] for x in mine))
+        if not hearing.available():
+            pass
+        elif hearing.enrolling():
+            parts.append("목소리를 익히는 중이야")
+        elif selfdb.voice_get(hearing.ME):
+            parts.append("이 사람의 목소리를 익혀 뒀어 (닮았는지 재 보는 중, 아직 누구 말인지 구분해 주지는 않아)")
+        else:
+            parts.append("목소리를 익힐 수 있어: 사람이 '내 목소리 기억해 줘'라고 하면 이어지는 말 몇 번으로 익혀 (아직 익힌 목소리 없음)")
         cur = selfdb.persona_current()
         if cur:
             parts.append("나에 대해: " + cur["text"].replace("\n", " ")[:300])
@@ -1036,8 +1044,9 @@ T_CMD = "daijin/cmd"
 _TALK_OFF = re.compile(r"대화\s*모드\s*(를|좀|는|은)?\s*(꺼|끄|끝|종료|그만|해제)|대화\s*(는|를)?\s*(끝|그만)|(그만|이제\s*그만)\s*(얘기|이야기|대화)|(얘기|이야기)\s*(는)?\s*(그만|끝)")
 _TALK_ON = re.compile(r"대화\s*모드|(얘기|이야기|대화)\s*(좀)?\s*(하자|할까|할래)|버튼\s*(없이|안\s*누르고|누르지\s*않고)")
 
-_VOICE_FORGET = re.compile(r"(내|제)\s*목소리\s*(를|는|좀)?\s*(잊어|지워|삭제)")
-_VOICE_ENROLL = re.compile(r"(내|제)\s*목소리\s*(를|좀)?\s*(등록|기억|익혀|외워|알아\s*둬|배워)")
+_VOICE_FORGET = re.compile(r"목소리[^.?!]{0,8}[.?!]?\s*.{0,6}(잊어|지워|삭제)")
+# "내 목소리 기억해 줘" 만이 아니라 "이게 내 목소리야. 기억해줘"도 (2026-11-17: 첫 등록 시도가 이 말이어서 놓쳤다). 지난 일을 말하는 "기억했어/기억나"는 아니다.
+_VOICE_ENROLL = re.compile(r"목소리[^.?!]{0,8}[.?!]?\s*.{0,6}(등록해|등록\s*좀|기억해|기억\s*좀|익혀|외워|알아\s*둬|배워)")
 
 def voice_from_text(text):
     """사람 말에서 목소리를 익히라/잊으라는 뜻을 읽는다: "enroll" | "forget" | None."""
@@ -1118,18 +1127,19 @@ def handle_clip(client, pcm, ear=False):
     vcmd = voice_from_text(user) if user else None
     if vcmd == "enroll" and speech_s is not None:
         hearing.enroll_start(); want = want or "voice"
-        note += (f" [방금 이 말로 목소리 익히기를 시작했어. 앞으로 버튼을 누르고 하는 말 {hearing.ENROLL_CLIPS}번이 이 사람의 목소리로 남아. "
-                 "대화 모드 말고 버튼을 누르고, 평소처럼 두세 문장씩 말해 달라고 알려 줘.]")
+        note += (f" [방금 이 말로 목소리 익히기를 시작했어. 이어지는 말 {hearing.ENROLL_CLIPS}번이 이 사람의 목소리로 남아. "
+                 "평소처럼 두세 문장씩 말해 달라고 알려 줘.]")
     elif vcmd == "enroll":
         note += " [목소리를 익히는 기능이 지금 서버에 준비돼 있지 않아. 그렇다고 말해 줘.]"
     elif vcmd == "forget":
         hearing.forget(); want = want or "voice"
         note += " [방금 이 말로 익혀 둔 목소리를 지웠어.]"
-    elif hearing.enrolling() and not ear and user:
+    elif hearing.enrolling() and user:
         st, left = hearing.enroll_add(pcm, voiced, speech_s)
         note += {"more": f" [목소리 익히는 중: {hearing.ENROLL_CLIPS - left}번째를 들었어, {left}번 남았어.]",
                  "done": " [이 사람 목소리를 다 익혔어. 이제부터 들리는 말이 이 목소리와 얼마나 닮았는지 재 볼 거야 (아직은 재 보기만 해).]",
                  "short": f" [목소리 익히는 중인데 방금 말은 너무 짧아서 못 썼어. 조금 더 길게 말해 달라고 해. {left}번 남았어.]",
+                 "other": f" [목소리 익히는 중인데 방금 말은 앞서 들은 목소리와 달라서 넣지 않았어 (다른 사람이거나 TV 일 수 있어). {left}번 남았어.]",
                  "failed": " [목소리 익히기가 방금 실패했어. 그렇다고 말해 줘.]"}[st]
         print(f"  🎙️ 목소리 익히기: {st}, 남은 {left}")
     fast = try_fastpath(user) if user and not want else None
