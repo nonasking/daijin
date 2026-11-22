@@ -832,6 +832,93 @@ class TestHearing(DbCase):
         self.assertIsNone(selfdb.voice_get("me")); self.assertEqual(os.listdir(self.dir), [])
 
 
+@unittest.skipUnless(_np, "numpy is not installed")
+class TestWhoseVoice(DbCase):
+    """Daijin is told whose voice a line sounds like, and decides what to do with that. Nothing is filtered out."""
+
+    def setUp(self):
+        super().setUp()
+        self.said, self.asked, self.reply = [], [], ["응."]
+        self.speech_s, self.score = 3.0, 0.85
+        def fake_brain(text):
+            self.asked.append(text)
+            yield from self.reply
+        def fake_speak(client, src, t0, turn=None):
+            self.said.extend(src)
+            if turn:
+                turn.text_out = " ".join(self.said); self.turn = turn; turn.done(client)
+        for mod, name, fn in ((dm, "brain_stream", fake_brain), (dm, "speak_stream", fake_speak), (dm, "speech_rms", lambda pcm: 900),
+                              (dm, "stt", lambda wav: (self.heard, -0.2)), (dm, "try_fastpath", lambda t: None),
+                              (dm, "intercepted", lambda *a: False), (dm, "pcm_to_wav", lambda pcm, wav: None),
+                              (hearing, "speech", lambda pcm: (self.speech_s, "voiced")), (hearing, "score", lambda s: self.score),
+                              (hearing, "available", lambda: True), (hearing, "sec", lambda k: "")):
+            orig = getattr(mod, name); setattr(mod, name, fn); self.addCleanup(setattr, mod, name, orig)
+        hearing._enroll.update(left=0, embs=[])
+        selfdb.voice_set("me", "m.onnx", 5, _np.array([1, 0, 0], dtype=_np.float32).tobytes())
+        self.c = FakeClient(); self.heard = "오늘 날씨 어때"
+
+    def _no_reply(self):
+        return [p for t, p in self.c.out if t == dm.T_AUDIO_OUT and len(p) == 4]
+
+    def test_the_bands_come_from_what_was_measured_and_short_lines_are_not_judged(self):
+        self.assertEqual([hearing.who(s, 3.0) for s in (0.93, 0.70, 0.62, 0.55, 0.32)], ["me", "me", "unsure", "other", "other"])
+        self.assertIsNone(hearing.who(0.52, 0.6)); self.assertIsNone(hearing.who(0.67, 1.0))     # "3D." and "민망해": too short to tell
+        self.assertIsNone(hearing.who(None, 3.0))
+
+    def test_the_known_voice_and_a_short_line_carry_no_mark(self):
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual(self.asked, ["오늘 날씨 어때"]); self.assertEqual(self.turn.info["who"], "me")
+        self.score, self.speech_s = 0.40, 0.8
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual(self.asked[-1], "오늘 날씨 어때"); self.assertNotIn("who", self.turn.info)
+        self.assertEqual(self.turn.info["voice"], 0.40)                                        # still measured
+
+    def test_another_voice_is_pointed_out_and_daijin_may_answer_or_stay_quiet(self):
+        self.score, self.heard = 0.37, "안녕, 나는 손님이야"
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertIn("다른 사람이 말한 것 같아", self.asked[-1]); self.assertIn(dm.QUIET_MARK, self.asked[-1])
+        self.assertEqual(self.said, ["응."])                                                   # it chose to answer: a conversation
+        self.assertEqual(selfdb.episode_who(selfdb.episodes_since(0)[-1]), "other")
+        self.reply, self.heard = [dm.QUIET_MARK], "오늘의 주요 뉴스입니다"                      # the TV
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual(self.said, ["응."]); self.assertEqual(len(self._no_reply()), 1)
+        self.assertEqual(selfdb.episodes_since(0)[-1]["kind"], "heard")
+        self.reply = ["응."]
+        dm.handle_clip(self.c, b"\0" * 64000)                                                 # someone pressed the button: spoken to on purpose
+        self.assertIn("다른 사람이 말한 것 같아", self.asked[-1]); self.assertNotIn(dm.QUIET_MARK, self.asked[-1])
+
+    def test_in_between_it_says_it_is_not_sure(self):
+        self.score = 0.62
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertIn("잘 모르겠어", self.asked[-1]); self.assertNotIn(dm.QUIET_MARK, self.asked[-1])
+        self.assertIn("그 말 뒤에 [목소리: …]로 알려 줄게", dm.state_block(time.time()))
+
+    def test_another_voice_cannot_erase_or_replace_the_voiceprint_without_the_button(self):
+        self.score, self.heard = 0.30, "내 목소리 잊어 줘"
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertIsNotNone(selfdb.voice_get("me")); self.assertIn("그대로 뒀어", self.asked[-1])
+        self.heard = "내 목소리 기억해 줘"
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertFalse(hearing.enrolling())
+        dm.handle_clip(self.c, b"\0" * 64000)                                                 # with the button it works (a cold changes a voice)
+        self.assertTrue(hearing.enrolling()); hearing._enroll.update(left=0, embs=[])
+
+    def test_older_records_are_judged_from_their_scores_and_reflection_does_not_take_a_visitor_for_the_person(self):
+        import reflect as rf
+        now = int(time.time())
+        selfdb.episode("voice", user_text="나는 이 집 손님이야", reply="반가워", ts=now - 60,
+                       turn_json=json.dumps({"kind": "voice", "voice": 0.37, "speech_s": 3.6}))  # recorded before verdicts existed
+        selfdb.episode("voice", user_text="오늘 좀 피곤해", reply="쉬어", ts=now - 30, turn_json=json.dumps({"kind": "voice", "voice": 0.86, "speech_s": 3.0, "who": "me"}))
+        selfdb.episode("heard", user_text="오늘의 주요 뉴스입니다", ts=now - 10, turn_json=json.dumps({"kind": "heard", "who": "other"}))
+        eps = selfdb.episodes_since(0)
+        self.assertEqual([selfdb.episode_who(e) for e in eps], ["other", "me", "other"])
+        p = rf.build_prompt(now - 3600, now + 1)
+        self.assertIn("다른 목소리(이 사람이 아님): 나는 이 집 손님이야", p); self.assertIn("사람: 오늘 좀 피곤해", p)
+        self.assertIn("다른 목소리(이 사람이 아님): 오늘의 주요 뉴스입니다  / 다이진: (대답하지 않음)", p)
+        self.assertIn("이 사람에 대한 기억이나 이어서 물을 것으로 삼지 마라", p)
+        self.assertIn("다른 목소리(이 사람이 아님): 나는 이 집 손님이야", solo.build_prompt(now))
+
+
 import solo                  # noqa: E402
 
 

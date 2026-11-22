@@ -4,8 +4,11 @@
 #      대화 모드에서 말소리가 거의 없는 클립은 음성 인식 전에 버린다 (daijin_mqtt.handle_clip).
 #      TV 와 라디오는 못 거른다: 그것도 사람 말소리다. 그건 2) 가 가늠한다.
 #   2) 목소리 닮음 (화자 임베딩): 등록해 둔 목소리와 클립이 얼마나 닮았나 (코사인, -1~1).
-#      지금은 재 보기만 한다 (2026-11-17): 점수를 턴 기록에 남길 뿐 동작은 바꾸지 않는다. 내 말과 TV·다른 사람 말의 점수가
-#      실제로 갈리는지 본 뒤에 다이진에게 알려 줄지 정한다. 짧은 말(2초 아래)은 점수가 흔들린다: 그래서 말소리 길이도 같이 남긴다.
+#      닷새 재 본 결과 (2026-11-17~22, 대화 모드 67개): 주인의 말 60개는 0.61~0.93 (대부분 0.8대), 다녀간 사람의 말 7개는 0.32~0.52.
+#      겹치지 않았다. 주인의 말이 0.70 아래로 내려간 4개 중 3개는 말소리 1초 안팎이었다: 짧은 말은 양쪽 다 가운데로 몰린다.
+#      그래서 who() 가 가늠한다: 0.70 이상 = 그 사람, 0.55 이하 = 다른 사람, 사이 = 모름, 말소리 1.5초 미만 = 가늠하지 않음.
+#      걸러내지는 않는다. 누구 목소리 같은지 다이진에게 알려 줄 뿐이고, 어떻게 대할지는 다이진이 정한다 (daijin_mqtt.handle_clip).
+#      다른 목소리 표본이 한 사람뿐이고 TV 는 아직 재 보지 못했다: 문턱은 secrets 의 VOICE_ME_AT / VOICE_OTHER_AT 로 옮길 수 있다.
 # 둘 다 sherpa-onnx 로 돈다 (서버 venv: pip install sherpa-onnx). 모델은 voice/models/ 에 직접 받는다 (install 은 이 파일 맨 아래 명령).
 # sherpa-onnx 나 모델이 없으면 전부 None 을 돌려주고 브레인은 예전처럼 돈다.
 # 목소리 지문은 selfdb 의 voices 표에 (임베딩 평균), 등록에 쓴 녹음은 voice/voiceprint/ 에 남는다 (모델을 바꾸면 다시 계산하려고. git 에 안 들어간다).
@@ -26,6 +29,8 @@ ME = "me"                              # 지금은 한 사람만 등록한다
 ENROLL_CLIPS = 5                       # 지문 하나에 쓰는 말의 수
 ENROLL_MIN_SPEECH_S = 2.0              # 이보다 짧은 말은 지문에 넣지 않는다
 ENROLL_MIN_SIM = 0.35                  # 익히는 중에 앞서 들은 목소리와 이만큼도 안 닮은 말은 다른 소리(TV, 다른 사람)로 보고 넣지 않는다
+ME_AT, OTHER_AT = 0.70, 0.55           # 닮음이 이 이상이면 그 사람, 이 이하면 다른 사람 (사이는 모름)
+WHO_MIN_SPEECH_S = 1.5                 # 이보다 짧은 말은 누구 목소리인지 가늠하지 않는다
 MIN_SPEECH_S = 0.4                     # 대화 모드: 말소리가 이보다 적으면 말이 아니다
 _lock = threading.Lock()               # sherpa 객체는 스레드 하나씩만 쓴다 (턴 스레드와 배경 채점이 겹칠 수 있다)
 _vad = _ext = None
@@ -136,6 +141,20 @@ def score(samples, name=ME):
     if e is None or len(e) != len(vp):
         return None
     return round(float(e @ vp), 3)
+
+def _th(key, default):
+    try:
+        return float(sec(key) or default)
+    except ValueError:
+        return default
+
+def who(score_, speech_s):
+    """닮음 점수와 말소리 길이로 누구 목소리 같은지: "me" | "other" | "unsure" | None(가늠하지 않음: 지문이 없거나 말이 너무 짧다)."""
+    if score_ is None or speech_s is None or speech_s < WHO_MIN_SPEECH_S:
+        return None
+    if score_ >= _th("VOICE_ME_AT", ME_AT):
+        return "me"
+    return "other" if score_ <= _th("VOICE_OTHER_AT", OTHER_AT) else "unsure"
 
 def _save_print(embs, name=ME):
     import numpy as np

@@ -15,7 +15,7 @@
 # - 서비스 내성: 초기 브로커 연결 실패 시 재시도 루프, 런타임 끊김은 paho 자동 재접속 (daijin_common).
 
 import subprocess, re, os, sys, time, json, threading, queue, shutil, socket, uuid, types, pathlib
-import array, asyncio, math, tempfile
+import array, asyncio, itertools, math, tempfile
 import urllib.request, urllib.parse
 try:
     import edge_tts                    # pip install edge-tts. 없으면 edge 엔진만 못 쓰고 다음 엔진으로 넘어간다
@@ -203,7 +203,7 @@ def state_block(now=None):
         elif hearing.enrolling():
             parts.append("목소리를 익히는 중이야")
         elif selfdb.voice_get(hearing.ME):
-            parts.append("이 사람의 목소리를 익혀 뒀어 (닮았는지 재 보는 중, 아직 누구 말인지 구분해 주지는 않아)")
+            parts.append("이 사람의 목소리를 익혀 뒀어: 다른 사람 목소리 같거나 잘 모르겠으면 그 말 뒤에 [목소리: …]로 알려 줄게 (표시가 없으면 이 사람이거나 너무 짧은 말)")
         else:
             parts.append("목소리를 익힐 수 있어: 사람이 '내 목소리 기억해 줘'라고 하면 이어지는 말 몇 번으로 익혀 (아직 익힌 목소리 없음)")
         cur = selfdb.persona_current()
@@ -1056,6 +1056,22 @@ def voice_from_text(text):
         return "enroll"
     return None
 
+# 누구 목소리 같은지 (hearing.who). 걸러내지 않고 알려 준다: 어떻게 대할지는 다이진이 정한다.
+# 표시가 없는 말은 익혀 둔 목소리이거나, 너무 짧아서 가늠하지 않은 말이다.
+QUIET_MARK = "(가만히)"
+VOICE_OTHER_NOTE = " [목소리: 익혀 둔 사람의 목소리와 달라. 다른 사람이 말한 것 같아 (TV 나 영상 소리일 수도 있어). 어떻게 대할지는 네가 정해.]"
+VOICE_QUIET_NOTE = f" [대답하지 않기로 했으면 다른 말 없이 {QUIET_MARK} 한마디만 해.]"
+VOICE_UNSURE_NOTE = " [목소리: 익혀 둔 사람의 목소리인지 잘 모르겠어.]"
+
+def _first_or_quiet(src):
+    """첫 문장이 QUIET_MARK 면(또는 아무 말도 없으면) None, 아니면 문장 이터레이터."""
+    first = next(src, None)
+    if first is None or QUIET_MARK.strip("()") in first:
+        if hasattr(src, "close"):
+            src.close()
+        return None
+    return itertools.chain([first], src)
+
 def talk_from_text(text):
     """사람 말에서 대화 모드를 켜라/끄라는 뜻을 읽는다: "on" | "off" | None. 끄라는 말이 먼저다 ("대화 모드 꺼 줘")."""
     if _TALK_OFF.search(text or ""):
@@ -1085,7 +1101,7 @@ def handle_clip(client, pcm, ear=False):
             publish_no_reply(client)
             turn.info["dropped"] = "no_speech"; turn.done(client)
             return
-        if not hearing.enrolling():                        # 닮음 점수는 재 보기만 한다: 답을 기다리게 하지 않도록 배경에서
+        if not hearing.enrolling():                        # 닮음 점수는 음성 인식과 나란히 잰다 (0.2~0.4초): 답을 늦추지 않는다
             box = []
             def _score():
                 try:
@@ -1108,7 +1124,16 @@ def handle_clip(client, pcm, ear=False):
         publish_no_reply(client)
         turn.info["dropped"] = "hallucination"; turn.done(client)
         return
-    print(f"  🗣️  나: {user}{conf}")
+    # 누구 목소리 같은가. 음성 인식이 도는 동안 다 재졌을 것이다: 조금만 기다리고, 늦으면 이번 말은 가늠 없이 간다.
+    who = None
+    if turn.voice_job is not None:
+        turn.voice_job[0].join(timeout=1.5)
+        if turn.voice_job[1]:
+            turn.info["voice"] = turn.voice_job[1][0]
+            who = hearing.who(turn.info["voice"], speech_s)
+            if who: turn.info["who"] = who
+    tag = {"other": "다른 목소리", "unsure": "목소리 불확실"}.get(who)
+    print(f"  🗣️  {'나' if not tag else tag}: {user}{conf}" + (f"  (닮음 {turn.info['voice']:.2f})" if "voice" in turn.info else ""))
     turn.text_in = user
     client.publish(T_TXT_IN, user)
     if user and intercepted(client, user, "voice", t0):
@@ -1125,6 +1150,12 @@ def handle_clip(client, pcm, ear=False):
         want = None
     # 목소리 익히기: "내 목소리 기억해" 뒤로, 버튼을 누르고 한 말 몇 개가 지문이 된다 (버튼을 누른 사람이 그 사람이다)
     vcmd = voice_from_text(user) if user else None
+    if vcmd and who == "other" and ear:
+        # 다른 목소리가 대화 모드에서 "목소리 잊어 줘 / 기억해 줘"라고 했다: 익혀 둔 목소리를 건드리지 않는다.
+        # 주인의 목소리가 달라져서(감기) 다시 익히려는 것이면 버튼을 누르고 말하면 된다: 버튼 클립은 막지 않는다.
+        note += (" [익혀 둔 목소리와 다른 목소리가 목소리를 " + ("잊어" if vcmd == "forget" else "새로 익혀") +
+                 " 달라고 했어. 익혀 둔 목소리는 그대로 뒀어. 본인이면 버튼을 누르고 다시 말해 달라고 알려 줘.]")
+        vcmd = None
     if vcmd == "enroll" and speech_s is not None:
         hearing.enroll_start(); want = want or "voice"
         note += (f" [방금 이 말로 목소리 익히기를 시작했어. 이어지는 말 {hearing.ENROLL_CLIPS}번이 이 사람의 목소리로 남아. "
@@ -1137,7 +1168,7 @@ def handle_clip(client, pcm, ear=False):
     elif hearing.enrolling() and user:
         st, left = hearing.enroll_add(pcm, voiced, speech_s)
         note += {"more": f" [목소리 익히는 중: {hearing.ENROLL_CLIPS - left}번째를 들었어, {left}번 남았어.]",
-                 "done": " [이 사람 목소리를 다 익혔어. 이제부터 들리는 말이 이 목소리와 얼마나 닮았는지 재 볼 거야 (아직은 재 보기만 해).]",
+                 "done": " [이 사람 목소리를 다 익혔어. 이제부터 다른 사람 목소리 같은 말이 들리면 그 말 뒤에 알려 줄게.]",
                  "short": f" [목소리 익히는 중인데 방금 말은 너무 짧아서 못 썼어. 조금 더 길게 말해 달라고 해. {left}번 남았어.]",
                  "other": f" [목소리 익히는 중인데 방금 말은 앞서 들은 목소리와 달라서 넣지 않았어 (다른 사람이거나 TV 일 수 있어). {left}번 남았어.]",
                  "failed": " [목소리 익히기가 방금 실패했어. 그렇다고 말해 줘.]"}[st]
@@ -1151,7 +1182,19 @@ def handle_clip(client, pcm, ear=False):
         publish_no_reply(client)
         turn.info["dropped"] = "talk_unclear"; turn.done(client)
         return
+    if user and who == "other":
+        note += VOICE_OTHER_NOTE + (VOICE_QUIET_NOTE if ear else "")
+    elif user and who == "unsure":
+        note += VOICE_UNSURE_NOTE
     src = brain_stream(user + note) if user else iter(["잘 못 들었어, 다시 말해줄래?"])
+    if user and who == "other" and ear:                    # 버튼 없이 들린 다른 목소리 (손님일 수도, TV 일 수도): 가만히 있어도 된다
+        src = _first_or_quiet(src)
+        if src is None:
+            print("  🤫 다른 목소리: 대답하지 않기로 함")
+            publish_no_reply(client)
+            turn.kind = "heard"                            # 들었지만 대화는 아니다: "얘기한 지 오래됐다"와 기분 계산에 대화로 세지 않는다
+            turn.info["path"] = "quiet"; turn.done(client)
+            return
     speak_stream(client, src, t0, turn)
 
 # 말하기 직전 치환 — 프롬프트로 안 고쳐지는 습관어. TTS가 "ack"를 "액"으로 읽어 "액바닷서"가 됨(2026-09-16).
@@ -1283,7 +1326,7 @@ class Turn:
         global _turns
         _turns += 1
         self.mark("done")
-        if self.voice_job is not None:
+        if self.voice_job is not None and "voice" not in self.info:      # 생각하기 전에 못 받은 점수 (일찍 끝난 턴): 기록에는 남긴다
             self.voice_job[0].join(timeout=3)
             if self.voice_job[1]: self.info["voice"] = self.voice_job[1][0]
         d = {"kind": self.kind, **self.info, **self.marks, "ts": int(time.time())}

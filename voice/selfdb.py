@@ -99,6 +99,19 @@ def episode(kind, user_text=None, reply=None, stt_conf=None, rms=None, clip_s=No
                        (int(ts or time.time()), kind, user_text, reply, stt_conf, rms, clip_s, turn_json, ask_id))
     return cur.lastrowid
 
+def episode_who(e):
+    """그 말이 누구 목소리 같았나: "me" | "other" | "unsure" | None. turn_json 의 who, 없으면(가늠을 시작하기 전의 기록) 점수로 다시 가늠한다."""
+    try:
+        t = json.loads(e["turn_json"] or "{}")
+    except ValueError:
+        return None
+    if "who" in t:
+        return t["who"]
+    if t.get("voice") is None:
+        return None
+    import hearing
+    return hearing.who(t["voice"], t.get("speech_s"))
+
 def episodes_since(ts, kinds=None):
     q, args = "SELECT * FROM episodes WHERE ts >= ?", [int(ts)]
     if kinds:

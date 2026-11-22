@@ -41,7 +41,8 @@ def build_prompt(now=None):
     talk = []
     for e in selfdb.episodes_since(now - 3 * 86400, kinds=("voice",)):
         if e["user_text"]:
-            talk.append(f"[{time.strftime('%m-%d %H:%M', time.localtime(e['ts']))}] 사람: {e['user_text'][:120]} / 나: {(e['reply'] or '')[:120]}")
+            spk = "다른 목소리(이 사람이 아님)" if selfdb.episode_who(e) == "other" else "사람"
+            talk.append(f"[{time.strftime('%m-%d %H:%M', time.localtime(e['ts']))}] {spk}: {e['user_text'][:120]} / 나: {(e['reply'] or '')[:120]}")
     threads = [f"- ({'내가 하기로 한 일' if t['kind'] == 'mine' else '사람의 일'}) {t['text']}" for t in selfdb.threads_open()]
     before = [f"- [{time.strftime('%m-%d %H:%M', time.localtime(s['ts']))}] {s['did']} {s['thought']}".strip() for s in recent_solo(5, now=now)]
     m = mood.compute(now)
