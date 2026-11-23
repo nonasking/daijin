@@ -21,6 +21,7 @@ class DbCase(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.dir, True)
         selfdb.use(os.path.join(self.dir, "t.db"))
         self.addCleanup(selfdb.use, None)
+        dm._state_sent.clear()                     # each test starts as a session that has been told nothing
         # Tests must not depend on whether this machine has the hearing models (the server does, a laptop may not):
         # by default nothing can be heard; TestHearing puts fakes in.
         import hearing as _h
@@ -166,6 +167,31 @@ class TestStateBlock(DbCase):
         self.assertLessEqual(len(s), dm.STATE_MAX_CHARS)
         self.assertNotIn("[지금 상태", dm.sys_prompt())          # the system prompt is fixed now
         self.assertTrue(dm.with_state("안녕").startswith("안녕\n\n[지금 상태"))   # the state rides in the user turn
+
+    def test_only_what_changed_rides_along_after_the_first_turn(self):
+        now = 1_800_000_000
+        dm.note_status(dm.T_DEV_STATUS, json.dumps({"online": True, "ts": now - 30, "temp_c": 41.2, "rssi": -57, "uptime_s": 5300}))
+        selfdb.add_memory("preference", "낮에 잔소리를 싫어한다", importance=7)
+        selfdb.persona_set_current("나는 다이진이야. " + "장난을 좋아해. " * 40)
+        tid = selfdb.thread_open("theirs", "글 마감이 금요일이라고 했다", ts=now - 86400)
+        first = dm.with_state("안녕", now=now, session="s1")
+        for piece in ("[지금 상태", "온도 41.2도", "낮에 잔소리를 싫어한다", "글 마감이 금요일", "나에 대해: 나는 다이진이야"):
+            self.assertIn(piece, first)                                                        # all of it, the persona included: nothing is cut
+        dm.note_status(dm.T_DEV_STATUS, json.dumps({"online": True, "ts": now + 30, "temp_c": 41.9, "rssi": -55, "uptime_s": 5360}))
+        self.assertEqual(dm.with_state("그래", now=now + 60, session="s1"), "그래")              # a minute later, half a degree: nothing to say
+        selfdb.add_memory("fact", "고양이와 산다", importance=9, ts=now + 61)
+        second = dm.with_state("음", now=now + 120, session="s1")
+        self.assertIn("[상태에서 바뀐 것", second); self.assertIn("고양이와 산다", second)
+        self.assertNotIn("나에 대해", second); self.assertNotIn("온도", second)
+        selfdb.thread_close(tid, "resolved")
+        dm.note_status(dm.T_DEV_STATUS, json.dumps({"online": True, "ts": now + 150, "temp_c": 52.0, "rssi": -55, "uptime_s": 5500}))
+        third = dm.with_state("응", now=now + 180, session="s1")
+        self.assertIn("아직 뒷이야기를 못 들은 일: 이제 없음", third); self.assertIn("온도 52.0도", third)   # gone things are said, real changes too
+        self.assertIn("[지금 상태", dm.with_state("안녕", now=now + 240, session="s2"))          # a new session knows nothing
+        self.assertEqual(dm.with_state("응", now=now + 300, session="s2"), "응")
+        self.assertIn("[지금 상태", dm.with_state("응", now=now + 300 + dm.STATE_FULL_AFTER_S, session="s2"))   # and all of it again after a long while
+        dm._state_sent["turns"] = dm.STATE_FULL_EVERY
+        self.assertIn("[지금 상태", dm.with_state("응", now=now + 400 + dm.STATE_FULL_AFTER_S, session="s2"))
 
     def test_old_readings_and_dead_device_are_marked(self):
         now = 1_800_000_000

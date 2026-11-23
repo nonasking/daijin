@@ -124,7 +124,7 @@ EMOJI = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿*#`_]")
 T_DEV_STATUS  = "daijin/status"
 T_NODE_STATUS = "daijin/dev/+/status"
 _body = {"device": None, "device_ts": 0, "nodes": {}}     # nodes: id -> (json dict, 수신 시각)
-STATE_MAX_CHARS = 1000
+STATE_MAX_CHARS = 2400     # 안전 상한. 조각마다 제 길이 제한이 있어 평소엔 닿지 않는다 (2026-11-22 실측 전체 1,555자)
 
 def note_status(topic, payload):
     try:
@@ -141,18 +141,23 @@ def note_status(topic, payload):
 def _age(sec_):
     return f"{int(sec_)}초 전" if sec_ < 120 else f"{int(sec_ // 60)}분 전" if sec_ < 7200 else f"{int(sec_ // 3600)}시간 전"
 
-def state_block(now=None):
+def state_parts(now=None):
+    """지금 상태를 조각으로: [(이름, 열쇠, 글)]. 열쇠는 "다시 알려 줄 만큼 바뀌었나"를 가른다: 글은 매 턴 조금씩 달라져도
+    (온도 0.3도, "3분 전"이 "4분 전"으로) 열쇠가 같으면 with_state 가 다시 싣지 않는다."""
     now = time.time() if now is None else now
     parts = []
     d = _body["device"]
     if d:
         if d.get("online") is False:
-            parts.append("몸(디바이스): 꺼져 있음")
+            parts.append(("body", "off", "몸(디바이스): 꺼져 있음"))
         else:
             age = now - (d.get("ts") or _body["device_ts"])
-            parts.append(f"몸: 온도 {d.get('temp_c', '?')}도, 신호 {d.get('rssi', '?')}, 켜진 지 {int((d.get('uptime_s') or 0) // 60)}분"
-                         + (f" ({_age(age)} 값)" if age > 150 else "")
-                         + (", 대화 모드 켜짐(버튼 없이 주고받는 중)" if d.get("talk") else ""))
+            t, r, up = d.get("temp_c"), d.get("rssi"), d.get("uptime_s") or 0
+            key = ("on", int(t // 5) if isinstance(t, (int, float)) else None, int(r // 15) if isinstance(r, (int, float)) else None,
+                   up < 300, age > 150, bool(d.get("talk")))                 # 온도 5도, 신호 15 단위, 막 켜졌나, 값이 묵었나, 대화 모드
+            parts.append(("body", key, f"몸: 온도 {d.get('temp_c', '?')}도, 신호 {d.get('rssi', '?')}, 켜진 지 {int(up // 60)}분"
+                          + (f" ({_age(age)} 값)" if age > 150 else "")
+                          + (", 대화 모드 켜짐(버튼 없이 주고받는 중)" if d.get("talk") else "")))
     nodes = []
     excused, standing = selfdb.node_excused(), selfdb.node_standing()
     for nid, (nd, rts) in sorted(_body["nodes"].items()):
@@ -165,55 +170,66 @@ def state_block(now=None):
             nodes.append(f"{name} 꺼짐" + (" (평소 꺼 두는 노드, 꺼져 있다고 말 꺼내지 마)" if nid in standing else
                                          " (사람이 일부러 꺼 둠, 걱정하지 마)" if nid in excused else ""))
     if nodes:
-        parts.append("노드: " + ", ".join(nodes))
+        parts.append(("nodes", None, "노드: " + ", ".join(nodes)))
     temp = d.get("temp_c") if d and d.get("online") is not False and now - (d.get("ts") or _body["device_ts"] or 0) < 300 else None
-    ml = mood.state_line(now, temp if isinstance(temp, (int, float)) else None)
+    temp = temp if isinstance(temp, (int, float)) else None
+    ml = mood.state_line(now, temp)
     if ml:
-        parts.append(ml)
+        parts.append(("mood", mood.compute(now, temp)["felt"], ml))          # 이유 속 숫자("12마디")가 늘 때마다 다시 싣지는 않는다
     if token_line(now):
-        parts.append(token_line(now))
+        parts.append(("token", None, token_line(now)))
     try:
         asks = selfdb.recent_asks(3)
         if asks:
             kor = {"engaged": "대화로 이어짐", "acknowledged": "짧게 답함", "refused_context": "사정이 있어 거절",
                    "negative": "싫어함", "unanswered": "응답 없음", None: "응답 기다리는 중"}
-            parts.append("내가 먼저 말 건 기록: " + " / ".join(
-                f"{_age(now - a['ts'])} '{a['text'][:24]}' → {kor.get(a['response_class'], a['response_class'])}" for a in asks))
+            parts.append(("asks", tuple((a["id"], a["response_class"]) for a in asks), "내가 먼저 말 건 기록: " + " / ".join(
+                f"{_age(now - a['ts'])} '{a['text'][:24]}' → {kor.get(a['response_class'], a['response_class'])}" for a in asks)))
         mems = [m for m in selfdb.top_memories(8, 320) if m["kind"] != "self"][:5]
         if mems:
-            parts.append("기억: " + " · ".join(m["text"] for m in mems))
+            parts.append(("memories", None, "기억: " + " · ".join(m["text"] for m in mems)))
         me = [m["text"] for m in selfdb.valid_memories() if m["kind"] == "self"][-3:]
         if me:
-            parts.append("내가 아는 나: " + " · ".join(x[:60] for x in me))
+            parts.append(("self", None, "내가 아는 나: " + " · ".join(x[:60] for x in me)))
         import solo                                  # 여기서 import: solo 가 daijin_mqtt 를 늦게 가져다 쓴다
         sl = solo.state_line(now)
         if sl:
-            parts.append(sl + " (얘기하고 싶으면 해)")
+            parts.append(("solo", sl.split("혼자 있을 때:", 1)[-1], sl + " (얘기하고 싶으면 해)"))     # "3시간 전"이 "4시간 전"이 된 것은 새 소식이 아니다
         # 끝나지 않은 일: 대화 안에서는 조심스러운 주제도 실린다 (FOLLOWUP_SENSITIVE=never 가 아니면). 먼저 스피커로 꺼내는 것은 initiative 가 따로 가린다.
         never = (sec("FOLLOWUP_SENSITIVE") or "").strip() == "never"
         th = [t for t in selfdb.threads_open() if not (t["sensitive"] and never)]
         theirs = [t["text"] for t in th if t["kind"] == "theirs"][:2]
         mine = [t["text"] for t in th if t["kind"] == "mine"][:2]
         if theirs:
-            parts.append("아직 뒷이야기를 못 들은 일 (물을지, 언제 어떻게 물을지는 네가 정해): " + " · ".join(x[:80] for x in theirs))
+            parts.append(("theirs", None, "아직 뒷이야기를 못 들은 일 (물을지, 언제 어떻게 물을지는 네가 정해): " + " · ".join(x[:80] for x in theirs)))
         if mine:
-            parts.append("내가 하기로 한 일: " + " · ".join(x[:80] for x in mine))
+            parts.append(("mine", None, "내가 하기로 한 일: " + " · ".join(x[:80] for x in mine)))
         if not hearing.available():
             pass
         elif hearing.enrolling():
-            parts.append("목소리를 익히는 중이야")
+            parts.append(("voice", None, "목소리를 익히는 중이야"))
         elif selfdb.voice_get(hearing.ME):
-            parts.append("이 사람의 목소리를 익혀 뒀어: 다른 사람 목소리 같거나 잘 모르겠으면 그 말 뒤에 [목소리: …]로 알려 줄게 (표시가 없으면 이 사람이거나 너무 짧은 말)")
+            parts.append(("voice", None, "이 사람의 목소리를 익혀 뒀어: 다른 사람 목소리 같거나 잘 모르겠으면 그 말 뒤에 [목소리: …]로 알려 줄게 (표시가 없으면 이 사람이거나 너무 짧은 말)"))
         else:
-            parts.append("목소리를 익힐 수 있어: 사람이 '내 목소리 기억해 줘'라고 하면 이어지는 말 몇 번으로 익혀 (아직 익힌 목소리 없음)")
+            parts.append(("voice", None, "목소리를 익힐 수 있어: 사람이 '내 목소리 기억해 줘'라고 하면 이어지는 말 몇 번으로 익혀 (아직 익힌 목소리 없음)"))
         cur = selfdb.persona_current()
         if cur:
-            parts.append("나에 대해: " + cur["text"].replace("\n", " ")[:300])
+            parts.append(("persona", None, "나에 대해: " + cur["text"].replace("\n", " ")[:300]))
     except Exception as e:
         print(f"  (상태 블록: DB 읽기 실패 {e})")
+    return [(n, t if k is None else k, t) for n, k, t in parts]
+
+# 조각이 사라졌을 때 알려 줄 이름 (열린 일이 다 닫혔다, 기분이 평온으로 돌아왔다): 안 알려 주면 세션은 예전 것을 그대로 믿는다
+STATE_GONE = {"mood": "기분: 평온으로 돌아옴", "asks": "내가 먼저 말 건 기록: 없음", "solo": "혼자 있을 때 한 일: 최근 것 없음",
+              "theirs": "아직 뒷이야기를 못 들은 일: 이제 없음", "mine": "내가 하기로 한 일: 이제 없음", "token": "클로드 토큰 알림: 해결됨",
+              "memories": "기억: 없음", "self": "내가 아는 나: 없음", "nodes": "노드: 없음", "body": "몸: 알 수 없음", "persona": "나에 대해: 없음", "voice": "목소리: 익힐 수 없음"}
+
+def state_block(now=None):
+    """지금 상태 전부를 한 줄로. 대화 이력이 없는 엔진(로컬)과 도구가 쓴다. Claude 의 고정 세션에는 with_state 가 바뀐 조각만 싣는다."""
+    parts = state_parts(now)
     if not parts:
         return ""
-    text = " [지금 상태, 이미 최신이니 다시 조회하지 않아도 돼] " + " | ".join(parts)
+    text = " [지금 상태, 이미 최신이니 다시 조회하지 않아도 돼] " + " | ".join(t for _, _, t in parts)
     return text[:STATE_MAX_CHARS]
 
 def sys_prompt():
@@ -221,10 +237,35 @@ def sys_prompt():
     상주 프로세스는 시스템 프롬프트를 시작할 때 한 번만 받으므로, 매 턴 바뀌는 것은 턴 안에 있어야 한다."""
     return SYS
 
-def with_state(text, now=None):
-    """사람의 말 + 지금 상태 블록. 상태가 비어 있으면 말만."""
-    s = state_block(now).strip()
-    return f"{text}\n\n{s}" if s else text
+# 상태는 사람의 말 뒤에 붙어 세션 이력에 남는다. 매 턴 통째로 붙였더니 2026-11 한 달 220턴에 사람의 말이 1만 자, 상태가 19만 5천 자였고
+# 세션이 5만 7천 토큰에서 30만 5천 토큰으로 불었다 (거의 같은 글의 반복). 게다가 1,000자 상한에 뒤쪽 조각(나에 대한 글, 내가 하기로 한 일,
+# 목소리 안내)이 잘려 한 번도 전달되지 않았다. 이제 처음 한 번 전부 싣고, 그 뒤로는 열쇠가 바뀐 조각만 싣는다: 나머지는 이력에 이미 있다.
+# 이력이 요약으로 압축되면 앞의 상태가 흐려질 수 있으므로 STATE_FULL_EVERY 턴 또는 STATE_FULL_AFTER_S 마다 전부를 다시 싣는다.
+STATE_FULL_EVERY = 60
+STATE_FULL_AFTER_S = 12 * 3600
+_state_sent = {}                 # {"session", "keys": {이름: 열쇠}, "turns", "at"}: 이 세션에 마지막으로 실어 보낸 것
+
+def with_state(text, now=None, session=None):
+    """사람의 말 + 상태. 이 세션에 처음이면 전부, 아니면 지난번에 실은 뒤로 바뀐 조각만. 바뀐 게 없으면 말만."""
+    now = time.time() if now is None else now
+    parts = state_parts(now)
+    keys = {n: k for n, k, _ in parts}
+    sent = _state_sent
+    full = (not sent or sent.get("session") != session or sent.get("turns", 0) >= STATE_FULL_EVERY
+            or now - sent.get("at", 0) >= STATE_FULL_AFTER_S)
+    if full:
+        body = [t for _, _, t in parts]
+        head = "[지금 상태, 이미 최신이니 다시 조회하지 않아도 돼]"
+        sent.clear(); sent.update(session=session, turns=0, at=now)
+    else:
+        old = sent.get("keys", {})
+        body = [t for n, k, t in parts if old.get(n) != k] + [STATE_GONE[n] for n in old if n not in keys and n in STATE_GONE]
+        head = "[상태에서 바뀐 것, 나머지는 앞에서 알려 준 그대로야]"
+        sent["turns"] = sent.get("turns", 0) + 1
+    sent["keys"] = keys
+    if not body:
+        return text
+    return f"{text}\n\n{head} " + " | ".join(body)[:STATE_MAX_CHARS]
 
 # ---------- 그 사이 내가 먼저 한 말 ----------
 # daijin/say 로 나간 말은 에이전트를 거치지 않아 고정 세션의 대화 이력에 없다. 그러면 모델은 상태 블록에 기록이 있어도
@@ -694,7 +735,7 @@ def claude_think(text, out):
     global _resume_failures
     sid = load_session()
     st = _new_state()
-    text = with_state(with_proactive_context(text))      # 그 사이 먼저 한 말은 Claude 의 고정 세션에만 필요하다 (로컬 엔진은 자아 층에서 읽는다)
+    text = with_state(with_proactive_context(text), session=sid)      # 그 사이 먼저 한 말은 Claude 의 고정 세션에만 필요하다 (로컬 엔진은 자아 층에서 읽는다)
     yield from _think_turn(text, sid, st)
     if st["timeout"]:
         print(f"  ⚠️ 에이전트 {BRAIN_TIMEOUT_S}초 초과 → 중단")
