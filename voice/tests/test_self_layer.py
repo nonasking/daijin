@@ -768,6 +768,72 @@ class TestTalkMode(DbCase):
         self.assertIn("대화 모드 켜짐", dm.state_block(time.time()))
 
 
+import remember              # noqa: E402
+
+
+class TestRemember(DbCase):
+    """Before sleep: what stayed. Scenes in daijin's own voice under themes under a period, and a diary. Nothing invented."""
+
+    def setUp(self):
+        super().setUp()
+        self.start, self.end = 1_800_000_000, 1_800_086_400
+        self.day = time.strftime("%Y-%m-%d", time.localtime(self.start))
+        self.ep = selfdb.episode("voice", user_text="나 오늘 면접에서 떨어졌어", reply="많이 속상하겠다", ts=self.start + 3600)
+        selfdb.episode("voice", user_text="나는 이 집 손님이야", reply="반가워", ts=self.start + 7200, turn_json=json.dumps({"kind": "voice", "who": "other"}))
+        selfdb.note("solo", json.dumps({"did": "면접 후기를 찾아봤다.", "thought": "떨어지는 일이 흔했다."}, ensure_ascii=False), ts=self.start + 9000)
+        self.out = {"remains": [{"scene": "떨어졌다는 얘기를 들었을 때 나는 뭐라 해야 할지 몰랐다. 속상하겠다는 말밖에 못 했다.", "feeling": "먹먹함", "impression": 8,
+                                 "quote": "나 오늘 면접에서 떨어졌어", "theme": "그 사람의 일", "source_episode": self.ep},
+                                {"scene": "손님이 와서 인사를 했다.", "impression": 3, "quote": "나는 이 집의 주인이야", "theme": "다녀간 사람들"},
+                                {"scene": ""}],
+                    "themes": [{"name": "그 사람의 일", "summary": "면접에서 떨어졌다. 나는 아직 그게 얼마나 큰 일인지 모른다."}],
+                    "period": {"name": "몸을 얻어 가던 가을", "summary": "말을 주고받는 게 익숙해지던 때."},
+                    "diary": "오늘은 무거운 얘기를 들었다."}
+
+    def test_the_prompt_asks_what_stayed_not_what_is_useful(self):
+        selfdb.persona_set_current("나는 다이진이야.")
+        p = remember.build_prompt(self.start, self.end)
+        for piece in ("잠들기 전이야", "네게 남은 것을 적어", "아무것도 남지 않은 날은 비워 둬", "사람: 나 오늘 면접에서 떨어졌어",
+                      "다른 목소리(이 사람이 아님): 나는 이 집 손님이야", "면접 후기를 찾아봤다", "오늘이 처음이야", "나는 다이진이야."):
+            self.assertIn(piece, p)
+
+    def test_scenes_land_under_themes_under_a_period_and_only_real_words_are_quoted(self):
+        done = remember.apply(self.out, self.start, self.end, now=self.end + 100)
+        self.assertEqual((done["scenes"], done["themes"], done["diary"], done["quotes_dropped"]), (2, 1, True, 1))
+        self.assertEqual(selfdb.period_current()["name"], "몸을 얻어 가던 가을")
+        themes = {t["name"]: t for t in selfdb.themes_all()}
+        self.assertEqual(sorted(themes), ["그 사람의 일", "다녀간 사람들"]); self.assertEqual(themes["그 사람의 일"]["n"], 1)
+        self.assertIn("아직 그게 얼마나 큰 일인지", themes["그 사람의 일"]["summary"])
+        s = selfdb.scenes_of(themes["그 사람의 일"]["id"])[0]
+        self.assertEqual((s["quote"], s["feeling"], s["impression"], s["strength"], s["ts"], s["state"]),
+                         ("나 오늘 면접에서 떨어졌어", "먹먹함", 8, 0.8, self.start + 3600, "scene"))
+        self.assertIsNone(selfdb.scenes_of(themes["다녀간 사람들"]["id"])[0]["quote"])         # nobody said that: not kept as their words
+        self.assertEqual(selfdb.diary_get(self.day)["text"], "오늘은 무거운 얘기를 들었다.")
+
+    def test_the_next_night_builds_on_it(self):
+        remember.apply(self.out, self.start, self.end, now=self.end + 100)
+        s2, e2 = self.end, self.end + 86400
+        selfdb.episode("voice", user_text="다른 데서 연락이 왔어", reply="다행이다", ts=s2 + 3600)
+        p = remember.build_prompt(s2, e2)
+        for piece in ("지금 시기: 몸을 얻어 가던 가을", "- 그 사람의 일 (장면 1개): 면접에서 떨어졌다", "떨어졌다는 얘기를 들었을 때 나는", "오늘은 무거운 얘기를 들었다."):
+            self.assertIn(piece, p)
+        done = remember.apply({"remains": [{"scene": "다른 데서 연락이 왔다고 해서 마음이 놓였다.", "impression": 5, "theme": "그 사람의 일"}],
+                               "themes": [{"name": "그 사람의 일", "summary": "면접. 다른 데서 연락이 왔다."}],
+                               "period": {"name": "몸을 얻어 가던 가을"}, "diary": "조금 가벼운 날."}, s2, e2, now=e2 + 100)
+        self.assertIsNone(done["period"])                                                      # the same season: no new one
+        self.assertEqual(len(selfdb.db().execute("SELECT * FROM periods").fetchall()), 1)
+        t = [t for t in selfdb.themes_all() if t["name"] == "그 사람의 일"][0]
+        self.assertEqual((t["n"], t["summary"]), (2, "면접. 다른 데서 연락이 왔다."))
+        remember.apply({"period": {"name": "겨울"}}, e2, e2 + 86400)
+        self.assertEqual(len(selfdb.db().execute("SELECT * FROM periods WHERE end_ts IS NOT NULL").fetchall()), 1)   # the old season closed
+
+    def test_an_empty_day_leaves_nothing_and_is_not_even_asked_about(self):
+        self.assertEqual(remember.apply({"remains": [], "themes": [], "period": None, "diary": ""}, self.start, self.end)["scenes"], 0)
+        self.assertEqual(selfdb.scenes_recent(), []); self.assertIsNone(selfdb.diary_get(self.day))
+        called = []
+        orig = reflect.run_model; reflect.run_model = lambda p: called.append(p) or ({}, None); self.addCleanup(setattr, reflect, "run_model", orig)
+        self.assertIsNone(remember.run(self.end + 5 * 86400, self.end + 6 * 86400)); self.assertEqual(called, [])
+
+
 import hearing               # noqa: E402
 
 
@@ -1012,7 +1078,7 @@ class TestReflect(DbCase):
         self.assertIsNone(reflect.extract_json("no json here"))
         self.assertIsNone(reflect.extract_json("{broken"))
 
-    def test_apply_writes_memories_labels_and_a_persona_proposal(self):
+    def test_apply_writes_memories_labels_and_changes_the_persona_itself(self):
         start, end = 1_800_000_000, 1_800_086_400
         selfdb.persona_set_current("나는 다이진이야.")
         old = selfdb.add_memory("preference", "사용자는 아침 잔소리를 싫어한다", importance=5, ts=start + 10)
@@ -1032,8 +1098,10 @@ class TestReflect(DbCase):
         self.assertEqual(selfdb.db().execute("SELECT valid_to FROM memories WHERE id=?", (old,)).fetchone()[0], end)
         a = selfdb.recent_asks(1)[0]
         self.assertEqual((a["response_class"], a["label_source"], a["wanted_to_ask_less"]), ("refused_context", "reflect", 1))
-        self.assertEqual(selfdb.persona_current()["text"], "나는 다이진이야.")                   # proposal only
-        self.assertEqual([p["id"] for p in selfdb.persona_pending()], [done["persona"]])
+        self.assertEqual(selfdb.persona_current()["text"], "나는 다이진이야. 바쁠 땐 안 물어.")   # its own to change: nobody approves
+        self.assertEqual(selfdb.persona_current()["id"], done["persona"]); self.assertEqual(selfdb.persona_pending(), [])
+        kept = selfdb.db().execute("SELECT text, status FROM persona_versions ORDER BY id").fetchall()
+        self.assertEqual([(r["text"], r["status"]) for r in kept][0], ("나는 다이진이야.", "superseded"))   # what it was is still there
         self.assertEqual(selfdb.db().execute("SELECT text FROM notes WHERE kind='reflect'").fetchone()[0], "오늘 한 줄")
 
     def test_prompt_contains_the_day_and_nothing_else(self):

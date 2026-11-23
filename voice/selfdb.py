@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS persona_versions (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL, diff_summary TEXT,
   proposed_by TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notes (ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS periods (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, summary TEXT, start_ts INTEGER NOT NULL, end_ts INTEGER);
+CREATE TABLE IF NOT EXISTS themes (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, summary TEXT, period_id INTEGER, ts_first INTEGER NOT NULL, ts_last INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS scenes (
+  id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, written_ts INTEGER NOT NULL, theme_id INTEGER, text TEXT NOT NULL, feeling TEXT, quote TEXT,
+  impression INTEGER NOT NULL DEFAULT 5, strength REAL NOT NULL DEFAULT 0.5, state TEXT NOT NULL DEFAULT 'scene',
+  recall_count INTEGER NOT NULL DEFAULT 0, last_recalled_ts INTEGER, source_episode INTEGER);
+CREATE INDEX IF NOT EXISTS scenes_theme ON scenes(theme_id);
+CREATE TABLE IF NOT EXISTS diary (day TEXT PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS voices (name TEXT PRIMARY KEY, ts INTEGER NOT NULL, model TEXT NOT NULL, n INTEGER NOT NULL, emb BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS threads (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
@@ -290,6 +300,68 @@ def threads_let_go(now, max_age_s, max_asks, grace_s):
         db().execute("UPDATE threads SET status='dropped', closed_ts=?, closed_note='놓음: 오래됐거나 물어도 소식이 없었다' WHERE id=?", (int(now), r["id"]))
     return [r["id"] for r in rows]
 
+# ---------- 기억의 지도와 일기 (remember.py) ----------
+# 사람처럼 겪고 떠올리고 잊기 위한 기억 (2026-11-23, docs/design-memory.md). 위의 memories 가 "이 사람에 대한 사실" 목록이라면
+# 이쪽은 다이진이 겪은 일이다: 시기(periods) 아래 주제(themes), 그 아래 장면(scenes). 장면은 1인칭으로, 그때의 기분과 함께 남는다.
+# strength·state·recall_count·last_recalled_ts 는 떠올리면 강해지고 시간이 지나면 흐려지는 단계에서 쓴다 (지금은 적어 두기만 한다).
+def period_current():
+    return db().execute("SELECT * FROM periods WHERE end_ts IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+
+@_safe
+def period_set(name, summary=None, ts=None):
+    """지금 시기. 이름이 같으면 요약만 고치고, 다르면 지금 시기를 닫고 새 시기를 연다. 시기 id."""
+    now = int(ts or time.time())
+    cur = period_current()
+    if cur and cur["name"] == name:
+        if summary:
+            db().execute("UPDATE periods SET summary=? WHERE id=?", (summary, cur["id"]))
+        return cur["id"]
+    if cur:
+        db().execute("UPDATE periods SET end_ts=? WHERE id=?", (now, cur["id"]))
+    return db().execute("INSERT INTO periods(name,summary,start_ts) VALUES(?,?,?)", (name, summary, now)).lastrowid
+
+def themes_all():
+    return db().execute("SELECT t.*, (SELECT COUNT(*) FROM scenes s WHERE s.theme_id=t.id) AS n FROM themes t ORDER BY ts_last DESC").fetchall()
+
+@_safe
+def theme_touch(name, summary=None, ts=None):
+    """주제를 찾거나 만든다. summary 가 있으면 고쳐 쓴다 (주제에 대해 아는 것은 덮어써진다: 지난 생각은 장면과 일기에 남는다). 주제 id."""
+    now = int(ts or time.time())
+    name = " ".join((name or "").split())[:40]
+    if not name:
+        return None
+    row = db().execute("SELECT * FROM themes WHERE name=?", (name,)).fetchone()
+    if row:
+        db().execute("UPDATE themes SET ts_last=MAX(ts_last, ?), summary=COALESCE(?, summary) WHERE id=?", (now, summary, row["id"]))
+        return row["id"]
+    cur = period_current()
+    return db().execute("INSERT INTO themes(name,summary,period_id,ts_first,ts_last) VALUES(?,?,?,?,?)",
+                        (name, summary, cur["id"] if cur else None, now, now)).lastrowid
+
+@_safe
+def scene_add(text, theme_id=None, feeling=None, quote=None, impression=5, source_episode=None, ts=None, written_ts=None):
+    imp = max(1, min(10, int(impression)))
+    now = int(written_ts or time.time())
+    return db().execute("INSERT INTO scenes(ts,written_ts,theme_id,text,feeling,quote,impression,strength,source_episode) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (int(ts or now), now, theme_id, text, feeling, quote, imp, imp / 10.0, source_episode)).lastrowid
+
+def scenes_recent(n=10):
+    return db().execute("SELECT s.*, t.name AS theme FROM scenes s LEFT JOIN themes t ON t.id=s.theme_id ORDER BY s.ts DESC, s.id DESC LIMIT ?", (n,)).fetchall()
+
+def scenes_of(theme_id):
+    return db().execute("SELECT * FROM scenes WHERE theme_id IS ? ORDER BY ts", (theme_id,)).fetchall()
+
+@_safe
+def diary_set(day, text, ts=None):
+    db().execute("INSERT INTO diary(day,ts,text) VALUES(?,?,?) ON CONFLICT(day) DO UPDATE SET ts=excluded.ts, text=excluded.text", (day, int(ts or time.time()), text))
+    return True
+
+def diary_get(day):
+    return db().execute("SELECT * FROM diary WHERE day=?", (day,)).fetchone()
+
+def diary_recent(n=3):
+    return db().execute("SELECT * FROM diary ORDER BY day DESC LIMIT ?", (n,)).fetchall()
+
 # ---------- voices: 목소리 지문 (hearing.py) ----------
 def voice_get(name):
     return db().execute("SELECT * FROM voices WHERE name=?", (name,)).fetchone()
@@ -334,9 +406,9 @@ def persona_reject(version_id):
     return True
 
 @_safe
-def persona_set_current(text, by="human", diff_summary=None):
-    """사람이 파일을 직접 고친 경우: 제안과 승인을 한 번에."""
-    vid = persona_propose(text, diff_summary or "사람이 직접 편집", by)
+def persona_set_current(text, by="human", diff_summary=None, ts=None):
+    """글을 바로 현재로. 이전 현재는 superseded 로 남는다 (무엇이 달라졌는지 볼 수 있게: python3 persona.py history)."""
+    vid = persona_propose(text, diff_summary or "사람이 직접 편집", by, ts=ts)
     return persona_approve(vid) and vid
 
 # ---------- node_state ----------

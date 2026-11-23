@@ -2,7 +2,7 @@
 # reflect — 밤에 하루를 돌아본다. 설계: docs/design-self-layer.md §8.
 #   입력: 오늘의 episodes, asks, drives 요약, 현재 persona.
 #   모델: claude -p 를 대화 세션과 별개로(--resume 없이) 한 번. 도구 없음. 출력은 JSON 하나로 강제.
-#   적용: memories 추가(같은 뜻의 옛 기억은 valid_to 를 채워 대체), asks 재분류와 wanted_to_ask_less, persona 변경 제안(승인 대기),
+#   적용: memories 추가(같은 뜻의 옛 기억은 valid_to 를 채워 대체), asks 재분류와 wanted_to_ask_less, persona 를 스스로 고침(이전 판은 남는다),
 #         threads 열고 닫기 (끝나지 않은 일: 이어서 물을 것과 다이진이 한 약속. initiative 의 followup 추동이 쓴다).
 # 실행: python3 reflect.py [--date YYYY-MM-DD] [--dry-run] [--db PATH]   (상시는 systemd 타이머 daijin-reflect, 03:30)
 import argparse, json, os, re, subprocess, sys, time
@@ -46,14 +46,12 @@ def day_bounds(date_str=None, now=None):
         start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
     return int(start), int(start) + 86400
 
-def build_prompt(start, end):
-    eps = selfdb.episodes_since(start)
-    eps = [e for e in eps if e["ts"] < end]
-    if len(eps) > MAX_EPISODES:
-        eps = eps[-MAX_EPISODES:]
-    asks = [a for a in selfdb.asks_since(start) if a["ts"] < end]
-    cur = selfdb.persona_current()
-    mems = selfdb.valid_memories()
+def day_episodes(start, end):
+    eps = [e for e in selfdb.episodes_since(start) if e["ts"] < end]
+    return eps[-MAX_EPISODES:] if len(eps) > MAX_EPISODES else eps
+
+def episode_lines(eps):
+    """하루의 에피소드를 읽을 수 있는 줄로. 밤 반성과 되새김(remember.py)이 같이 쓴다."""
     lines = []
     for e in eps:
         t = time.strftime("%H:%M", time.localtime(e["ts"]))
@@ -64,6 +62,14 @@ def build_prompt(start, end):
             lines.append(f"[ep{e['id']} {t}] (상황이 들어와 다이진이 먼저 말함) {e['reply'] or ''}  ← 상황: {e['user_text']}")
         else:
             lines.append(f"[ep{e['id']} {t}] (다이진이 먼저 말함) {e['reply']}")
+    return lines
+
+def build_prompt(start, end):
+    eps = day_episodes(start, end)
+    asks = [a for a in selfdb.asks_since(start) if a["ts"] < end]
+    cur = selfdb.persona_current()
+    mems = selfdb.valid_memories()
+    lines = episode_lines(eps)
     ask_lines = [f"[ask{a['id']} {time.strftime('%H:%M', time.localtime(a['ts']))} {a['source']}/{a['drive']}] 말함: {a['text'][:80]}"
                  f"  → 지금 분류: {a['response_class'] or '열림'}" +
                  (f", 사람 답({int(a['latency_s'] or 0) // 60}분 {int(a['latency_s'] or 0) % 60}초 뒤): {a['response_text'][:60]}" if a["response_text"] else "")
@@ -83,7 +89,7 @@ def build_prompt(start, end):
             "negative=그만하라거나 짜증을 냄, unanswered=그 말에 대한 답이 없음. 창 안에 들어온 말이라도 네 말과 상관없는 새 이야기나 질문이면 거절이 아니다: "
             "engaged 나 unanswered 로 두고, 거절(refused_context, negative)은 사람이 네 말을 물리친 게 분명할 때만 붙여라. "
             "답은 네가 말한 뒤 10분 안에 들어온 말만이다: 그보다 뒤의 대화는 네 말에 대한 답이 아니니 unanswered 를 engaged 로 바꾸지 마라.\n"
-            "3) 인격: 현재 인격 글을 읽고, 오늘 배운 것 때문에 고쳐야 할 문장이 있으면 글 전체를 다시 써서 persona_new 에 넣어라. 바꿀 이유가 분명할 때만. 사람이 승인해야 반영된다.\n\n"
+            "3) 인격: 현재 인격 글을 읽고, 오늘 배운 것 때문에 고쳐야 할 문장이 있으면 글 전체를 다시 써서 persona_new 에 넣어라. 바꿀 이유가 분명할 때만. 네가 고치면 그대로 네 글이 된다 (이전 글은 남는다).\n\n"
             "4) 이어서 물을 것: 사람이 결과를 기다리던 일, 하겠다고 한 일, 걱정하던 일처럼 '그 뒤가 어떻게 됐는지' 며칠 뒤에 묻는 게 자연스러운 것만 "
             "threads_open 에 넣어라(kind=theirs). 사람이 실제로 한 말에 근거한 것만, 하루에 0~2개. 이미 끝난 이야기, 잡담, 네가 지어낸 걱정은 넣지 마라. "
             "text 는 네 궁금증('~인지 궁금하다')이 아니라 있었던 일을 적어라('~라고 했다', '~하기로 했다'): 나중에 그 글을 보고 질문을 새로 짓는다. 한 가지 일만, 짧게. "
@@ -205,8 +211,8 @@ def apply(out, start, end, now=None):
     new = (out.get("persona_new") or "").strip()
     cur = selfdb.persona_current()
     if new and new != (cur["text"] if cur else ""):
-        vid = selfdb.persona_propose(new, out.get("persona_change_summary") or "밤 반성의 제안", "reflect", ts=now)
-        done["persona"] = vid
+        # 승인을 기다리지 않는다 (2026-11-23 사용자: 없애). 사람은 겪은 일이 쌓여 스스로 달라진다. 이전 글은 superseded 로 남는다.
+        done["persona"] = selfdb.persona_set_current(new, by="reflect", diff_summary=out.get("persona_change_summary") or "밤 반성", ts=now) or None
     if out.get("note"):
         selfdb.note("reflect", str(out["note"])[:300], ts=now)
     return done
@@ -251,8 +257,14 @@ def main():
     done = apply(out, start, end)
     print(f"✅ 적용: 기억 {done['memories']}개(대체 {done['replaced']}), 실 {done['threads']}개 열고 {done['threads_closed']}개 닫음, "
           f"장부 재분류 {done['relabeled']}, 덜 묻고 싶었나 {done['wanted']}건, "
-          f"인격 제안 {'#%d (승인 대기: python3 voice/persona.py show)' % done['persona'] if done['persona'] else '없음'}")
+          f"나에 대한 글 {'고침 (#%d, 이전 글과의 차이: python3 voice/persona.py history)' % done['persona'] if done['persona'] else '그대로'}")
     publish_pending()
+    try:                                             # 잠들기 전 되새김: 오늘 무엇이 남았나 (remember.py). 실패해도 위의 반성은 이미 적용됐다
+        import remember
+        remember.run(start, end)
+    except Exception as e:
+        print(f"  ⚠️ 되새김 실패: {e!r}")
+        selfdb.note("remember_error", repr(e)[:300])
     return 0
 
 if __name__ == "__main__":

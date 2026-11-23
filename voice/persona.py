@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# persona — 다이진의 인격 글을 다룬다. 밤 반성이 제안하고 사람이 승인하는 한 군데 (docs/design-self-layer.md §8).
+# persona — 다이진의 인격 글(나에 대한 글)을 다룬다. 밤 반성이 스스로 고친다: 사람의 승인을 기다리지 않는다 (2026-11-23).
+#   history [n]       지금까지의 판과, 판마다 무엇이 달라졌는지 (최근 n개, 기본 5)
 #   show              현재 글과 승인 기다리는 제안들 (제안은 현재 글과의 차이로)
 #   approve <id>      제안을 현재로 (이전 현재는 superseded)
 #   reject <id>
@@ -37,6 +38,15 @@ def main(argv):
         ok = selfdb.persona_approve(int(argv[1])) if cmd == "approve" else selfdb.persona_reject(int(argv[1]))
         print(("승인됨" if cmd == "approve" else "거절됨") if ok else "실패: 그 id 의 제안이 없다")
         return 0 if ok else 1
+    if cmd == "history":
+        rows = selfdb.db().execute("SELECT * FROM persona_versions WHERE status IN ('current','superseded') ORDER BY id").fetchall()
+        n = int(argv[1]) if len(argv) > 1 else 5
+        for i, r in enumerate(rows):
+            if i < len(rows) - n:
+                continue
+            print(f"=== #{r['id']} {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['ts']))} ({r['proposed_by']}, {r['status']}): {r['diff_summary']}")
+            print(_diff(rows[i - 1]["text"] if i else "", r["text"]).replace("현재", "이전").replace("제안", "이 판") or "(차이 없음)")
+        return 0
     if cmd == "export":
         cur = selfdb.persona_current()
         if not cur:
