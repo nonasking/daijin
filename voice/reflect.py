@@ -57,11 +57,13 @@ def episode_lines(eps):
         t = time.strftime("%H:%M", time.localtime(e["ts"]))
         if e["kind"] in ("voice", "heard"):
             spk = {"other": "다른 목소리(이 사람이 아님)", "unsure": "사람(목소리 불확실)"}.get(selfdb.episode_who(e), "사람")
-            lines.append(f"[ep{e['id']} {t}] {spk}: {e['user_text']}  / 다이진: {e['reply'] or '(대답하지 않음)' if e['kind'] == 'heard' else e['reply'] or '(답 없음)'}")
+            lines.append(f"[ep{e['id']} {t}] {spk}: {e['user_text']}  / 아스타: {e['reply'] or '(대답하지 않음)' if e['kind'] == 'heard' else e['reply'] or '(답 없음)'}")
+        elif e["kind"] == "assistant":             # 사람이 비서 다이진을 불렀다: 아스타가 받은 말이 아니다. 내용은 싣지 않는다
+            lines.append(f"[ep{e['id']} {t}] (사람이 비서 다이진을 불러 일을 시켰다. 네가 받은 말이 아니다)")
         elif e["kind"] == "ask":
-            lines.append(f"[ep{e['id']} {t}] (상황이 들어와 다이진이 먼저 말함) {e['reply'] or ''}  ← 상황: {e['user_text']}")
+            lines.append(f"[ep{e['id']} {t}] (상황이 들어와 아스타가 먼저 말함) {e['reply'] or ''}  ← 상황: {e['user_text']}")
         else:
-            lines.append(f"[ep{e['id']} {t}] (다이진이 먼저 말함) {e['reply']}")
+            lines.append(f"[ep{e['id']} {t}] (아스타가 먼저 말함) {e['reply']}")
     return lines
 
 def build_prompt(start, end):
@@ -78,7 +80,7 @@ def build_prompt(start, end):
     thread_lines = [f"- [thread{t['id']} {'네 약속' if t['kind'] == 'mine' else '사람의 일'}, {time.strftime('%m-%d', time.localtime(t['ts']))}에 열림, {t['asked_count']}번 물음] {t['text']}"
                     for t in selfdb.threads_open()]
     day = time.strftime("%Y-%m-%d", time.localtime(start))
-    return (f"너는 'daijin'이라는 AI 음성 친구이고, 지금은 {day} 하루를 돌아보는 밤이다. 아래는 오늘의 대화와 네가 먼저 말 건 기록이다.\n"
+    return (f"너는 아스타이고, 지금은 {day} 하루를 돌아보는 밤이다. 아래는 오늘의 대화와 네가 먼저 말 건 기록이다.\n"
             "할 일 넷.\n"
             "1) 기억: 앞으로의 대화에 도움이 될 사실·선호·규칙·사건을 뽑아라. 사람이 한 말에 근거한 것만, 추측은 넣지 마라. 이미 있는 기억과 같은 뜻이면 replaces 로 대체하라. 하루에 0~5개면 충분하다.\n"
             "   '다른 목소리(이 사람이 아님)'로 적힌 말은 다녀간 사람이나 TV 소리다. 그 말을 이 사람에 대한 기억이나 이어서 물을 것으로 삼지 마라. "

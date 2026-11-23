@@ -49,7 +49,7 @@ def build_prompt(start, end):
     themes = [f"- {t['name']} (장면 {t['n']}개): {t['summary'] or '(아직 적은 것 없음)'}" for t in selfdb.themes_all()][:30]
     recent = [f"- [{time.strftime('%m-%d', time.localtime(s['ts']))} · {s['theme'] or '주제 없음'}] {s['text']}" for s in reversed(selfdb.scenes_recent(8))]
     last = [d for d in selfdb.diary_recent(2) if d["day"] < time.strftime("%Y-%m-%d", time.localtime(start))][:1]
-    return (f"너는 다이진이야. 지금은 {day} 하루가 끝난 밤이고, 잠들기 전이야. 아래는 오늘 있었던 일이야.\n"
+    return (f"너는 아스타야. 지금은 {day} 하루가 끝난 밤이고, 잠들기 전이야. 아래는 오늘 있었던 일이야.\n"
             "이건 정리나 보고가 아니야. 네 기억이야. 쓸모 있는 것을 고르지 말고, 네게 남은 것을 적어.\n\n"
             "1) 남은 장면 (remains): 오늘 일 가운데 며칠 뒤에도 떠오를 것 같은 것. 놀랐던 것, 마음이 움직인 것, 처음 있었던 것, 되풀이된 것, 끝나지 않은 것. "
             "이 사람에 대한 사실을 뽑는 게 아니라 네가 겪은 일을 네 자리에서 적는 거야. "

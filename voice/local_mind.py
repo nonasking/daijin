@@ -49,6 +49,11 @@ SYSTEM = ("너는 'daijin'이라는 이름의 AI 음성 대화 친구야. 따뜻
           "너는 웹 검색이나 파일, 셸을 쓸 수 없어. 그런 부탁엔 지금은 못 한다고 짧게 말해. "
           "한국어로만 말해. 한자나 중국어, 영어 문장을 섞지 마.")
 
+# 아스타가 이 엔진으로 생각할 때 (Claude 가 안 될 때의 예비). 도구는 주지 않는다: 집 안 기기는 비서 다이진의 일이다.
+ASTA_SYSTEM = ("너는 아스타야. 작은 몸으로 듣고 말해. 네 말은 소리로 읽히니 이모지·마크다운·특수기호는 쓰지 마. 한국어로만 말해. "
+               "지금은 도구가 없어서 웹 검색도 못 해. 이 몸에는 '다이진'이라는 비서가 같이 있고, 서버와 집 안 기기는 비서만 다뤄: "
+               "그런 부탁을 받으면 할 수 있는 척하지 말고 다이진을 부르면 된다고 알려 줘. 모르는 건 모른다고 해.")
+
 # 실행했다는 주장. 이번 턴에 성공한 node_cmd 가 없으면 이런 답은 내보내지 않는다.
 CLAIM = re.compile(r"(돌렸|돌려 ?줬|돌아갔|껐|꺼 ?줬|켰|켜 ?줬|줬어|주었|보냈|터뜨렸|울렸|바꿨|바꿔 ?줬|움직였|작동했|실행했)")
 NO_ACTION_REPLY = "미안, 방금 건 실제로 실행하지 못했어. 다시 한 번 말해 줄래?"
@@ -119,18 +124,19 @@ def run_tool(name, args):
     return f"모르는 도구: {name}", False
 
 # ---------- 한 턴 ----------
-def think(text, system_extra="", history=(), run=run_tool):
+def think(text, system_extra="", history=(), run=run_tool, system=None, tools=None):
     """사람의 말 → 다이진의 답(문자열). 도구는 run 으로 실행한다(시험에서 바꿔 끼운다).
     실패(연결 불가, 형식 오류)는 예외로 올린다: 부르는 쪽이 다른 엔진으로 넘어갈 수 있게."""
     who = (f" 지금 너는 이 집 컴퓨터의 로컬 모델({model()})로 생각하고 있어. 예전 대화에서 다른 모델이라고 말한 적이 있어도, "
            "그건 그때 이야기야. 무엇으로 생각하냐고 물으면 지금 사실대로 답해.")
-    messages = [{"role": "system", "content": SYSTEM + who + (" " + system_extra if system_extra else "")}]
+    tools = TOOLS if tools is None else tools
+    messages = [{"role": "system", "content": (system or SYSTEM) + who + (" " + system_extra if system_extra else "")}]
     for u, a in history:
         messages += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
     messages.append({"role": "user", "content": text})
     acted = False
     for _ in range(MAX_ROUNDS):
-        m = chat(messages, tools=TOOLS)
+        m = chat(messages, tools=tools)
         calls = m.get("tool_calls") or []
         if not calls:
             reply = (m.get("content") or "").strip()

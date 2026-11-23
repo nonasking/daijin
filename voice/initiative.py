@@ -228,7 +228,7 @@ def excuse_from_text(text, now=None):
     if not (INTENT.search(text) and OFF.search(text)) or re.search(r"안 ?꺼|끄지 ?마|켜 ?(줘|놔|둬)", text):
         return set()
     named = mentioned(text)
-    if not named and re.search(r"다이진|daijin|너를|널 ", text, re.I):
+    if not named and re.search(r"아스타|다이진|daijin|너를|널 ", text, re.I):
         return set()                               # 노드가 아니라 다이진 자신을 꺼 뒀다는 말: 노드들은 그대로 걱정한다
     off_now = {nid for nid, (online, _) in selfdb.node_state_all().items() if not online}
     targets = named or off_now
@@ -261,7 +261,7 @@ class Ledger:
             else:
                 self._open("ask", text, now)
         elif topic == T_TXT_IN:
-            if text.startswith("[ask]"):
+            if text.startswith("[ask]") or text.startswith("[비서]"):      # 비서 다이진에게 한 말은 아스타가 먼저 건 말의 답이 아니다
                 return
             self.settle(text, now)
             excuse_from_text(text, now)

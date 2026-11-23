@@ -53,7 +53,7 @@ run() {
     T=$(mktemp -d); trap "rm -rf $T" EXIT
     mkdir -p "$T/esp32-iot/voice"
     cp esp32-iot/secrets.local.txt "$T/esp32-iot/" 2>/dev/null || true
-    cp esp32-iot/voice/.daijin_session* "$T/esp32-iot/voice/" 2>/dev/null || true
+    cp esp32-iot/voice/.daijin_session* esp32-iot/voice/.daijin_assistant_session* "$T/esp32-iot/voice/" 2>/dev/null || true
     cp -r esp32-iot/voice/voiceprint "$T/esp32-iot/voice/" 2>/dev/null || true      # 등록한 목소리 녹음 (hearing.py)
     PY=python3; [ -x venv/bin/python3 ] && PY=venv/bin/python3
     "$PY" -c "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close()" \

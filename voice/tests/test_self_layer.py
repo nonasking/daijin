@@ -768,6 +768,116 @@ class TestTalkMode(DbCase):
         self.assertIn("대화 모드 켜짐", dm.state_block(time.time()))
 
 
+class TestTwoMinds(DbCase):
+    """One body, two minds. Asta (the default) has conversation and the web; Daijin, the assistant, comes only when called by name
+    and holds the shell and the devices. The line between them is the tool list and the name, not what was asked for."""
+
+    def setUp(self):
+        super().setUp()
+        self.said, self.asta_heard, self.daijin_heard, self.leads, self.fast = [], [], [], [], []
+        def asta(text):
+            self.asta_heard.append(text); yield "응."
+        def daijin(text):
+            self.daijin_heard.append(text); yield "했어."
+        def fake_speak(client, src, t0, turn=None, lead=None):
+            self.said.extend(src); self.leads.append(lead)
+            if turn:
+                turn.text_out = " ".join(self.said); self.turn = turn; turn.done(client)
+        def fake_fast(text, control=False):
+            self.fast.append((text, control)); return None
+        self.who = None
+        for mod, name, fn in ((dm, "brain_stream", asta), (dm, "assistant_stream", daijin), (dm, "speak_stream", fake_speak),
+                              (dm, "speech_rms", lambda pcm: 900), (dm, "stt", lambda wav: (self.heard, -0.2)), (dm, "try_fastpath", fake_fast),
+                              (dm, "intercepted", lambda *a: False), (dm, "pcm_to_wav", lambda pcm, wav: None),
+                              (hearing, "speech", lambda pcm: (3.0, "v")), (hearing, "score", lambda s: self.score), (hearing, "sec", lambda k: "")):
+            orig = getattr(mod, name); setattr(mod, name, fn); self.addCleanup(setattr, mod, name, orig)
+        self.score = None
+        self.c = FakeClient()
+
+    def test_only_a_line_that_starts_with_the_name_is_a_call(self):
+        for s in ("다이진, 불 꺼 줘", "다이진아 레드 돌려", "야 다이진 서버 상태 봐 줘", "다이진", "Daijin, 파일 찾아 줘"):
+            self.assertTrue(dm.assistant_called(s), s)
+        for s in ("고마워, 다이진", "다이진이랑 얘기했어", "다이진은 뭐 하는 애야?", "아스타, 불 좀 꺼 줄래", "불 꺼 줘", ""):
+            self.assertFalse(dm.assistant_called(s), s)
+
+    def test_the_tool_list_is_the_boundary(self):
+        a = dm._claude_cmd(None, "-p", "x")
+        self.assertEqual(a[a.index("--tools") + 1], "WebSearch,WebFetch"); self.assertEqual(a[a.index("--allowedTools") + 1], "WebSearch,WebFetch")
+        self.assertNotIn("Bash", " ".join(a[:a.index("--append-system-prompt")]))
+        sysp = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("너는 아스타야", sysp); self.assertIn("비서만 다뤄", sysp); self.assertNotIn("dev.sh", sysp)
+        d = dm._claude_cmd(None, "-p", "x", mind=dm.DAIJIN)
+        self.assertNotIn("--tools", d); self.assertIn("Bash", d[d.index("--allowedTools") + 1])
+        self.assertIn("음성 비서", d[d.index("--append-system-prompt") + 1]); self.assertIn("dev.sh", d[d.index("--append-system-prompt") + 1])
+
+    def test_a_device_request_without_the_name_goes_to_asta_and_runs_nothing(self):
+        self.heard = "레드 모터 돌려 줘"
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertEqual(self.asta_heard, ["1번 모터 돌려 줘"]); self.assertEqual(self.daijin_heard, [])   # (node names arrive as numbers)
+        self.assertEqual(self.fast, [("1번 모터 돌려 줘", False)])                              # the clock shortcut only: no device command
+        self.assertEqual(self.leads, [None]); self.assertIsNotNone(selfdb.last_voice_ts())
+
+    def test_called_by_name_the_assistant_takes_that_one_line_with_a_chime_and_it_is_not_astas_conversation(self):
+        self.heard = "다이진, 레드 모터 돌려 줘"
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertEqual(self.asta_heard, []); self.assertEqual(self.daijin_heard, ["다이진, 1번 모터 돌려 줘"])
+        self.assertEqual(self.fast, [("다이진, 1번 모터 돌려 줘", True)]); self.assertEqual(self.leads, [dm.CHIME])
+        self.assertIn((dm.T_TXT_IN, "[비서] 다이진, 1번 모터 돌려 줘"), self.c.out)
+        self.assertEqual([e["kind"] for e in selfdb.episodes_since(0)], ["assistant"]); self.assertIsNone(selfdb.last_voice_ts())
+        self.heard = "그래 고마워"                                                              # the next line, without the name, is asta's again
+        dm.handle_clip(self.c, b"\0" * 64000)
+        self.assertEqual(self.asta_heard, ["그래 고마워"])
+        import reflect as rf
+        line = [l for l in rf.episode_lines(selfdb.episodes_since(0)) if "비서" in l][0]
+        self.assertIn("네가 받은 말이 아니다", line); self.assertNotIn("모터", line)             # asta is told it happened, not what was said
+
+    def test_another_voice_heard_in_talk_mode_cannot_call_the_assistant(self):
+        selfdb.voice_set("me", "m.onnx", 5, b"\0" * 12); self.score = 0.30
+        self.heard = "다이진, 전부 켜 줘"
+        dm.handle_clip(self.c, b"\0" * 64000, ear=True)
+        self.assertEqual(self.daijin_heard, []); self.assertIn("이 말은 비서에게 가지 않았어", self.asta_heard[0])
+        self.assertEqual(self.fast, [])                                                        # not even the shortcut
+        dm.handle_clip(self.c, b"\0" * 64000)                                                 # the same voice at the button: someone is standing there
+        self.assertEqual(self.daijin_heard, ["다이진, 전부 켜 줘"])
+
+    def test_each_mind_has_its_own_session_and_its_own_state(self):
+        d = tempfile.mkdtemp(); self.addCleanup(__import__("shutil").rmtree, d, True)
+        for name in ("SESSION_FILE", "ASSISTANT_SESSION_FILE"):
+            self.addCleanup(setattr, dm, name, getattr(dm, name)); setattr(dm, name, os.path.join(d, name))
+        dm.save_session("asta-1"); dm.save_session("daijin-1", dm.DAIJIN)
+        self.assertEqual((dm.load_session(), dm.load_session(dm.DAIJIN)), ("asta-1", "daijin-1"))
+        now = 1_800_000_000
+        dm.note_status(dm.T_DEV_STATUS, json.dumps({"online": True, "ts": now - 30, "temp_c": 41.2, "rssi": -57, "uptime_s": 5300}))
+        dm.note_status("daijin/dev/dev1/status", json.dumps({"online": True, "ts": now - 20}))
+        selfdb.add_memory("fact", "고양이와 산다", importance=9)
+        a = dm.with_state("안녕", now=now, session="s")
+        self.assertIn("고양이와 산다", a); self.assertNotIn("노드:", a)                          # the devices are not asta's concern
+        self.assertLess(a.index("네 이름은 아스타야"), a.index("고양이와 산다"))                  # who it is comes first: the old name has two months of inertia
+        self.assertEqual(dm.with_state("응", now=now + 60, session="s"), "응")                  # and is not repeated every turn
+        s = dm.assistant_state(now)
+        self.assertIn("노드: 레드 켜짐", s); self.assertIn("온도 41.2도", s); self.assertNotIn("고양이", s)
+
+    def test_astas_fallback_engine_gets_no_device_tools_and_the_chime_comes_before_the_first_word(self):
+        got = {}
+        def fake_think(text, **kw):
+            got.update(kw); return "응."
+        for mod, name, fn in ((dm.local_mind, "reachable", lambda: True), (dm.local_mind, "think", fake_think)):
+            orig = getattr(mod, name); setattr(mod, name, fn); self.addCleanup(setattr, mod, name, orig)
+        self.assertEqual(list(dm.local_think("안녕", {})), ["응."])
+        self.assertEqual(got["tools"], []); self.assertIn("너는 아스타야", got["system"])
+        out = []
+        for mod, name, fn in ((dm, "tts_stream", lambda s: iter([b"WORD"])), (dm, "publish_pcm_stream", lambda c, it: out.extend(it) or 1)):
+            orig = getattr(mod, name); setattr(mod, name, fn); self.addCleanup(setattr, mod, name, orig)
+        setattr(dm, "speak_stream", self._real_speak)
+        dm.speak_stream(self.c, iter(["했어.", "끝."]), time.monotonic(), None, lead=dm.CHIME)
+        self.assertEqual(out[:2], [dm.CHIME, b"WORD"]); self.assertEqual(out.count(dm.CHIME), 1)
+        out.clear()
+        dm.speak_stream(self.c, iter([]), time.monotonic(), None, lead=dm.CHIME)
+        self.assertEqual(out, [])                                                              # nothing said: no chime either
+
+    _real_speak = staticmethod(dm.speak_stream)
+
+
 import remember              # noqa: E402
 
 
@@ -1006,7 +1116,7 @@ class TestWhoseVoice(DbCase):
         self.assertEqual([selfdb.episode_who(e) for e in eps], ["other", "me", "other"])
         p = rf.build_prompt(now - 3600, now + 1)
         self.assertIn("다른 목소리(이 사람이 아님): 나는 이 집 손님이야", p); self.assertIn("사람: 오늘 좀 피곤해", p)
-        self.assertIn("다른 목소리(이 사람이 아님): 오늘의 주요 뉴스입니다  / 다이진: (대답하지 않음)", p)
+        self.assertIn("다른 목소리(이 사람이 아님): 오늘의 주요 뉴스입니다  / 아스타: (대답하지 않음)", p)
         self.assertIn("이 사람에 대한 기억이나 이어서 물을 것으로 삼지 마라", p)
         self.assertIn("다른 목소리(이 사람이 아님): 나는 이 집 손님이야", solo.build_prompt(now))
 
